@@ -2963,6 +2963,16 @@ def generate_html_report(
     <div class="stat"><strong>{len(action_items)}</strong>Sell / Trim flags</div>
     <div class="stat"><strong>{len(add_items)}</strong>Add candidates</div>"""
 
+    import os as _os
+    _GH_REPO   = _os.environ.get("GITHUB_REPO",   "")
+    _GH_TOKEN  = _os.environ.get("GITHUB_TOKEN",  "")
+    _GH_BRANCH = _os.environ.get("GITHUB_BRANCH", "main")
+
+    import os as _os
+    _GH_REPO   = _os.environ.get("GH_REPO",   "")
+    _GH_TOKEN  = _os.environ.get("GH_TOKEN",  "")
+    _GH_BRANCH = _os.environ.get("GH_BRANCH", "main")
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3219,31 +3229,66 @@ def generate_html_report(
                    transition: transform 0.15s, background 0.2s; }}
   .theme-toggle:hover {{ transform: scale(1.08); background: var(--bg-card-hover); }}
 
-  /* ---------- Refresh button (floating, left of theme toggle) ---------- */
-  .refresh-btn {{ position: fixed; top: 20px; right: 66px;
-                  height: 38px; padding: 0 14px;
-                  border-radius: 19px; border: 1px solid var(--border-medium);
-                  background: var(--bg-card); color: var(--fg-body);
-                  cursor: pointer; font-size: 13px; font-weight: 600;
-                  display: flex; align-items: center; gap: 6px;
-                  box-shadow: var(--shadow-card); z-index: 100;
-                  transition: transform 0.15s, background 0.2s; white-space: nowrap; }}
-  .refresh-btn:hover {{ transform: scale(1.05); background: var(--bg-card-hover); }}
-  .refresh-btn.spinning .refresh-icon {{ display: inline-block; animation: spin 0.8s linear infinite; }}
+  /* ---------- Cloud refresh button ---------- */
+  .refresh-btn {{
+    position: fixed; top: 20px; right: 66px;
+    height: 38px; padding: 0 14px;
+    border-radius: 19px; border: 1px solid var(--border-medium);
+    background: var(--bg-card); color: var(--fg-body);
+    cursor: pointer; font-size: 13px; font-weight: 600;
+    display: flex; align-items: center; gap: 6px;
+    box-shadow: var(--shadow-card); z-index: 100;
+    transition: transform 0.15s, background 0.2s; white-space: nowrap;
+  }}
+  .refresh-btn:hover   {{ transform: scale(1.05); background: var(--bg-card-hover); }}
+  .refresh-btn.running {{ background: #2c3e50; color: #fff; cursor: wait; }}
+  .refresh-btn.success {{ background: #27ae60; color: #fff; }}
+  .refresh-btn.error   {{ background: #c0392b; color: #fff; }}
   @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
+  .spin {{ display: inline-block; animation: spin 0.9s linear infinite; }}
 
-  /* ---------- Refresh button (floating, left of theme toggle) ---------- */
-  .refresh-btn {{ position: fixed; top: 20px; right: 66px;
-                  height: 38px; padding: 0 14px;
-                  border-radius: 19px; border: 1px solid var(--border-medium);
-                  background: var(--bg-card); color: var(--fg-body);
-                  cursor: pointer; font-size: 13px; font-weight: 600;
-                  display: flex; align-items: center; gap: 6px;
-                  box-shadow: var(--shadow-card); z-index: 100;
-                  transition: transform 0.15s, background 0.2s; white-space: nowrap; }}
-  .refresh-btn:hover {{ transform: scale(1.05); background: var(--bg-card-hover); }}
-  .refresh-btn.spinning .refresh-icon {{ display: inline-block; animation: spin 0.8s linear infinite; }}
-  @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
+  /* ---------- Refresh progress panel ---------- */
+  #refresh-panel {{
+    position: fixed; bottom: 24px; right: 24px;
+    width: 340px;
+    background: #1a2028; color: #e8eaed;
+    border: 1px solid #2d3540; border-radius: 10px;
+    font-size: 12px; font-family: "SF Mono", Consolas, monospace;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    z-index: 9999; display: none; overflow: hidden;
+  }}
+  #refresh-panel.open {{ display: block; }}
+  #refresh-panel-header {{
+    background: #232a35; padding: 8px 12px;
+    font-size: 11px; font-weight: 600; color: #8b95a3;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    display: flex; justify-content: space-between; align-items: center;
+  }}
+  #refresh-panel-close {{
+    cursor: pointer; background: none; border: none;
+    color: #8b95a3; font-size: 14px; padding: 0 4px;
+  }}
+  #refresh-panel-close:hover {{ color: #e8eaed; }}
+  #refresh-panel-body {{ padding: 10px 12px; }}
+  #refresh-panel-body p {{ margin: 2px 0; padding: 1px 0; color: #cbd5e0; }}
+  #refresh-panel-body p.phase {{ color: #fbbf24; font-weight: 700; }}
+  #refresh-panel-body p.done  {{ color: #4ade80; }}
+  #refresh-panel-body p.error {{ color: #f87171; }}
+  #refresh-progress-wrap {{
+    padding: 6px 12px 10px;
+    background: #232a35; border-top: 1px solid #2d3540;
+  }}
+  #refresh-progress-bar {{
+    width: 100%; height: 4px; background: #2d3540;
+    border-radius: 2px; overflow: hidden; margin-bottom: 4px;
+  }}
+  #refresh-progress-fill {{
+    height: 100%; background: #4a90e2; border-radius: 2px;
+    width: 0%; transition: width 0.8s ease;
+  }}
+  #refresh-progress-text {{
+    font-size: 11px; color: #8b95a3; text-align: right;
+  }}
 
   /* ---------- Inline-chip overrides (dark mode) ---------- */
   /* Cell renderers use inline styles with hardcoded chip colors. We override
@@ -3370,12 +3415,32 @@ def generate_html_report(
 </script>
 <button class="theme-toggle" id="themeToggle"
         title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
-<button class="refresh-btn" id="refreshBtn" title="Reload report (re-run the script first to refresh data)" onclick="refreshReport()">
-  <span class="refresh-icon">🔄</span> Refresh
+<button class="refresh-btn" id="refreshBtn" onclick="triggerRefresh()"
+        title="Trigger a fresh data pull via GitHub Actions (~10 min)">
+  🔄 Refresh
 </button>
+<div id="refresh-panel">
+  <div id="refresh-panel-header">
+    <span>📡 Refreshing report…</span>
+    <button id="refresh-panel-close" onclick="document.getElementById('refresh-panel').classList.remove('open')">✕</button>
+  </div>
+  <div id="refresh-panel-body"></div>
+  <div id="refresh-progress-wrap">
+    <div id="refresh-progress-bar"><div id="refresh-progress-fill"></div></div>
+    <div id="refresh-progress-text">Starting…</div>
+  </div>
+</div>
 
 <h1>{report_title}</h1>
 <div class="sub">Live data as of {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
+<div id="gh-meta" style="display:none"
+     data-repo="{_GH_REPO}"
+     data-token="{_GH_TOKEN}"
+     data-branch="{_GH_BRANCH}"></div>
+<div id="gh-meta" style="display:none"
+     data-repo="{_GH_REPO}"
+     data-token="{_GH_TOKEN}"
+     data-branch="{_GH_BRANCH}"></div>
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
@@ -3812,13 +3877,202 @@ Verdicts are framework outputs, not investment advice.
   });
 })();
 
-/* ---------- Refresh button ---------- */
-function refreshReport() {
+/* ---------- Cloud refresh — triggers GitHub Actions run ---------- */
+// GitHub repo and token are injected at report-generation time (see below).
+// GITHUB_REPO format: "username/repo-name"
+// GITHUB_TOKEN needs workflow scope (read-only would 403 on dispatch).
+var _GH_REPO  = document.getElementById('gh-meta') ?
+                document.getElementById('gh-meta').dataset.repo : '';
+var _GH_TOKEN = document.getElementById('gh-meta') ?
+                document.getElementById('gh-meta').dataset.token : '';
+var _GH_BRANCH = document.getElementById('gh-meta') ?
+                 document.getElementById('gh-meta').dataset.branch : 'main';
+
+var _pollTimer = null;
+var _runId = null;
+var _startTime = null;
+
+function _log(msg, cls) {{
+  var body = document.getElementById('refresh-panel-body');
+  if (!body) return;
+  var p = document.createElement('p');
+  p.textContent = msg;
+  if (cls) p.className = cls;
+  body.appendChild(p);
+  body.scrollTop = body.scrollHeight;
+}}
+
+function _setProgress(pct, label) {{
+  var fill = document.getElementById('refresh-progress-fill');
+  var text = document.getElementById('refresh-progress-text');
+  if (fill) fill.style.width = pct + '%';
+  if (text) text.textContent = label;
+}}
+
+function _setBtn(state) {{
   var btn = document.getElementById('refreshBtn');
-  if (btn) btn.classList.add('spinning');
-  // Brief visual feedback, then reload the page (picks up the latest saved report.html)
-  setTimeout(function() { location.reload(); }, 300);
-}
+  if (!btn) return;
+  btn.classList.remove('running','success','error');
+  if (state === 'running') {{
+    btn.classList.add('running');
+    btn.innerHTML = '<span class="spin">⏳</span> Running…';
+    btn.disabled = true;
+  }} else if (state === 'success') {{
+    btn.classList.add('success');
+    btn.innerHTML = '✓ Done — reloading…';
+    btn.disabled = true;
+  }} else if (state === 'error') {{
+    btn.classList.add('error');
+    btn.innerHTML = '✗ Error — click to retry';
+    btn.disabled = false;
+  }} else {{
+    btn.innerHTML = '🔄 Refresh';
+    btn.disabled = false;
+  }}
+}}
+
+function triggerRefresh() {{
+  if (!_GH_REPO || !_GH_TOKEN) {{
+    alert('GitHub repo/token not configured.\n\nAdd GITHUB_REPO and GITHUB_TOKEN as GitHub Secrets, then regenerate the report.');
+    return;
+  }}
+  document.getElementById('refresh-panel').classList.add('open');
+  document.getElementById('refresh-panel-body').innerHTML = '';
+  _setBtn('running');
+  _setProgress(5, 'Triggering workflow…');
+  _startTime = Date.now();
+  _runId = null;
+
+  _log('▶ Triggering GitHub Actions workflow…', 'phase');
+
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/workflows/portfolio.yml/dispatches', {{
+    method: 'POST',
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+    }},
+    body: JSON.stringify({{ ref: _GH_BRANCH }}),
+  }})
+  .then(function(r) {{
+    if (r.status === 204) {{
+      _log('✓ Workflow triggered successfully', 'done');
+      _log('⏳ Waiting for run to start…');
+      _setProgress(10, 'Workflow queued…');
+      setTimeout(_findRun, 5000);
+    }} else {{
+      return r.text().then(function(t) {{
+        throw new Error('GitHub API ' + r.status + ': ' + t);
+      }});
+    }}
+  }})
+  .catch(function(e) {{
+    _log('✗ ' + e.message, 'error');
+    _setProgress(0, 'Failed');
+    _setBtn('error');
+  }});
+}}
+
+function _findRun() {{
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs?per_page=5&event=workflow_dispatch', {{
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+    }},
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(data) {{
+    var runs = data.workflow_runs || [];
+    var recent = runs.filter(function(r) {{
+      return r.status !== 'completed' ||
+        (Date.now() - new Date(r.created_at).getTime()) < 120000;
+    }});
+    if (recent.length > 0) {{
+      _runId = recent[0].id;
+      _log('▶ Run #' + _runId + ' started — polling status…', 'phase');
+      _setProgress(20, 'Run started…');
+      _pollTimer = setInterval(_pollRun, 10000);
+    }} else {{
+      // Not found yet, keep waiting
+      setTimeout(_findRun, 5000);
+    }}
+  }})
+  .catch(function(e) {{
+    _log('✗ Could not find run: ' + e.message, 'error');
+    setTimeout(_findRun, 10000);
+  }});
+}}
+
+var _STEPS = [
+  [0,  20, 'Queued'],
+  [20, 35, 'Logging into Robinhood…'],
+  [35, 55, 'Fetching positions…'],
+  [55, 70, 'Analyzing compounders…'],
+  [70, 80, 'Analyzing watchlists…'],
+  [80, 88, 'Tax analysis…'],
+  [88, 95, 'Generating report…'],
+  [95, 99, 'Deploying to GitHub Pages…'],
+];
+var _stepIdx = 0;
+
+function _pollRun() {{
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs/' + _runId, {{
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+    }},
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(run) {{
+    var status     = run.status;
+    var conclusion = run.conclusion;
+    var elapsed    = Math.round((Date.now() - _startTime) / 1000);
+    var mins       = Math.floor(elapsed / 60);
+    var secs       = elapsed % 60;
+    var elapsedStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+
+    // Advance progress step based on elapsed time
+    var step = _STEPS[Math.min(_stepIdx, _STEPS.length - 1)];
+    var progress = step[0] + Math.min(
+      (elapsed / 600) * (step[1] - step[0]),
+      step[1] - step[0]
+    );
+    if (elapsed > 60  && _stepIdx < 2) {{ _stepIdx = 2; }}
+    if (elapsed > 90  && _stepIdx < 3) {{ _stepIdx = 3; }}
+    if (elapsed > 150 && _stepIdx < 4) {{ _stepIdx = 4; }}
+    if (elapsed > 240 && _stepIdx < 5) {{ _stepIdx = 5; }}
+    if (elapsed > 360 && _stepIdx < 6) {{ _stepIdx = 6; }}
+    if (elapsed > 480 && _stepIdx < 7) {{ _stepIdx = 7; }}
+
+    _setProgress(Math.min(progress, 98), _STEPS[_stepIdx][2] + ' · ' + elapsedStr);
+
+    if (status === 'completed') {{
+      clearInterval(_pollTimer);
+      if (conclusion === 'success') {{
+        _setProgress(100, 'Complete!');
+        _log('✓ Report updated successfully!', 'done');
+        _log('↻ Reloading in 3 seconds…', 'done');
+        _setBtn('success');
+        setTimeout(function() {{ location.reload(); }}, 3000);
+      }} else {{
+        _setProgress(100, 'Failed');
+        _log('✗ Workflow failed: ' + conclusion, 'error');
+        _log('  Check: https://github.com/' + _GH_REPO + '/actions', 'error');
+        _setBtn('error');
+      }}
+    }}
+  }})
+  .catch(function(e) {{
+    _log('Poll error: ' + e.message, 'error');
+  }});
+}}
+
+// Section refresh buttons now trigger a full Actions run instead of local API
+document.querySelectorAll('.section-refresh-btn').forEach(function(btn) {{
+  btn.addEventListener('click', function() {{
+    triggerRefresh();
+  }});
+}});
 
 /* ---------- Filter bar: multi-select pills + search + more toggle ---------- */
 (function() {
@@ -4073,9 +4327,205 @@ function refreshReport() {
 
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
-  // Expose so section-refresh can re-run filters after swapping table HTML
   window._applyFilters = applyFilters;
 })();
+
+/* ---------- Cloud refresh — triggers GitHub Actions run ---------- */
+// GitHub repo and token are injected at report-generation time (see below).
+// GH_REPO format: "username/repo-name"
+// GH_TOKEN needs workflow scope (read-only would 403 on dispatch).
+var _GH_REPO  = document.getElementById('gh-meta') ?
+                document.getElementById('gh-meta').dataset.repo : '';
+var _GH_TOKEN = document.getElementById('gh-meta') ?
+                document.getElementById('gh-meta').dataset.token : '';
+var _GH_BRANCH = document.getElementById('gh-meta') ?
+                 document.getElementById('gh-meta').dataset.branch : 'main';
+
+var _pollTimer = null;
+var _runId = null;
+var _startTime = null;
+
+function _log(msg, cls) {{
+  var body = document.getElementById('refresh-panel-body');
+  if (!body) return;
+  var p = document.createElement('p');
+  p.textContent = msg;
+  if (cls) p.className = cls;
+  body.appendChild(p);
+  body.scrollTop = body.scrollHeight;
+}}
+
+function _setProgress(pct, label) {{
+  var fill = document.getElementById('refresh-progress-fill');
+  var text = document.getElementById('refresh-progress-text');
+  if (fill) fill.style.width = pct + '%';
+  if (text) text.textContent = label;
+}}
+
+function _setBtn(state) {{
+  var btn = document.getElementById('refreshBtn');
+  if (!btn) return;
+  btn.classList.remove('running','success','error');
+  if (state === 'running') {{
+    btn.classList.add('running');
+    btn.innerHTML = '<span class="spin">⏳</span> Running…';
+    btn.disabled = true;
+  }} else if (state === 'success') {{
+    btn.classList.add('success');
+    btn.innerHTML = '✓ Done — reloading…';
+    btn.disabled = true;
+  }} else if (state === 'error') {{
+    btn.classList.add('error');
+    btn.innerHTML = '✗ Error — click to retry';
+    btn.disabled = false;
+  }} else {{
+    btn.innerHTML = '🔄 Refresh';
+    btn.disabled = false;
+  }}
+}}
+
+function triggerRefresh() {{
+  if (!_GH_REPO || !_GH_TOKEN) {{
+    alert('GitHub repo/token not configured.\n\nAdd GH_REPO and GH_TOKEN as GitHub Secrets, then regenerate the report.');
+    return;
+  }}
+  document.getElementById('refresh-panel').classList.add('open');
+  document.getElementById('refresh-panel-body').innerHTML = '';
+  _setBtn('running');
+  _setProgress(5, 'Triggering workflow…');
+  _startTime = Date.now();
+  _runId = null;
+
+  _log('▶ Triggering GitHub Actions workflow…', 'phase');
+
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/workflows/portfolio.yml/dispatches', {{
+    method: 'POST',
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+    }},
+    body: JSON.stringify({{ ref: _GH_BRANCH }}),
+  }})
+  .then(function(r) {{
+    if (r.status === 204) {{
+      _log('✓ Workflow triggered successfully', 'done');
+      _log('⏳ Waiting for run to start…');
+      _setProgress(10, 'Workflow queued…');
+      setTimeout(_findRun, 5000);
+    }} else {{
+      return r.text().then(function(t) {{
+        throw new Error('GitHub API ' + r.status + ': ' + t);
+      }});
+    }}
+  }})
+  .catch(function(e) {{
+    _log('✗ ' + e.message, 'error');
+    _setProgress(0, 'Failed');
+    _setBtn('error');
+  }});
+}}
+
+function _findRun() {{
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs?per_page=5&event=workflow_dispatch', {{
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+    }},
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(data) {{
+    var runs = data.workflow_runs || [];
+    var recent = runs.filter(function(r) {{
+      return r.status !== 'completed' ||
+        (Date.now() - new Date(r.created_at).getTime()) < 120000;
+    }});
+    if (recent.length > 0) {{
+      _runId = recent[0].id;
+      _log('▶ Run #' + _runId + ' started — polling status…', 'phase');
+      _setProgress(20, 'Run started…');
+      _pollTimer = setInterval(_pollRun, 10000);
+    }} else {{
+      // Not found yet, keep waiting
+      setTimeout(_findRun, 5000);
+    }}
+  }})
+  .catch(function(e) {{
+    _log('✗ Could not find run: ' + e.message, 'error');
+    setTimeout(_findRun, 10000);
+  }});
+}}
+
+var _STEPS = [
+  [0,  20, 'Queued'],
+  [20, 35, 'Logging into Robinhood…'],
+  [35, 55, 'Fetching positions…'],
+  [55, 70, 'Analyzing compounders…'],
+  [70, 80, 'Analyzing watchlists…'],
+  [80, 88, 'Tax analysis…'],
+  [88, 95, 'Generating report…'],
+  [95, 99, 'Deploying to GitHub Pages…'],
+];
+var _stepIdx = 0;
+
+function _pollRun() {{
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs/' + _runId, {{
+    headers: {{
+      'Authorization': 'token ' + _GH_TOKEN,
+      'Accept': 'application/vnd.github+json',
+    }},
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(run) {{
+    var status     = run.status;
+    var conclusion = run.conclusion;
+    var elapsed    = Math.round((Date.now() - _startTime) / 1000);
+    var mins       = Math.floor(elapsed / 60);
+    var secs       = elapsed % 60;
+    var elapsedStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+
+    // Advance progress step based on elapsed time
+    var step = _STEPS[Math.min(_stepIdx, _STEPS.length - 1)];
+    var progress = step[0] + Math.min(
+      (elapsed / 600) * (step[1] - step[0]),
+      step[1] - step[0]
+    );
+    if (elapsed > 60  && _stepIdx < 2) {{ _stepIdx = 2; }}
+    if (elapsed > 90  && _stepIdx < 3) {{ _stepIdx = 3; }}
+    if (elapsed > 150 && _stepIdx < 4) {{ _stepIdx = 4; }}
+    if (elapsed > 240 && _stepIdx < 5) {{ _stepIdx = 5; }}
+    if (elapsed > 360 && _stepIdx < 6) {{ _stepIdx = 6; }}
+    if (elapsed > 480 && _stepIdx < 7) {{ _stepIdx = 7; }}
+
+    _setProgress(Math.min(progress, 98), _STEPS[_stepIdx][2] + ' · ' + elapsedStr);
+
+    if (status === 'completed') {{
+      clearInterval(_pollTimer);
+      if (conclusion === 'success') {{
+        _setProgress(100, 'Complete!');
+        _log('✓ Report updated successfully!', 'done');
+        _log('↻ Reloading in 3 seconds…', 'done');
+        _setBtn('success');
+        setTimeout(function() {{ location.reload(); }}, 3000);
+      }} else {{
+        _setProgress(100, 'Failed');
+        _log('✗ Workflow failed: ' + conclusion, 'error');
+        _log('  Check: https://github.com/' + _GH_REPO + '/actions', 'error');
+        _setBtn('error');
+      }}
+    }}
+  }})
+  .catch(function(e) {{
+    _log('Poll error: ' + e.message, 'error');
+  }});
+}}
+
+// Section refresh buttons now trigger a full Actions run instead of local API
+document.querySelectorAll('.section-refresh-btn').forEach(function(btn) {{
+  btn.addEventListener('click', function() {{
+    triggerRefresh();
+  }});
+}});
 
 /* ---------- Section refresh ---------- */
 (function() {
