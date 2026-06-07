@@ -41,6 +41,8 @@ jobs:
           TAX_STATE_RATE:     ${{ secrets.TAX_STATE_RATE }}
           TAX_APPLY_NIIT:     ${{ secrets.TAX_APPLY_NIIT }}
           SEC_USER_AGENT:     ${{ secrets.SEC_USER_AGENT }}
+          GH_REPO:            ${{ secrets.GH_REPO }}
+          GH_TOKEN:           ${{ secrets.GH_TOKEN }}
         run: |
           python analyze_portfolio.py \
             --source robinhood \
