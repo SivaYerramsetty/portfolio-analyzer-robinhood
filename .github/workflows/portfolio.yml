@@ -1,0 +1,87 @@
+name: Portfolio Analyzer
+
+on:
+  schedule:
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore Robinhood session cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.tokens
+          key: robinhood-session-${{ github.run_id }}
+          restore-keys: robinhood-session-
+
+      - name: Run portfolio analyzer
+        env:
+          RH_USERNAME:        ${{ secrets.RH_USERNAME }}
+          RH_PASSWORD:        ${{ secrets.RH_PASSWORD }}
+          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+          TAX_FILING_STATUS:  ${{ secrets.TAX_FILING_STATUS }}
+          TAX_TAXABLE_INCOME: ${{ secrets.TAX_TAXABLE_INCOME }}
+          TAX_STATE_RATE:     ${{ secrets.TAX_STATE_RATE }}
+          TAX_APPLY_NIIT:     ${{ secrets.TAX_APPLY_NIIT }}
+          SEC_USER_AGENT:     ${{ secrets.SEC_USER_AGENT }}
+          SMTP_HOST:          ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:          ${{ secrets.SMTP_PORT }}
+          SMTP_USER:          ${{ secrets.SMTP_USER }}
+          SMTP_PASS:          ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: |
+          python analyze_portfolio.py \
+            --source robinhood \
+            --include-watchlists \
+            --save-positions positions.csv \
+            --out report.html
+
+      - name: Build site
+        run: |
+          mkdir -p _site
+          cp report.html _site/index.html
+          TIMESTAMP=$(date -u '+%B %d, %Y at %I:%M %p UTC')
+          sed -i "s|<body>|<body><div style='background:#1a2028;color:#8b95a3;font-size:11px;text-align:center;padding:6px;'>Auto-updated: ${TIMESTAMP}</div>|" _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: analyze
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
