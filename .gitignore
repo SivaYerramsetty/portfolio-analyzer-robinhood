@@ -1,0 +1,13 @@
+cat > .gitignore << 'EOF'
+.env
+*.pickle
+*.csv
+positions.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.bak
+*.bak2
+*.bak3
+EOF

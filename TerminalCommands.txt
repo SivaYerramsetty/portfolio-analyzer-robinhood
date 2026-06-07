@@ -1,0 +1,311 @@
+============================================================================
+PORTFOLIO ANALYZER — COMPLETE COMMAND REFERENCE
+============================================================================
+
+A single Python tool for analyzing your Robinhood portfolio, screening
+S&P 500/400, and managing watchlists. All commands run from your project
+directory where the .py files live.
+
+
+============================================================================
+SETUP (one-time)
+============================================================================
+
+Install dependencies:
+
+    pip install yfinance pdfplumber robin-stocks python-dotenv requests pandas
+    # pyotp only needed if using legacy TOTP auth
+
+Create a .env file in the project folder with your credentials:
+
+    # Required for Robinhood mode:
+    RH_USERNAME=your_email@example.com
+    RH_PASSWORD=your_password
+
+    # Optional — richer analyst ratings (free key at finnhub.io):
+    FINNHUB_API_KEY=your_finnhub_key
+
+    # Optional — required for SEC insider data (use your real email):
+    SEC_USER_AGENT=Your Name your_email@example.com
+
+    # Optional — personalize tax analysis (else uses 15% LT / 24% ST defaults):
+    TAX_FILING_STATUS=single        # single | mfj | hoh | mfs
+    TAX_TAXABLE_INCOME=150000        # ordinary income BEFORE capital gains
+    TAX_STATE_RATE=4.25              # state cap-gains rate as percent
+    TAX_APPLY_NIIT=                  # set to true if subject to 3.8% NIIT
+
+    # Optional — email delivery:
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=587
+    SMTP_USER=your_sending_email
+    SMTP_PASS=your_app_password
+    EMAIL_TO=where_to_send
+
+============================================================================
+MOST USED
+============================================================================
+
+python analyze_portfolio.py --source robinhood --out report.html
+
+python analyze_portfolio.py --source robinhood --include-watchlists --out report.html
+
+python analyze_portfolio.py --tickers AAPL,MSFT,GOOGL,NVDA --out lookup.html
+
+python analyze_portfolio.py --add-to-watchlist "Screening" --tickers NVDA,GOOGL
+
+
+============================================================================
+MODE 1 — LIVE ROBINHOOD (your real positions)
+============================================================================
+
+Basic — pull live positions, analyze, write report:
+
+    python analyze_portfolio.py --source robinhood --out report.html
+
+Add Robinhood watchlists (a "should I buy?" section):
+
+    python analyze_portfolio.py --source robinhood --include-watchlists --out report.html
+
+Save a CSV snapshot of positions alongside the report:
+
+    python analyze_portfolio.py --source robinhood --save-positions positions.csv --out report.html
+
+Full daily-driver — positions + watchlists + snapshot + email:
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --save-positions positions.csv --out report.html --email
+
+Open the report (macOS):
+
+    open report.html
+
+
+============================================================================
+MODE 2 — CSV (analyze a saved positions file, no Robinhood needed)
+============================================================================
+
+First parse a Robinhood monthly statement PDF into CSV:
+
+    python parse_statement.py "/path/to/statement.pdf" positions.csv
+
+Then analyze that CSV:
+
+    python analyze_portfolio.py positions.csv --out report.html
+
+CSV mode with email:
+
+    python analyze_portfolio.py positions.csv --out report.html --email
+
+
+============================================================================
+MODE 3 — AD-HOC TICKERS (quick lookup, NO Robinhood, NO holdings)
+============================================================================
+
+Single stock:
+
+    python analyze_portfolio.py --tickers AAPL --out lookup.html
+
+Multiple stocks (comma-separated):
+
+    python analyze_portfolio.py --tickers AAPL,MSFT,GOOGL,NVDA --out lookup.html
+
+Multiple stocks (space-separated, must be quoted):
+
+    python analyze_portfolio.py --tickers "AAPL MSFT GOOGL NVDA" --out lookup.html
+
+Ad-hoc lookup emailed to you:
+
+    python analyze_portfolio.py --tickers AAPL,MSFT --out lookup.html --email
+
+
+============================================================================
+MODE 4 — ADD TO ROBINHOOD WATCHLIST (write-only, no report)
+============================================================================
+
+Append tickers to an existing watchlist (skips ones already in it):
+
+    python analyze_portfolio.py --add-to-watchlist "Screening" --tickers NVDA,GOOGL
+
+Preview without writing (dry run):
+
+    python analyze_portfolio.py --add-to-watchlist "AI Plays" --tickers NVDA --sync-dry-run
+
+Bulk-add a longer list:
+
+    python analyze_portfolio.py --add-to-watchlist "Dividend Stocks" \
+        --tickers "JNJ KO PEP PG MO"
+
+Note: The watchlist must exist already (create it in the Robinhood app first).
+The mode is write-only — it doesn't generate a report.
+
+
+============================================================================
+MODE 5 — SCREEN S&P 500/400 (~15-25 min for full universe)
+============================================================================
+
+Run the screen and add a Screening section to the report:
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --screen --out report.html
+
+Speed-test with a smaller universe first (recommended for initial run):
+
+    python analyze_portfolio.py --source robinhood --screen --screen-limit 50 \
+        --out report.html
+
+Run screen AND sync passing tickers to a Robinhood "Screening" watchlist:
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --screen --sync-screening-watchlist --out report.html
+
+Preview the sync without writing:
+
+    python analyze_portfolio.py --source robinhood --screen \
+        --sync-screening-watchlist --sync-dry-run --out report.html
+
+The grand-finale command (positions + watchlists + screen + sync + email):
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --screen --sync-screening-watchlist \
+        --save-positions positions.csv --out report.html --email
+
+
+============================================================================
+DEBUG / DIAGNOSTIC COMMANDS
+============================================================================
+
+Diagnose insider lookup for one ticker (shows which sources return data):
+
+    python analyze_portfolio.py --debug-insider AAPL
+
+Test Robinhood login and print top holdings (sanity check auth):
+
+    python robinhood_source.py
+
+Just parse a statement PDF to CSV without analyzing:
+
+    python parse_statement.py "/path/to/statement.pdf" positions.csv
+
+Enable Finnhub for richer analyst data inline (without setting .env):
+
+    FINNHUB_API_KEY=your_key python analyze_portfolio.py --tickers NVDA --out nvda.html
+
+
+============================================================================
+ALL FLAGS REFERENCE
+============================================================================
+
+positions_csv               Positional. CSV from parse_statement.py (CSV mode).
+--source {csv,robinhood}    Where to load positions (default: csv).
+--tickers TICKERS           Ad-hoc mode: comma/space separated symbols.
+                            Also used by --add-to-watchlist to specify what to add.
+--include-watchlists        With --source robinhood: also analyze your watchlists.
+--save-positions FILE       With --source robinhood: dump positions snapshot CSV.
+--out FILE                  Output HTML path (default: portfolio_report.html).
+--email                     Also send the report via SMTP (uses env vars).
+
+--screen                    Run S&P 500/400 screen; adds Screening section.
+                            Slow (~15-25 min for full universe).
+--screen-limit N            Cap screened universe for testing (e.g. 50).
+--sync-screening-watchlist  Sync passing tickers to "Screening" watchlist
+                            (requires --screen and --source robinhood).
+
+--add-to-watchlist NAME     Append --tickers to a Robinhood watchlist (no report).
+                            Requires --tickers for the symbol list.
+--sync-dry-run              Preview --add-to-watchlist or --sync-screening-watchlist
+                            without writing.
+
+--debug-insider TICKER      Diagnose insider data sources for one ticker.
+
+
+============================================================================
+HTML REPORT FEATURES (always on, no flags needed)
+============================================================================
+
+Filter bar at top with search box + quick-filter pills:
+    All · Action items · Buy signals · High quality (7+)
+    🔥 Hot sector · Winners · Losers
+
+Click any column header to sort; click again to reverse.
+
+Sections (top to bottom):
+    1. Filter bar (sticky at top)
+    2. Quality Compounders — your stock holdings with strict 9-filter framework
+    3. ETFs & Thematic Positions — index funds, sector ETFs, etc.
+    4. Watchlists — Robinhood watchlists (when --include-watchlists used)
+    5. Screening — S&P 500/400 passers (when --screen used)
+    6. Tax-Aware Trim Guidance — only for SELL/TRIM positions
+
+Insider 90d column shows a decision verdict:
+    ✓ Supports buy   = Real open-market buying with personal cash
+    — No signal       = Typical compensation/plan/tax activity (most mega-caps)
+    ⚠ Caution         = Discretionary selling meaningful for company size
+
+
+============================================================================
+GITHUB ACTIONS (automated daily run)
+============================================================================
+
+The portfolio.yml workflow runs automatically when triggered manually.
+Equivalent command it executes:
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --save-positions positions.csv --out report.html --email
+
+Trigger via GitHub UI:
+    Repo → Actions tab → "Portfolio Analysis" → Run workflow
+
+
+============================================================================
+COMMON WORKFLOWS
+============================================================================
+
+Daily portfolio check (5 min):
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --out report.html
+
+Add a research candidate to a watchlist:
+
+    python analyze_portfolio.py --add-to-watchlist "Research" --tickers TICKER
+
+Quick lookup before deciding to buy a single stock:
+
+    python analyze_portfolio.py --tickers TICKER --out lookup.html
+
+Weekly deep scan with screen (takes 20 min):
+
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --screen --sync-screening-watchlist \
+        --save-positions positions.csv --out report.html --email
+
+Monthly statement parse and analysis:
+
+    python parse_statement.py "~/Downloads/statement_2026-05.pdf" positions.csv
+    python analyze_portfolio.py positions.csv --out monthly_report.html
+
+
+============================================================================
+TROUBLESHOOTING
+============================================================================
+
+"Wikipedia HTTP 403" during screen run:
+    Network blocks Wikipedia. The screen will use a 30-ticker fallback.
+    Workaround: manually populate universe_cache.json with the S&P list.
+
+Insider 90d shows "— No signal" for all tickers:
+    Run `python analyze_portfolio.py --debug-insider AAPL` to see which
+    data source is failing. Most likely SEC requires SEC_USER_AGENT with
+    a real email in .env.
+
+Watchlist sync shows "failed_add" entries:
+    Robinhood's write API occasionally no-ops silently. The script verifies
+    by re-reading; failures shown in the log can be re-added manually in
+    the app or via another script run.
+
+Robinhood login fails:
+    Run `python robinhood_source.py` to test auth in isolation. Robinhood's
+    new device-approval flow may require SMS verification on first login;
+    subsequent logins use the cached session at ~/.tokens/robinhood.pickle.
+
+============================================================================
