@@ -3892,7 +3892,7 @@ var _pollTimer = null;
 var _runId = null;
 var _startTime = null;
 
-function _log(msg, cls) {{
+function _log(msg, cls) {
   var body = document.getElementById('refresh-panel-body');
   if (!body) return;
   var p = document.createElement('p');
@@ -3900,42 +3900,42 @@ function _log(msg, cls) {{
   if (cls) p.className = cls;
   body.appendChild(p);
   body.scrollTop = body.scrollHeight;
-}}
+}
 
-function _setProgress(pct, label) {{
+function _setProgress(pct, label) {
   var fill = document.getElementById('refresh-progress-fill');
   var text = document.getElementById('refresh-progress-text');
   if (fill) fill.style.width = pct + '%';
   if (text) text.textContent = label;
-}}
+}
 
-function _setBtn(state) {{
+function _setBtn(state) {
   var btn = document.getElementById('refreshBtn');
   if (!btn) return;
   btn.classList.remove('running','success','error');
-  if (state === 'running') {{
+  if (state === 'running') {
     btn.classList.add('running');
     btn.innerHTML = '<span class="spin">⏳</span> Running…';
     btn.disabled = true;
-  }} else if (state === 'success') {{
+  } else if (state === 'success') {
     btn.classList.add('success');
     btn.innerHTML = '✓ Done — reloading…';
     btn.disabled = true;
-  }} else if (state === 'error') {{
+  } else if (state === 'error') {
     btn.classList.add('error');
     btn.innerHTML = '✗ Error — click to retry';
     btn.disabled = false;
-  }} else {{
+  } else {
     btn.innerHTML = '🔄 Refresh';
     btn.disabled = false;
-  }}
-}}
+  }
+}
 
-function triggerRefresh() {{
-  if (!_GH_REPO || !_GH_TOKEN) {{
+function triggerRefresh() {
+  if (!_GH_REPO || !_GH_TOKEN) {
     alert('GitHub repo/token not configured.\n\nAdd GH_REPO and GH_TOKEN as GitHub Secrets, then regenerate the report.');
     return;
-  }}
+  }
   document.getElementById('refresh-panel').classList.add('open');
   document.getElementById('refresh-panel-body').innerHTML = '';
   _setBtn('running');
@@ -3945,63 +3945,63 @@ function triggerRefresh() {{
 
   _log('▶ Triggering GitHub Actions workflow…', 'phase');
 
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/workflows/portfolio.yml/dispatches', {{
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/workflows/portfolio.yml/dispatches', {
     method: 'POST',
-    headers: {{
+    headers: {
       'Authorization': 'token ' + _GH_TOKEN,
       'Accept': 'application/vnd.github+json',
       'Content-Type': 'application/json',
-    }},
-    body: JSON.stringify({{ ref: _GH_BRANCH }}),
-  }})
-  .then(function(r) {{
-    if (r.status === 204) {{
+    },
+    body: JSON.stringify({ ref: _GH_BRANCH }),
+  })
+  .then(function(r) {
+    if (r.status === 204) {
       _log('✓ Workflow triggered successfully', 'done');
       _log('⏳ Waiting for run to start…');
       _setProgress(10, 'Workflow queued…');
       setTimeout(_findRun, 5000);
-    }} else {{
-      return r.text().then(function(t) {{
+    } else {
+      return r.text().then(function(t) {
         throw new Error('GitHub API ' + r.status + ': ' + t);
-      }});
-    }}
-  }})
-  .catch(function(e) {{
+      });
+    }
+  })
+  .catch(function(e) {
     _log('✗ ' + e.message, 'error');
     _setProgress(0, 'Failed');
     _setBtn('error');
-  }});
-}}
+  });
+}
 
-function _findRun() {{
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs?per_page=5&event=workflow_dispatch', {{
-    headers: {{
+function _findRun() {
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs?per_page=5&event=workflow_dispatch', {
+    headers: {
       'Authorization': 'token ' + _GH_TOKEN,
       'Accept': 'application/vnd.github+json',
-    }},
-  }})
-  .then(function(r) {{ return r.json(); }})
-  .then(function(data) {{
+    },
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
     var runs = data.workflow_runs || [];
-    var recent = runs.filter(function(r) {{
+    var recent = runs.filter(function(r) {
       return r.status !== 'completed' ||
         (Date.now() - new Date(r.created_at).getTime()) < 120000;
-    }});
-    if (recent.length > 0) {{
+    });
+    if (recent.length > 0) {
       _runId = recent[0].id;
       _log('▶ Run #' + _runId + ' started — polling status…', 'phase');
       _setProgress(20, 'Run started…');
       _pollTimer = setInterval(_pollRun, 10000);
-    }} else {{
+    } else {
       // Not found yet, keep waiting
       setTimeout(_findRun, 5000);
-    }}
-  }})
-  .catch(function(e) {{
+    }
+  })
+  .catch(function(e) {
     _log('✗ Could not find run: ' + e.message, 'error');
     setTimeout(_findRun, 10000);
-  }});
-}}
+  });
+}
 
 var _STEPS = [
   [0,  20, 'Queued'],
@@ -4015,15 +4015,15 @@ var _STEPS = [
 ];
 var _stepIdx = 0;
 
-function _pollRun() {{
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs/' + _runId, {{
-    headers: {{
+function _pollRun() {
+  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs/' + _runId, {
+    headers: {
       'Authorization': 'token ' + _GH_TOKEN,
       'Accept': 'application/vnd.github+json',
-    }},
-  }})
-  .then(function(r) {{ return r.json(); }})
-  .then(function(run) {{
+    },
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(run) {
     var status     = run.status;
     var conclusion = run.conclusion;
     var elapsed    = Math.round((Date.now() - _startTime) / 1000);
@@ -4037,42 +4037,42 @@ function _pollRun() {{
       (elapsed / 600) * (step[1] - step[0]),
       step[1] - step[0]
     );
-    if (elapsed > 60  && _stepIdx < 2) {{ _stepIdx = 2; }}
-    if (elapsed > 90  && _stepIdx < 3) {{ _stepIdx = 3; }}
-    if (elapsed > 150 && _stepIdx < 4) {{ _stepIdx = 4; }}
-    if (elapsed > 240 && _stepIdx < 5) {{ _stepIdx = 5; }}
-    if (elapsed > 360 && _stepIdx < 6) {{ _stepIdx = 6; }}
-    if (elapsed > 480 && _stepIdx < 7) {{ _stepIdx = 7; }}
+    if (elapsed > 60  && _stepIdx < 2) { _stepIdx = 2; }
+    if (elapsed > 90  && _stepIdx < 3) { _stepIdx = 3; }
+    if (elapsed > 150 && _stepIdx < 4) { _stepIdx = 4; }
+    if (elapsed > 240 && _stepIdx < 5) { _stepIdx = 5; }
+    if (elapsed > 360 && _stepIdx < 6) { _stepIdx = 6; }
+    if (elapsed > 480 && _stepIdx < 7) { _stepIdx = 7; }
 
     _setProgress(Math.min(progress, 98), _STEPS[_stepIdx][2] + ' · ' + elapsedStr);
 
-    if (status === 'completed') {{
+    if (status === 'completed') {
       clearInterval(_pollTimer);
-      if (conclusion === 'success') {{
+      if (conclusion === 'success') {
         _setProgress(100, 'Complete!');
         _log('✓ Report updated successfully!', 'done');
         _log('↻ Reloading in 3 seconds…', 'done');
         _setBtn('success');
-        setTimeout(function() {{ location.reload(); }}, 3000);
-      }} else {{
+        setTimeout(function() { location.reload(); }, 3000);
+      } else {
         _setProgress(100, 'Failed');
         _log('✗ Workflow failed: ' + conclusion, 'error');
         _log('  Check: https://github.com/' + _GH_REPO + '/actions', 'error');
         _setBtn('error');
-      }}
-    }}
-  }})
-  .catch(function(e) {{
+      }
+    }
+  })
+  .catch(function(e) {
     _log('Poll error: ' + e.message, 'error');
-  }});
-}}
+  });
+}
 
 // Section refresh buttons now trigger a full Actions run instead of local API
-document.querySelectorAll('.section-refresh-btn').forEach(function(btn) {{
-  btn.addEventListener('click', function() {{
+document.querySelectorAll('.section-refresh-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
     triggerRefresh();
-  }});
-}});
+  });
+});
 
 /* ---------- Cloud refresh — triggers GitHub Actions run ---------- */
 (function() {
