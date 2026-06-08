@@ -1,14 +1,11 @@
 name: Portfolio Analyzer
-
 on:
-  # Run automatically every day at 8:30 AM Eastern
+  # 9:30 AM EST = 14:30 UTC | 4:00 PM EST = 21:00 UTC (weekdays only)
   schedule:
-    - cron: '30 13 * * 1-5'   # 1:30 PM UTC = 8:30 AM ET (weekdays only)
-
-  # Also allow manual trigger from GitHub website
+    - cron: '30 14 * * 1-5'   # 9:30 AM EST — market open
+    - cron: '0 21 * * 1-5'    # 4:00 PM EST — market close
   workflow_dispatch:
 
-# Allow the workflow to publish to GitHub Pages
 permissions:
   contents: read
   pages: write
@@ -17,20 +14,16 @@ permissions:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run portfolio analyzer
         env:
           RH_USERNAME:        ${{ secrets.RH_USERNAME }}
@@ -49,14 +42,11 @@ jobs:
             --include-watchlists \
             --save-positions positions.csv \
             --out report.html
-
       - name: Prepare Pages output
         run: |
           mkdir -p _site
           cp report.html _site/index.html
-          # Add a small "last updated" stamp
           echo "<!-- Generated: $(date -u) -->" >> _site/index.html
-
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -68,7 +58,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
