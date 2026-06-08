@@ -2618,15 +2618,7 @@ def _render_tax_section(flagged: list,
       all_holdings: full holdings list (used to find loss-harvest candidates)
       realized_ytd: dict from fetch_realized_ytd() — if present, YTD section renders
     """
-    html = (
-        "<h2 style='margin-top:48px;'>Tax-Aware Trim Guidance "
-        "<button class='section-refresh-btn' data-section='tax' "
-        "title='Refresh with live data'>\U0001f504</button>"
-        "<span class='section-refresh-status' id='status-tax'></span>"
-        "</h2>\n"
-        "<div id='log-tax' class='section-log-panel'></div>\n"
-        "<div class='section-content' id='content-tax'>\n"
-    )
+    html = "<h2 style='margin-top:48px;'>Tax-Aware Trim Guidance</h2>\n"
     html += (
         '<p style="color:var(--fg-muted);font-size:12px;margin-top:-6px;margin-bottom:8px;">'
         "For positions flagged SELL or TRIM: holding-period status, estimated tax "
@@ -2861,7 +2853,6 @@ def _render_tax_section(flagged: list,
 
         html += "</div>\n"
 
-    html += "</div>\n"  # close section-content#content-tax
     return html
 
 
@@ -2962,16 +2953,6 @@ def generate_html_report(
     <div class="stat"><strong>{len(thematics)}</strong>Thematic / ETF positions</div>
     <div class="stat"><strong>{len(action_items)}</strong>Sell / Trim flags</div>
     <div class="stat"><strong>{len(add_items)}</strong>Add candidates</div>"""
-
-    import os as _os
-    _GH_REPO   = _os.environ.get("GITHUB_REPO",   "")
-    _GH_TOKEN  = _os.environ.get("GITHUB_TOKEN",  "")
-    _GH_BRANCH = _os.environ.get("GITHUB_BRANCH", "main")
-
-    import os as _os
-    _GH_REPO   = _os.environ.get("GH_REPO",   "")
-    _GH_TOKEN  = _os.environ.get("GH_TOKEN",  "")
-    _GH_BRANCH = _os.environ.get("GH_BRANCH", "main")
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -3229,67 +3210,6 @@ def generate_html_report(
                    transition: transform 0.15s, background 0.2s; }}
   .theme-toggle:hover {{ transform: scale(1.08); background: var(--bg-card-hover); }}
 
-  /* ---------- Cloud refresh button ---------- */
-  .refresh-btn {{
-    position: fixed; top: 20px; right: 66px;
-    height: 38px; padding: 0 14px;
-    border-radius: 19px; border: 1px solid var(--border-medium);
-    background: var(--bg-card); color: var(--fg-body);
-    cursor: pointer; font-size: 13px; font-weight: 600;
-    display: flex; align-items: center; gap: 6px;
-    box-shadow: var(--shadow-card); z-index: 100;
-    transition: transform 0.15s, background 0.2s; white-space: nowrap;
-  }}
-  .refresh-btn:hover   {{ transform: scale(1.05); background: var(--bg-card-hover); }}
-  .refresh-btn.running {{ background: #2c3e50; color: #fff; cursor: wait; }}
-  .refresh-btn.success {{ background: #27ae60; color: #fff; }}
-  .refresh-btn.error   {{ background: #c0392b; color: #fff; }}
-  @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
-  .spin {{ display: inline-block; animation: spin 0.9s linear infinite; }}
-
-  /* ---------- Refresh progress panel ---------- */
-  #refresh-panel {{
-    position: fixed; bottom: 24px; right: 24px;
-    width: 340px;
-    background: #1a2028; color: #e8eaed;
-    border: 1px solid #2d3540; border-radius: 10px;
-    font-size: 12px; font-family: "SF Mono", Consolas, monospace;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    z-index: 9999; display: none; overflow: hidden;
-  }}
-  #refresh-panel.open {{ display: block; }}
-  #refresh-panel-header {{
-    background: #232a35; padding: 8px 12px;
-    font-size: 11px; font-weight: 600; color: #8b95a3;
-    text-transform: uppercase; letter-spacing: 0.5px;
-    display: flex; justify-content: space-between; align-items: center;
-  }}
-  #refresh-panel-close {{
-    cursor: pointer; background: none; border: none;
-    color: #8b95a3; font-size: 14px; padding: 0 4px;
-  }}
-  #refresh-panel-close:hover {{ color: #e8eaed; }}
-  #refresh-panel-body {{ padding: 10px 12px; }}
-  #refresh-panel-body p {{ margin: 2px 0; padding: 1px 0; color: #cbd5e0; }}
-  #refresh-panel-body p.phase {{ color: #fbbf24; font-weight: 700; }}
-  #refresh-panel-body p.done  {{ color: #4ade80; }}
-  #refresh-panel-body p.error {{ color: #f87171; }}
-  #refresh-progress-wrap {{
-    padding: 6px 12px 10px;
-    background: #232a35; border-top: 1px solid #2d3540;
-  }}
-  #refresh-progress-bar {{
-    width: 100%; height: 4px; background: #2d3540;
-    border-radius: 2px; overflow: hidden; margin-bottom: 4px;
-  }}
-  #refresh-progress-fill {{
-    height: 100%; background: #4a90e2; border-radius: 2px;
-    width: 0%; transition: width 0.8s ease;
-  }}
-  #refresh-progress-text {{
-    font-size: 11px; color: #8b95a3; text-align: right;
-  }}
-
   /* ---------- Inline-chip overrides (dark mode) ---------- */
   /* Cell renderers use inline styles with hardcoded chip colors. We override
      them in dark mode using attribute selectors so they remain readable. */
@@ -3347,56 +3267,6 @@ def generate_html_report(
     .theme-toggle {{ top: 12px; right: 12px;
                      width: 34px; height: 34px; font-size: 16px; }}
   }}
-
-  /* ---------- Section refresh buttons ---------- */
-  .section-refresh-btn {{
-    display: inline-flex; align-items: center; justify-content: center;
-    margin-left: 10px; width: 26px; height: 26px;
-    border-radius: 50%;
-    background: var(--bg-card); border: 1px solid var(--border-medium);
-    cursor: pointer; font-size: 13px;
-    box-shadow: var(--shadow-card);
-    transition: transform 0.15s, background 0.15s;
-    vertical-align: middle;
-  }}
-  .section-refresh-btn:hover   {{ background: var(--bg-card-hover); transform: scale(1.12); }}
-  .section-refresh-btn.running {{ cursor: wait; animation: _sec-spin 0.8s linear infinite; }}
-  .section-refresh-btn.success {{ background: var(--bg-chip-green); }}
-  .section-refresh-btn.error   {{ background: var(--bg-chip-red); }}
-  @keyframes _sec-spin {{ to {{ transform: rotate(360deg); }} }}
-  .section-refresh-status {{
-    margin-left: 8px; font-size: 12px; font-weight: 400;
-    color: var(--fg-muted); vertical-align: middle;
-  }}
-  .section-log-panel {{
-    margin: 4px 0 10px;
-    background: #1a2028; color: #e8eaed;
-    border: 1px solid #2d3540; border-radius: 8px;
-    font-family: "SF Mono", SFMono-Regular, Consolas, monospace;
-    font-size: 11px; line-height: 1.5;
-    max-height: 160px; overflow-y: auto;
-    padding: 8px 12px; display: none;
-  }}
-  .section-log-panel.open {{ display: block; }}
-  .section-log-panel p {{ margin: 0; padding: 1px 0; white-space: pre-wrap; }}
-  .l-phase  {{ color: #fbbf24; font-weight: 700; }}
-  .l-ticker {{ color: #60a5fa; }}
-  .l-add    {{ color: #4ade80; }}
-  .l-sell   {{ color: #f87171; }}
-  .l-trim   {{ color: #fb923c; }}
-  .l-error  {{ color: #f87171; }}
-  .section-content.loading {{
-    position: relative; pointer-events: none;
-  }}
-  .section-content.loading::after {{
-    content: ''; position: absolute; inset: 0;
-    background: rgba(255,255,255,0.5); border-radius: 10px;
-    animation: _shimmer 1.2s ease-in-out infinite alternate;
-  }}
-  [data-theme="dark"] .section-content.loading::after {{
-    background: rgba(0,0,0,0.4);
-  }}
-  @keyframes _shimmer {{ from {{ opacity: 0.3; }} to {{ opacity: 0.7; }} }}
 </style>
 </head>
 <body>
@@ -3415,32 +3285,9 @@ def generate_html_report(
 </script>
 <button class="theme-toggle" id="themeToggle"
         title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
-<button class="refresh-btn" id="refreshBtn" onclick="triggerRefresh()"
-        title="Trigger a fresh data pull via GitHub Actions (~10 min)">
-  🔄 Refresh
-</button>
-<div id="refresh-panel">
-  <div id="refresh-panel-header">
-    <span>📡 Refreshing report…</span>
-    <button id="refresh-panel-close" onclick="document.getElementById('refresh-panel').classList.remove('open')">✕</button>
-  </div>
-  <div id="refresh-panel-body"></div>
-  <div id="refresh-progress-wrap">
-    <div id="refresh-progress-bar"><div id="refresh-progress-fill"></div></div>
-    <div id="refresh-progress-text">Starting…</div>
-  </div>
-</div>
 
 <h1>{report_title}</h1>
 <div class="sub">Live data as of {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
-<div id="gh-meta" style="display:none"
-     data-repo="{_GH_REPO}"
-     data-token="{_GH_TOKEN}"
-     data-branch="{_GH_BRANCH}"></div>
-<div id="gh-meta" style="display:none"
-     data-repo="{_GH_REPO}"
-     data-token="{_GH_TOKEN}"
-     data-branch="{_GH_BRANCH}"></div>
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
@@ -3576,15 +3423,7 @@ def generate_html_report(
 
     # Compounder section (only if there are compounder holdings)
     if compounders:
-        html += (
-            "<h2>Quality Compounders "
-            "<button class='section-refresh-btn' data-section='compounders' "
-            "title='Refresh with live data'>\U0001f504</button>"
-            "<span class='section-refresh-status' id='status-compounders'></span>"
-            "</h2>\n"
-            "<div id='log-compounders' class='section-log-panel'></div>\n"
-        )
-        html += "<div class='section-content' id='content-compounders'>\n"
+        html += "<h2>Quality Compounders</h2>\n"
         html += "<div class='table-wrap'><table>\n<thead><tr>"
         html += (
             "<th>Ticker</th>"
@@ -3637,7 +3476,6 @@ def generate_html_report(
             html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
-        html += "</div>\n"  # close section-content#content-compounders
 
 
     # ---------- Watchlist sections ----------
@@ -3651,21 +3489,13 @@ def generate_html_report(
             "Verdicts answer <em>“should I buy?”</em> based on the 9-filter "
             "quality framework and analyst targets."
         )
-        html += (
-            f"<h2 style='margin-top:{'48px' if has_holdings else '24px'};'>"
-            f"{wl_title} "
-            "<button class='section-refresh-btn' data-section='watchlists' "
-            "title='Refresh with live data'>\U0001f504</button>"
-            "<span class='section-refresh-status' id='status-watchlists'></span>"
-            "</h2>\n"
-            "<div id='log-watchlists' class='section-log-panel'></div>\n"
-        )
+        html += f"<h2 style='margin-top:{'48px' if has_holdings else '24px'};'>{wl_title}</h2>\n"
         html += (
             f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:18px;">'
             f"{wl_subtitle}"
             "</p>\n"
         )
-        for wl_idx, (wl_name, items) in enumerate(watchlists.items()):
+        for wl_name, items in watchlists.items():
             # Filter out anything already in holdings (avoids duplicate rows)
             items = [r for r in items if r.ticker not in held_tickers]
             if not items:
@@ -3675,8 +3505,6 @@ def generate_html_report(
                 _VERDICT_ORDER.get(r.verdict.label if r.verdict else "ERROR", 99),
                 -(r.upside_pct or -1e6),
             ))
-            if wl_idx == 0:
-                html += "<div class='section-content' id='content-watchlists'>\n"
             html += f"<h3 style='margin-top:24px;color:#34495e;'>📋 {wl_name} ({len(items)})</h3>\n"
             html += "<div class='table-wrap'><table>\n<thead><tr>"
             html += (
@@ -3734,7 +3562,6 @@ def generate_html_report(
                 html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
                 html += "</tr>\n"
             html += "</tbody></table></div>\n"
-        html += "</div>\n"  # close section-content#content-watchlists
 
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
@@ -3742,15 +3569,7 @@ def generate_html_report(
 
     # ---------- ETFs & Thematic positions (moved before Tax section) ----------
     if thematics:
-        html += (
-            "<h2>ETFs &amp; Thematic Positions "
-            "<button class='section-refresh-btn' data-section='etfs' "
-            "title='Refresh with live data'>\U0001f504</button>"
-            "<span class='section-refresh-status' id='status-etfs'></span>"
-            "</h2>\n"
-            "<div id='log-etfs' class='section-log-panel'></div>\n"
-        )
-        html += "<div class='section-content' id='content-etfs'>\n"
+        html += "<h2>ETFs &amp; Thematic Positions</h2>\n"
         html += "<div class='table-wrap'><table>\n<thead><tr>"
         html += (
             "<th>Ticker</th>"
@@ -3797,7 +3616,6 @@ def generate_html_report(
             html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
-        html += "</div>\n"  # close section-content#content-etfs
     # ---------- Tax analysis section (moved to bottom by request) ----------
     flagged_with_tax = [r for r in results
                         if getattr(r, "tax", None) is not None]
@@ -3877,408 +3695,259 @@ Verdicts are framework outputs, not investment advice.
   });
 })();
 
-/* ---------- Cloud refresh — triggers GitHub Actions run ---------- */
-// GitHub repo and token are injected at report-generation time (see below).
-// GH_REPO format: "username/repo-name"
-// GH_TOKEN needs workflow scope (read-only would 403 on dispatch).
-var _GH_REPO  = document.getElementById('gh-meta') ?
-                document.getElementById('gh-meta').dataset.repo : '';
-var _GH_TOKEN = document.getElementById('gh-meta') ?
-                document.getElementById('gh-meta').dataset.token : '';
-var _GH_BRANCH = document.getElementById('gh-meta') ?
-                 document.getElementById('gh-meta').dataset.branch : 'main';
-
-var _pollTimer = null;
-var _runId = null;
-var _startTime = null;
-
-function _log(msg, cls) {
-  var body = document.getElementById('refresh-panel-body');
-  if (!body) return;
-  var p = document.createElement('p');
-  p.textContent = msg;
-  if (cls) p.className = cls;
-  body.appendChild(p);
-  body.scrollTop = body.scrollHeight;
-}
-
-function _setProgress(pct, label) {
-  var fill = document.getElementById('refresh-progress-fill');
-  var text = document.getElementById('refresh-progress-text');
-  if (fill) fill.style.width = pct + '%';
-  if (text) text.textContent = label;
-}
-
-function _setBtn(state) {
-  var btn = document.getElementById('refreshBtn');
-  if (!btn) return;
-  btn.classList.remove('running','success','error');
-  if (state === 'running') {
-    btn.classList.add('running');
-    btn.innerHTML = '<span class="spin">⏳</span> Running…';
-    btn.disabled = true;
-  } else if (state === 'success') {
-    btn.classList.add('success');
-    btn.innerHTML = '✓ Done — reloading…';
-    btn.disabled = true;
-  } else if (state === 'error') {
-    btn.classList.add('error');
-    btn.innerHTML = '✗ Error — click to retry';
-    btn.disabled = false;
-  } else {
-    btn.innerHTML = '🔄 Refresh';
-    btn.disabled = false;
-  }
-}
-
-function triggerRefresh() {
-  if (!_GH_REPO || !_GH_TOKEN) {
-    alert('GitHub repo/token not configured.\n\nAdd GH_REPO and GH_TOKEN as GitHub Secrets, then regenerate the report.');
-    return;
-  }
-  document.getElementById('refresh-panel').classList.add('open');
-  document.getElementById('refresh-panel-body').innerHTML = '';
-  _setBtn('running');
-  _setProgress(5, 'Triggering workflow…');
-  _startTime = Date.now();
-  _runId = null;
-
-  _log('▶ Triggering GitHub Actions workflow…', 'phase');
-
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/workflows/portfolio.yml/dispatches', {
-    method: 'POST',
-    headers: {
-      'Authorization': 'token ' + _GH_TOKEN,
-      'Accept': 'application/vnd.github+json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ ref: _GH_BRANCH }),
-  })
-  .then(function(r) {
-    if (r.status === 204) {
-      _log('✓ Workflow triggered successfully', 'done');
-      _log('⏳ Waiting for run to start…');
-      _setProgress(10, 'Workflow queued…');
-      setTimeout(_findRun, 5000);
-    } else {
-      return r.text().then(function(t) {
-        throw new Error('GitHub API ' + r.status + ': ' + t);
-      });
-    }
-  })
-  .catch(function(e) {
-    _log('✗ ' + e.message, 'error');
-    _setProgress(0, 'Failed');
-    _setBtn('error');
-  });
-}
-
-function _findRun() {
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs?per_page=5&event=workflow_dispatch', {
-    headers: {
-      'Authorization': 'token ' + _GH_TOKEN,
-      'Accept': 'application/vnd.github+json',
-    },
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    var runs = data.workflow_runs || [];
-    var recent = runs.filter(function(r) {
-      return r.status !== 'completed' ||
-        (Date.now() - new Date(r.created_at).getTime()) < 120000;
-    });
-    if (recent.length > 0) {
-      _runId = recent[0].id;
-      _log('▶ Run #' + _runId + ' started — polling status…', 'phase');
-      _setProgress(20, 'Run started…');
-      _pollTimer = setInterval(_pollRun, 10000);
-    } else {
-      // Not found yet, keep waiting
-      setTimeout(_findRun, 5000);
-    }
-  })
-  .catch(function(e) {
-    _log('✗ Could not find run: ' + e.message, 'error');
-    setTimeout(_findRun, 10000);
-  });
-}
-
-var _STEPS = [
-  [0,  20, 'Queued'],
-  [20, 35, 'Logging into Robinhood…'],
-  [35, 55, 'Fetching positions…'],
-  [55, 70, 'Analyzing compounders…'],
-  [70, 80, 'Analyzing watchlists…'],
-  [80, 88, 'Tax analysis…'],
-  [88, 95, 'Generating report…'],
-  [95, 99, 'Deploying to GitHub Pages…'],
-];
-var _stepIdx = 0;
-
-function _pollRun() {
-  fetch('https://api.github.com/repos/' + _GH_REPO + '/actions/runs/' + _runId, {
-    headers: {
-      'Authorization': 'token ' + _GH_TOKEN,
-      'Accept': 'application/vnd.github+json',
-    },
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(run) {
-    var status     = run.status;
-    var conclusion = run.conclusion;
-    var elapsed    = Math.round((Date.now() - _startTime) / 1000);
-    var mins       = Math.floor(elapsed / 60);
-    var secs       = elapsed % 60;
-    var elapsedStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
-
-    // Advance progress step based on elapsed time
-    var step = _STEPS[Math.min(_stepIdx, _STEPS.length - 1)];
-    var progress = step[0] + Math.min(
-      (elapsed / 600) * (step[1] - step[0]),
-      step[1] - step[0]
-    );
-    if (elapsed > 60  && _stepIdx < 2) { _stepIdx = 2; }
-    if (elapsed > 90  && _stepIdx < 3) { _stepIdx = 3; }
-    if (elapsed > 150 && _stepIdx < 4) { _stepIdx = 4; }
-    if (elapsed > 240 && _stepIdx < 5) { _stepIdx = 5; }
-    if (elapsed > 360 && _stepIdx < 6) { _stepIdx = 6; }
-    if (elapsed > 480 && _stepIdx < 7) { _stepIdx = 7; }
-
-    _setProgress(Math.min(progress, 98), _STEPS[_stepIdx][2] + ' · ' + elapsedStr);
-
-    if (status === 'completed') {
-      clearInterval(_pollTimer);
-      if (conclusion === 'success') {
-        _setProgress(100, 'Complete!');
-        _log('✓ Report updated successfully!', 'done');
-        _log('↻ Reloading in 3 seconds…', 'done');
-        _setBtn('success');
-        setTimeout(function() { location.reload(); }, 3000);
-      } else {
-        _setProgress(100, 'Failed');
-        _log('✗ Workflow failed: ' + conclusion, 'error');
-        _log('  Check: https://github.com/' + _GH_REPO + '/actions', 'error');
-        _setBtn('error');
-      }
-    }
-  })
-  .catch(function(e) {
-    _log('Poll error: ' + e.message, 'error');
-  });
-}
-
-// Section refresh buttons now trigger a full Actions run instead of local API
-document.querySelectorAll('.section-refresh-btn').forEach(function(btn) {
-  btn.addEventListener('click', function() {
-    triggerRefresh();
-  });
-});
-
-/* ---------- Cloud refresh — triggers GitHub Actions run ---------- */
+/* ---------- Filter bar: multi-select pills + search + more toggle ---------- */
 (function() {
-  var meta      = document.getElementById('gh-meta');
-  var GH_REPO   = meta ? (meta.getAttribute('data-repo')   || '') : '';
-  var GH_TOKEN  = meta ? (meta.getAttribute('data-token')  || '') : '';
-  var GH_BRANCH = meta ? (meta.getAttribute('data-branch') || 'main') : 'main';
+  var searchInput = document.getElementById('searchInput');
+  var pills = document.querySelectorAll('.filter-pill[data-filter]');
+  var clearBtn = document.getElementById('clearFilters');
+  var moreToggle = document.getElementById('moreToggle');
+  var moreSection = document.getElementById('filterMore');
+  var statusEl = document.getElementById('filterStatus');
+  if (!searchInput || !pills.length) return;
 
-  var pollTimer = null;
-  var runId     = null;
-  var startTime = null;
-  var stepIdx   = 0;
+  var activeFilters = new Set();
 
-  var STEPS = [
-    [0,  10, 'Queued…'],
-    [10, 30, 'Logging into Robinhood…'],
-    [30, 55, 'Fetching & analyzing positions…'],
-    [55, 70, 'Analyzing watchlists…'],
-    [70, 82, 'Tax analysis…'],
-    [82, 92, 'Generating report…'],
-    [92, 99, 'Deploying to GitHub Pages…'],
-  ];
-
-  function log(msg, cls) {
-    var body = document.getElementById('refresh-panel-body');
-    if (!body) return;
-    var p = document.createElement('p');
-    p.textContent = msg;
-    if (cls) p.className = cls;
-    body.appendChild(p);
-    body.scrollTop = body.scrollHeight;
+  function num(s) {
+    if (s === null || s === '') return NaN;
+    var n = parseFloat(s);
+    return isNaN(n) ? NaN : n;
   }
 
-  function setProgress(pct, label) {
-    var fill = document.getElementById('refresh-progress-fill');
-    var text = document.getElementById('refresh-progress-text');
-    if (fill) fill.style.width = Math.min(pct, 99) + '%';
-    if (text) text.textContent = label;
-  }
+  function rowMatchesFilter(row, filter) {
+    var verdict = row.getAttribute('data-verdict') || '';
+    var verdictScore = num(row.getAttribute('data-verdict-score'));
+    var quality = num(row.getAttribute('data-quality'));
+    var gain = num(row.getAttribute('data-gain'));
+    var gainPct = num(row.getAttribute('data-gain-pct'));
+    var upside = num(row.getAttribute('data-upside'));
+    var pos52 = num(row.getAttribute('data-pos52'));
+    var score = num(row.getAttribute('data-score'));
+    // Two sector attributes: the raw GICS name (Technology, Healthcare...)
+    // and the momentum label (Hot/Cool/Neutral). Both used by different filters.
+    var sectorRaw = (row.getAttribute('data-sector') || '').toLowerCase();
+    var sectorMom = row.getAttribute('data-sector-mom') || '';
+    var insider = row.getAttribute('data-insider') || '';
+    var hasInsider = row.getAttribute('data-has-insider') || '';
+    var trend = row.getAttribute('data-trend') || '';
+    var maPct = num(row.getAttribute('data-ma-pct'));
+    var portPct = num(row.getAttribute('data-port-pct'));
+    var daysHeld = num(row.getAttribute('data-days-held'));
+    var recommendation = row.getAttribute('data-recommendation') || '';
+    var hasTax = row.getAttribute('data-has-tax') || '0';
+    var bucket = row.getAttribute('data-bucket') || '';
 
-  function setBtn(state) {
-    var btn = document.getElementById('refreshBtn');
-    if (!btn) return;
-    btn.classList.remove('running', 'success', 'error');
-    if (state === 'running') {
-      btn.classList.add('running');
-      btn.innerHTML = '<span class="spin">&#9203;</span> Running&hellip;';
-      btn.disabled = true;
-    } else if (state === 'success') {
-      btn.classList.add('success');
-      btn.innerHTML = '&#10003; Done &mdash; reloading&hellip;';
-      btn.disabled = true;
-    } else if (state === 'error') {
-      btn.classList.add('error');
-      btn.innerHTML = '&#10007; Error &mdash; click to retry';
-      btn.disabled = false;
-    } else {
-      btn.innerHTML = '&#128260; Refresh';
-      btn.disabled = false;
+    switch (filter) {
+      // ------------- Essentials (top row) -------------
+      case 'action':          return verdict === 'SELL' || verdict === 'TRIM';
+      case 'buy':             return verdict === 'BUY'  || verdict === 'ADD';
+      case 'high-quality':    return !isNaN(quality) && quality >= 7;
+      case 'hot-sector':      return sectorMom === 'Hot';
+      case 'insider-buy':     return insider === 'supports_buy';
+
+      // ------------- Verdict-specific -------------
+      case 'verdict-add':     return verdict === 'ADD';
+      case 'verdict-hold':    return verdict === 'HOLD';
+      case 'verdict-trim':    return verdict === 'TRIM';
+      case 'verdict-sell':    return verdict === 'SELL';
+      case 'verdict-buy':     return verdict === 'BUY';
+      case 'verdict-watch':   return verdict === 'WATCH';
+      case 'verdict-score-high': return !isNaN(verdictScore) && verdictScore >= 75;
+      case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
+
+      // ------------- Quality / Composite -------------
+      case 'high-score':      return !isNaN(score) && score >= 70;
+      case 'mid-score':       return !isNaN(score) && score >= 50 && score < 70;
+      case 'weak-score':      return !isNaN(score) && score < 40;
+      case 'passes-9':        return !isNaN(quality) && quality === 9;
+      case 'passes-8':        return !isNaN(quality) && quality >= 8;
+      case 'quality-6':       return !isNaN(quality) && quality === 6;
+      case 'low-quality':     return !isNaN(quality) && quality < 5;
+
+      // ------------- Sector momentum -------------
+      case 'cool-sector':     return sectorMom === 'Cool';
+      case 'neutral-sector':  return sectorMom === 'Neutral';
+
+      // ------------- By sector (case-insensitive substring match) -------------
+      case 'sector-technology':         return sectorRaw.indexOf('technolog') !== -1;
+      case 'sector-healthcare':         return sectorRaw.indexOf('healthcare') !== -1;
+      case 'sector-financial':          return sectorRaw.indexOf('financ') !== -1;
+      case 'sector-comm':               return sectorRaw.indexOf('communication') !== -1;
+      case 'sector-consumer-cyclical':  return sectorRaw.indexOf('consumer cyclical') !== -1
+                                            || sectorRaw.indexOf('discretionary') !== -1;
+      case 'sector-consumer-defensive': return sectorRaw.indexOf('consumer defensive') !== -1
+                                            || sectorRaw.indexOf('staples') !== -1;
+      case 'sector-energy':             return sectorRaw.indexOf('energy') !== -1;
+      case 'sector-industrials':        return sectorRaw.indexOf('industrial') !== -1;
+      case 'sector-utilities':          return sectorRaw.indexOf('utilit') !== -1;
+      case 'sector-real-estate':        return sectorRaw.indexOf('real estate') !== -1;
+      case 'sector-basic-materials':    return sectorRaw.indexOf('basic material') !== -1
+                                            || sectorRaw.indexOf('materials') !== -1;
+
+      // ------------- Trend -------------
+      case 'uptrend':         return trend === 'uptrend';
+      case 'sideways':        return trend === 'sideways';
+      case 'downtrend':       return trend === 'downtrend';
+      case 'far-above-ma':    return !isNaN(maPct) && maPct >= 25;
+      case 'far-below-ma':    return !isNaN(maPct) && maPct <= -15;
+      case 'near-200d-ma':    return !isNaN(maPct) && Math.abs(maPct) <= 5;
+
+      // ------------- Price action -------------
+      case 'winners':
+        if (!isNaN(gain))   return gain > 0;
+        if (!isNaN(upside)) return upside > 0;
+        return false;
+      case 'big-winners':     return !isNaN(gainPct) && gainPct >= 25;
+      case 'huge-winners':    return !isNaN(gainPct) && gainPct >= 100;
+      case 'losers':
+        if (!isNaN(gain))   return gain < 0;
+        if (!isNaN(upside)) return upside < 0;
+        return false;
+      case 'beaten-down':     return !isNaN(gainPct) && gainPct <= -15;
+      case 'deep-losers':     return !isNaN(gainPct) && gainPct <= -30;
+      case 'near-low':        return !isNaN(pos52) && pos52 <= 25;
+      case 'mid-range':       return !isNaN(pos52) && pos52 >= 40 && pos52 <= 70;
+      case 'near-high':       return !isNaN(pos52) && pos52 >= 90;
+      case 'big-upside':      return !isNaN(upside) && upside >= 20;
+      case 'massive-upside':  return !isNaN(upside) && upside >= 40;
+      case 'overvalued':      return !isNaN(upside) && upside < 0;
+      case 'very-overvalued': return !isNaN(upside) && upside <= -15;
+
+      // ------------- Analyst rating -------------
+      case 'analyst-strong-buy': return recommendation === 'strong_buy';
+      case 'analyst-buy':        return recommendation === 'buy';
+      case 'analyst-hold':       return recommendation === 'hold';
+      case 'analyst-sell':       return recommendation === 'sell' || recommendation === 'strong_sell';
+
+      // ------------- Insider -------------
+      case 'insider-caution':   return insider === 'caution';
+      case 'insider-no-signal': return insider === 'no_signal';
+      case 'has-insider-data':  return hasInsider === '1';
+
+      // ------------- Position size -------------
+      case 'very-large-position': return !isNaN(portPct) && portPct >= 20;
+      case 'large-position':      return !isNaN(portPct) && portPct >= 10;
+      case 'mid-position':        return !isNaN(portPct) && portPct >= 2 && portPct < 10;
+      case 'small-position':      return !isNaN(portPct) && portPct > 0 && portPct < 2;
+
+      // ------------- Holding period -------------
+      case 'long-term':       return !isNaN(daysHeld) && daysHeld > 365;
+      case 'short-term':      return !isNaN(daysHeld) && daysHeld <= 365;
+      case 'approaching-lt':  return !isNaN(daysHeld) && daysHeld >= 275 && daysHeld <= 365;
+      case 'recent-buy':      return !isNaN(daysHeld) && daysHeld < 30;
+
+      // ------------- Tax -------------
+      case 'has-tax-flag':       return hasTax === '1';
+      case 'tax-loss-candidate': return !isNaN(gainPct) && gainPct <= -5;
+
+      // ------------- Type -------------
+      case 'compounder-only': return bucket === 'compounder';
+      case 'thematic-only':   return bucket === 'thematic' || bucket === 'etf';
+
+      default: return true;
     }
   }
 
-  function openPanel() {
-    var panel = document.getElementById('refresh-panel');
-    var body  = document.getElementById('refresh-panel-body');
-    if (panel) panel.classList.add('open');
-    if (body)  body.innerHTML = '';
-    stepIdx   = 0;
-    startTime = Date.now();
-    runId     = null;
-  }
+  function applyFilters() {
+    var searchTerm = searchInput.value.trim().toLowerCase();
+    var visible = 0, total = 0;
 
-  function findRun() {
-    fetch('https://api.github.com/repos/' + GH_REPO +
-          '/actions/runs?per_page=5&event=workflow_dispatch', {
-      headers: {
-        'Authorization': 'token ' + GH_TOKEN,
-        'Accept': 'application/vnd.github+json'
-      }
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      var runs = (data.workflow_runs || []).filter(function(r) {
-        return r.status !== 'completed' ||
-          (Date.now() - new Date(r.created_at).getTime()) < 120000;
-      });
-      if (runs.length > 0) {
-        runId = runs[0].id;
-        log('Run #' + runId + ' started — polling status…', 'phase');
-        setProgress(15, 'Run started…');
-        pollTimer = setInterval(pollRun, 12000);
-      } else {
-        setTimeout(findRun, 5000);
-      }
-    })
-    .catch(function() { setTimeout(findRun, 8000); });
-  }
-
-  function pollRun() {
-    fetch('https://api.github.com/repos/' + GH_REPO + '/actions/runs/' + runId, {
-      headers: {
-        'Authorization': 'token ' + GH_TOKEN,
-        'Accept': 'application/vnd.github+json'
-      }
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(run) {
-      var elapsed = Math.round((Date.now() - startTime) / 1000);
-      var mins    = Math.floor(elapsed / 60);
-      var secs    = elapsed % 60;
-      var timeStr = (mins > 0 ? mins + 'm ' : '') + secs + 's';
-
-      if (elapsed > 30  && stepIdx < 1) stepIdx = 1;
-      if (elapsed > 60  && stepIdx < 2) stepIdx = 2;
-      if (elapsed > 180 && stepIdx < 3) stepIdx = 3;
-      if (elapsed > 300 && stepIdx < 4) stepIdx = 4;
-      if (elapsed > 420 && stepIdx < 5) stepIdx = 5;
-      if (elapsed > 540 && stepIdx < 6) stepIdx = 6;
-
-      var step     = STEPS[Math.min(stepIdx, STEPS.length - 1)];
-      var progress = step[0] + Math.min(
-        (elapsed / 600) * (step[1] - step[0]), step[1] - step[0]
-      );
-      setProgress(progress, step[2] + ' · ' + timeStr);
-
-      if (run.status === 'completed') {
-        clearInterval(pollTimer);
-        if (run.conclusion === 'success') {
-          setProgress(100, 'Complete!');
-          log('Report updated successfully!', 'done');
-          log('Reloading in 3 seconds…', 'done');
-          setBtn('success');
-          setTimeout(function() { location.reload(); }, 3000);
-        } else {
-          setProgress(0, 'Failed');
-          log('Workflow failed: ' + run.conclusion, 'error');
-          log('Check: https://github.com/' + GH_REPO + '/actions', 'error');
-          setBtn('error');
+    document.querySelectorAll('tbody tr').forEach(function(row) {
+      total++;
+      var searchData = row.getAttribute('data-search') || '';
+      var matches = !searchTerm || searchData.indexOf(searchTerm) !== -1;
+      if (matches && activeFilters.size > 0) {
+        for (var f of activeFilters) {
+          if (!rowMatchesFilter(row, f)) { matches = false; break; }
         }
       }
-    })
-    .catch(function(e) { log('Poll error: ' + e, 'error'); });
+      row.style.display = matches ? '' : 'none';
+      if (matches) visible++;
+    });
+
+    // Hide empty tables (and their .table-wrap + preceding h3 sub-heading)
+    document.querySelectorAll('.table-wrap').forEach(function(wrap) {
+      var anyVisible = false;
+      wrap.querySelectorAll('tbody tr').forEach(function(r) {
+        if (r.style.display !== 'none') anyVisible = true;
+      });
+      wrap.style.display = anyVisible ? '' : 'none';
+      var prev = wrap.previousElementSibling;
+      while (prev && prev.tagName !== 'H2' && prev.tagName !== 'H3') {
+        prev = prev.previousElementSibling;
+      }
+      if (prev && prev.tagName === 'H3') {
+        prev.style.display = anyVisible ? '' : 'none';
+      }
+    });
+
+    if (statusEl) {
+      if (visible === total && !searchTerm && activeFilters.size === 0) {
+        statusEl.textContent = 'Showing all ' + total;
+      } else {
+        var bits = [];
+        if (activeFilters.size) bits.push(activeFilters.size + ' filter' + (activeFilters.size > 1 ? 's' : ''));
+        if (searchTerm) bits.push('search');
+        var suffix = bits.length ? ' (' + bits.join(' + ') + ')' : '';
+        statusEl.textContent = 'Showing ' + visible + ' of ' + total + suffix;
+      }
+    }
+    if (clearBtn) {
+      var hasAny = activeFilters.size > 0 || !!searchTerm;
+      clearBtn.style.opacity = hasAny ? '1' : '0.4';
+      clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
+    }
+    // If any "more filter" is active, auto-open the more section so user sees it
+    if (moreSection) {
+      var anyMoreActive = false;
+      moreSection.querySelectorAll('.filter-pill.active').forEach(function() {
+        anyMoreActive = true;
+      });
+      if (anyMoreActive && !moreSection.classList.contains('show')) {
+        moreSection.classList.add('show');
+        if (moreToggle) {
+          moreToggle.classList.add('expanded');
+          moreToggle.textContent = 'More filters ▴';
+        }
+      }
+    }
   }
 
-  window.triggerRefresh = function() {
-    if (!GH_REPO || !GH_TOKEN) {
-      alert(
-        'GitHub credentials missing.\n\n' +
-        'Add these secrets in your GitHub repo:\n' +
-        '  GH_REPO  = yourusername/portfolio-analyzer\n' +
-        '  GH_TOKEN = your personal access token\n\n' +
-        'Then re-run the workflow to regenerate the report.'
-      );
-      return;
-    }
-    openPanel();
-    setBtn('running');
-    setProgress(5, 'Triggering workflow…');
-    log('Triggering GitHub Actions workflow…', 'phase');
-
-    fetch('https://api.github.com/repos/' + GH_REPO +
-          '/actions/workflows/portfolio.yml/dispatches', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'token ' + GH_TOKEN,
-        'Accept': 'application/vnd.github+json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ ref: GH_BRANCH })
-    })
-    .then(function(r) {
-      if (r.status === 204) {
-        log('Workflow triggered successfully!', 'done');
-        setProgress(10, 'Workflow queued…');
-        setTimeout(findRun, 6000);
+  // Pills toggle on click (multi-select)
+  pills.forEach(function(pill) {
+    pill.addEventListener('click', function() {
+      var f = pill.getAttribute('data-filter');
+      if (activeFilters.has(f)) {
+        activeFilters.delete(f);
+        pill.classList.remove('active');
       } else {
-        return r.text().then(function(t) {
-          throw new Error('GitHub API ' + r.status + ': ' + t);
-        });
+        activeFilters.add(f);
+        pill.classList.add('active');
       }
-    })
-    .catch(function(e) {
-      log('Error: ' + e.message, 'error');
-      setProgress(0, 'Failed');
-      setBtn('error');
-    });
-  };
-
-  // Wire all refresh buttons
-  document.querySelectorAll('.section-refresh-btn, #refreshBtn').forEach(function(btn) {
-    btn.removeAttribute('onclick');
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      window.triggerRefresh();
+      applyFilters();
     });
   });
 
-  // Wire panel close button
-  var closeBtn = document.getElementById('refresh-panel-close');
-  if (closeBtn) {
-    closeBtn.addEventListener('click', function() {
-      var panel = document.getElementById('refresh-panel');
-      if (panel) panel.classList.remove('open');
+  // Clear-all
+  if (clearBtn) {
+    clearBtn.addEventListener('click', function() {
+      activeFilters.clear();
+      pills.forEach(function(p) { p.classList.remove('active'); });
+      searchInput.value = '';
+      applyFilters();
     });
   }
 
+  // More-filters toggle (expand/collapse advanced pills)
+  if (moreToggle && moreSection) {
+    moreToggle.addEventListener('click', function() {
+      var isOpen = moreSection.classList.toggle('show');
+      moreToggle.classList.toggle('expanded', isOpen);
+      moreToggle.textContent = isOpen ? 'More filters ▴' : 'More filters ▾';
+    });
+  }
+
+  searchInput.addEventListener('input', applyFilters);
+  applyFilters();
 })();
 </script>
 </body></html>
@@ -4620,35 +4289,12 @@ def main():
                 try:
                     lots = (tax_lots_lookup.get(r.ticker)
                             if tax_lots_lookup else None)
-
-                    # If current_price is None (yfinance returned nothing during
-                    # the main analysis run), do a fresh fetch now so we can still
-                    # run the lot-level tax analysis. Without a price we can't
-                    # compute per-lot gains, and the position silently disappears
-                    # from the tax section.
-                    current_price = r.current_price
-                    if current_price is None and lots:
-                        try:
-                            import yfinance as _yf
-                            _info = _yf.Ticker(r.ticker).info or {}
-                            current_price = (
-                                _info.get("regularMarketPrice")
-                                or _info.get("currentPrice")
-                            )
-                            if current_price:
-                                current_price = float(current_price)
-                                r.current_price = current_price  # update PA too
-                                print(f"[tax] {r.ticker}: fetched price ${current_price:.2f} "
-                                      f"(was None during main run)")
-                        except Exception as _pe:
-                            print(f"[tax] {r.ticker}: could not fetch price: {_pe}")
-
-                    if lots and current_price:
+                    if lots and r.current_price:
                         r.tax = analyze_tax_with_lots(
                             ticker=r.ticker,
                             verdict=r.verdict.label,
                             lots=lots,
-                            current_price=current_price,
+                            current_price=r.current_price,
                             cfg=tax_cfg,
                         )
                     else:
@@ -4658,12 +4304,6 @@ def main():
                         # holding-period fields empty but a tax estimate
                         # using representative rates. That's enough to keep
                         # the position visible in the tax section.
-                        if not lots:
-                            print(f"[tax] {r.ticker}: no lots found, "
-                                  f"falling back to position-level estimate")
-                        elif not current_price:
-                            print(f"[tax] {r.ticker}: price unavailable, "
-                                  f"falling back to position-level estimate")
                         r.tax = analyze_tax(
                             ticker=r.ticker,
                             verdict=r.verdict.label,
