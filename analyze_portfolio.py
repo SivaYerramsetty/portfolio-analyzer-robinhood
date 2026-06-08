@@ -134,7 +134,8 @@ COMMAND REFERENCE — every way to run this script
 """
 
 from __future__ import annotations
-
+from zoneinfo import ZoneInfo   # Python 3.9+; add near top of file if not already there
+import math as _math
 import argparse
 import csv
 import os
@@ -1452,8 +1453,19 @@ def analyze_position(
         _compute_multi_year_growth(tkr, info)
 
         pa.bucket = classify_position(ticker, info)
-        pa.current_price = _safe_get(info, "regularMarketPrice") \
-            or _safe_get(info, "currentPrice")
+        _regular = _safe_get(info, "regularMarketPrice") or _safe_get(info, "currentPrice")
+        _post = _safe_get(info, "postMarketPrice")
+        _pre = _safe_get(info, "preMarketPrice")
+
+        def _sane_extended(ext, reg):
+            return ext and reg and reg > 0 and abs(ext / reg - 1) < 0.30
+
+        if _sane_extended(_post, _regular):
+            pa.current_price = _post
+        elif _sane_extended(_pre, _regular):
+            pa.current_price = _pre
+        else:
+            pa.current_price = _regular
 
         # Compute LIVE market value from live price × shares
         if pa.current_price is not None:
@@ -2918,7 +2930,23 @@ def generate_html_report(
                     if r.verdict and r.verdict.label in ("SELL", "TRIM")]
     add_items = [r for r in results if r.verdict and r.verdict.label == "ADD"]
 
-    now = datetime.now().strftime("%B %d, %Y · %I:%M %p")
+    _now_est = datetime.now(ZoneInfo("America/New_York"))
+    now = _now_est.strftime("%B %d, %Y · %I:%M %p EST")
+
+    # --- Relative "last updated X ago" ---
+    def _relative_time(dt) -> str:
+        """Return a human-readable 'X days Y hrs ago' string."""
+        total_secs = int((datetime.now(ZoneInfo("America/New_York")) - dt).total_seconds())
+        days = total_secs // 86400
+        hours = (total_secs % 86400) // 3600
+        mins = (total_secs % 3600) // 60
+        if days > 0:
+            return f"{days}d {hours}h ago"
+        if hours > 0:
+            return f"{hours}h {mins}m ago"
+        return f"{mins}m ago"
+
+    relative_now = _relative_time(_now_est)
     delta_class = "pos-up" if delta >= 0 else "pos-down"
     delta_sign = "+" if delta >= 0 else ""
 
@@ -3287,7 +3315,7 @@ def generate_html_report(
         title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
 
 <h1>{report_title}</h1>
-<div class="sub">Live data as of {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
+<div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
