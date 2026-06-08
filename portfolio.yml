@@ -42,6 +42,8 @@ jobs:
             --include-watchlists \
             --save-positions positions.csv \
             --out report.html
+      - name: Add password protection
+        run: python add_password_protection.py report.html --in-place
       - name: Prepare Pages output
         run: |
           mkdir -p _site
