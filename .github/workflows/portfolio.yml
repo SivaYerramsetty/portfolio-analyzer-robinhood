@@ -1,12 +1,9 @@
 name: Portfolio Analyzer
-
 on:
-  # 9:30 AM EST = 14:30 UTC | 4:00 PM EST = 21:00 UTC (weekdays only)
   schedule:
     - cron: '30 14 * * 1-5'   # 9:30 AM EST — market open
     - cron: '0 21 * * 1-5'    # 4:00 PM EST — market close
   workflow_dispatch:
-
 
 permissions:
   contents: read
@@ -20,7 +17,8 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,21 +70,24 @@ jobs:
           TIMESTAMP=$(date -u '+%B %d, %Y at %I:%M %p UTC')
           sed -i "s|<body>|<body><div style='background:#1a2028;color:#8b95a3;font-size:11px;text-align:center;padding:6px;'>Auto-updated: ${TIMESTAMP}</div>|" _site/index.html
 
+      - name: Add password protection        # ← MOVED before upload
+        run: python add_password_protection.py _site/index.html --in-place
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
-      - name: Add password protection
-        run: python add_password_protection.py report.html --in-place
-
   deploy:
     needs: analyze
     runs-on: ubuntu-latest
+    permissions:                             # ← ADDED explicit permissions
+      pages: write
+      id-token: write
+      contents: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
