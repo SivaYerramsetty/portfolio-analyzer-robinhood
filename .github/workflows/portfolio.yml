@@ -1,8 +1,9 @@
 name: Portfolio Analyzer
-
 on:
+  # 9:30 AM EST = 14:30 UTC | 4:00 PM EST = 21:00 UTC (weekdays only)
   schedule:
-    - cron: '30 13 * * 1-5'
+    - cron: '30 14 * * 1-5'   # 9:30 AM EST — market open
+    - cron: '0 21 * * 1-5'    # 4:00 PM EST — market close
   workflow_dispatch:
 
 permissions:
@@ -10,36 +11,19 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
   analyze:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Restore Robinhood session cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.tokens
-          key: robinhood-session-${{ github.run_id }}
-          restore-keys: robinhood-session-
-
+        run: pip install -r requirements.txt
       - name: Run portfolio analyzer
         env:
           RH_USERNAME:        ${{ secrets.RH_USERNAME }}
@@ -50,29 +34,25 @@ jobs:
           TAX_STATE_RATE:     ${{ secrets.TAX_STATE_RATE }}
           TAX_APPLY_NIIT:     ${{ secrets.TAX_APPLY_NIIT }}
           SEC_USER_AGENT:     ${{ secrets.SEC_USER_AGENT }}
-          SMTP_HOST:          ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:          ${{ secrets.SMTP_PORT }}
-          SMTP_USER:          ${{ secrets.SMTP_USER }}
-          SMTP_PASS:          ${{ secrets.SMTP_PASS }}
-          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          GH_REPO:            ${{ secrets.GH_REPO }}
+          GH_TOKEN:           ${{ secrets.GH_TOKEN }}
         run: |
           python analyze_portfolio.py \
             --source robinhood \
             --include-watchlists \
             --save-positions positions.csv \
             --out report.html
-
-      - name: Build site
+      - name: Prepare Pages output
         run: |
           mkdir -p _site
           cp report.html _site/index.html
-          TIMESTAMP=$(date -u '+%B %d, %Y at %I:%M %p UTC')
-          sed -i "s|<body>|<body><div style='background:#1a2028;color:#8b95a3;font-size:11px;text-align:center;padding:6px;'>Auto-updated: ${TIMESTAMP}</div>|" _site/index.html
-
+          echo "<!-- Generated: $(date -u) -->" >> _site/index.html
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+      - name: Add password protection
+        run: python add_password_protection.py report.html --in-place
 
   deploy:
     needs: analyze
@@ -80,7 +60,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
