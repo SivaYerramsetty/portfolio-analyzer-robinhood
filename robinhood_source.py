@@ -333,7 +333,13 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
 
     for order in orders:
         try:
-            if order.get("state") != "filled":
+            # Robinhood marks partially-filled-then-cancelled orders as
+            # 'cancelled', but their executed shares are real. Skipping them
+            # drops genuine buys/sells — a dropped sell leaves a phantom
+            # (often long-term) lot behind. The qty guards below already
+            # exclude orders that never executed anything.
+            if order.get("state") not in ("filled", "partially_filled",
+                                          "cancelled"):
                 continue
             side = order.get("side")  # 'buy' or 'sell'
             if side not in ("buy", "sell"):
@@ -361,7 +367,9 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
                 qty = float(order.get("cumulative_quantity", 0) or 0)
                 price = float(order.get("average_price", 0) or 0)
                 ts = order.get("last_transaction_at") or order.get("created_at")
-                if qty > 0 and ts:
+                # A buy without a price would create a bogus zero-cost lot;
+                # sells only consume lots, so a missing price is harmless.
+                if qty > 0 and ts and not (side == "buy" and price <= 0):
                     txns.setdefault(sym, []).append({
                         "side": side, "date": ts[:10],
                         "shares": qty, "price": price,
@@ -497,7 +505,10 @@ def fetch_realized_ytd(year: Optional[int] = None,
     txns: dict[str, list[dict]] = {}
     for order in orders:
         try:
-            if order.get("state") != "filled":
+            # Include partially-filled-then-cancelled orders — their executed
+            # shares are real trades (same reasoning as fetch_tax_lots).
+            if order.get("state") not in ("filled", "partially_filled",
+                                          "cancelled"):
                 continue
             side = order.get("side")
             if side not in ("buy", "sell"):

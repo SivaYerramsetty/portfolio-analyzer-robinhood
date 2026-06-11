@@ -4316,7 +4316,8 @@ def main():
 
     # Tax analysis for SELL/TRIM positions (holding period + trim timing).
     try:
-        from tax_analysis import TaxConfig, analyze_tax, analyze_tax_with_lots
+        from tax_analysis import (TaxConfig, analyze_tax, analyze_tax_with_lots,
+                                  reconcile_lots_with_position)
         tax_cfg = TaxConfig.from_env()
         flagged = [r for r in results
                    if r.verdict and r.verdict.label in ("SELL", "TRIM")]
@@ -4338,6 +4339,16 @@ def main():
                 try:
                     lots = (tax_lots_lookup.get(r.ticker)
                             if tax_lots_lookup else None)
+                    # Reconcile reconstructed lots against the live share
+                    # count — unrecorded disposals (partial-fill cancels,
+                    # option assignments, transfers) otherwise leave phantom
+                    # lots that misreport the long/short-term split.
+                    recon_note = None
+                    if lots and r.shares:
+                        lots, recon_note = reconcile_lots_with_position(
+                            lots, r.shares, ticker=r.ticker)
+                        if recon_note:
+                            print(f"[tax] {r.ticker}: {recon_note}")
                     if lots and r.current_price:
                         r.tax = analyze_tax_with_lots(
                             ticker=r.ticker,
@@ -4346,6 +4357,9 @@ def main():
                             current_price=r.current_price,
                             cfg=tax_cfg,
                         )
+                        if recon_note:
+                            r.tax.timing_note = (
+                                f"⚠ {recon_note} {r.tax.timing_note}".strip())
                     else:
                         # Fallback: position-level open date. Note: if
                         # position_opened is None (CSV mode without dates),
