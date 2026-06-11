@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 .env
 *.pickle
 *.csv
@@ -7,7 +6,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-*.bak
-*.bak2
-*.bak3
-EOF
+*.bak*
+.DS_Store

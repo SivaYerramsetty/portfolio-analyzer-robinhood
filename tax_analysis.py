@@ -313,6 +313,59 @@ def _build_strategies(ta: TaxAnalysis, gain: float, cfg: TaxConfig) -> list[str]
     return s
 
 
+def reconcile_lots_with_position(
+    lots: list[dict],
+    actual_shares: float,
+    ticker: str = "?",
+    tolerance: float = 0.001,
+) -> tuple[list[dict], Optional[str]]:
+    """Align reconstructed lots with the shares actually held right now.
+
+    Order-history reconstruction can drift from the live position: sells on
+    partially-filled-then-cancelled orders, option assignments, ACATS
+    transfers, or dividend-reinvestment buys that never appear as stock
+    orders. If the lots OVERCOUNT the position, the unrecorded disposal is
+    assumed FIFO (oldest lots consumed first) and the excess is trimmed from
+    the front — otherwise the tax card shows long-gone (often long-term)
+    shares. If the lots UNDERCOUNT, missing acquisition dates can't be
+    invented, so the shortfall is only reported in the note.
+
+    Returns (adjusted_lots, note); note is None when lots already match.
+    """
+    total = sum(float(l.get("shares", 0) or 0) for l in lots)
+    diff = total - float(actual_shares)
+    if abs(diff) <= tolerance:
+        return lots, None
+
+    if diff > 0:
+        remaining = sorted(lots, key=lambda l: l.get("date") or "")
+        to_trim = diff
+        out: list[dict] = []
+        for lot in remaining:
+            sh = float(lot.get("shares", 0) or 0)
+            if to_trim >= sh - tolerance:
+                to_trim -= sh
+                continue
+            if to_trim > 0:
+                lot = dict(lot)
+                lot["shares"] = round(sh - to_trim, 6)
+                lot["cost"] = round(
+                    lot["shares"] * float(lot.get("price", 0) or 0), 2)
+                to_trim = 0.0
+            out.append(lot)
+        note = (f"Order history reconstructed {total:g} share(s) but you "
+                f"hold {actual_shares:g} — dropped the oldest {diff:g} "
+                f"share(s) (FIFO) to match; a past sale is likely missing "
+                f"from order history.")
+        return out, note
+
+    note = (f"You hold {-diff:g} more share(s) than order history explains "
+            f"(transfers or dividend reinvestments may be missing) — the "
+            f"long/short-term split below covers only the {total:g} "
+            f"reconstructed share(s).")
+    return lots, note
+
+
 def analyze_tax_with_lots(
     ticker: str,
     verdict: str,

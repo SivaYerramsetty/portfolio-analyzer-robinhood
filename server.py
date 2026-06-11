@@ -366,7 +366,9 @@ def _run_section(section: str):
             log("Finalizing verdicts with portfolio context…")
             finalize_holding_verdicts(results)
 
-            from tax_analysis import TaxConfig, analyze_tax, analyze_tax_with_lots
+            from tax_analysis import (TaxConfig, analyze_tax,
+                                      analyze_tax_with_lots,
+                                      reconcile_lots_with_position)
             tax_cfg = TaxConfig.from_env()
             flagged = [r for r in results
                        if r.verdict and r.verdict.label in ("SELL", "TRIM")]
@@ -374,11 +376,22 @@ def _run_section(section: str):
             for r in flagged:
                 try:
                     lots = tax_lots.get(r.ticker) if tax_lots else None
+                    # Drop phantom lots when order history disagrees with the
+                    # live share count (see reconcile_lots_with_position).
+                    recon_note = None
+                    if lots and r.shares:
+                        lots, recon_note = reconcile_lots_with_position(
+                            lots, r.shares, ticker=r.ticker)
+                        if recon_note:
+                            log(f"  {r.ticker}: {recon_note}")
                     if lots and r.current_price:
                         r.tax = analyze_tax_with_lots(
                             ticker=r.ticker, verdict=r.verdict.label,
                             lots=lots, current_price=r.current_price, cfg=tax_cfg,
                         )
+                        if recon_note:
+                            r.tax.timing_note = (
+                                f"⚠ {recon_note} {r.tax.timing_note}".strip())
                     else:
                         r.tax = analyze_tax(
                             ticker=r.ticker, verdict=r.verdict.label,
