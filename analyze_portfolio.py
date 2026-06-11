@@ -2694,6 +2694,8 @@ def _render_tax_section(flagged: list,
 
     for r in flagged:
         ta = r.tax
+        if ta is None:
+            continue  # tax analysis failed for this one — don't render a broken card
         verdict_color = r.verdict.color if r.verdict else "#7f8c8d"
         # Header row
         html += (
@@ -2868,13 +2870,18 @@ def _render_tax_section(flagged: list,
     return html
 
 
-def generate_html_report(
-    results: list[PositionAnalysis],
-    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
-    screening_results: Optional[dict] = None,
-    realized_ytd: Optional[dict] = None,
-) -> str:
-    # Compute live total portfolio value, then set live_pct_portfolio per position
+def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
+    """Populate live_pct_portfolio and re-run the v2 verdict with position size.
+
+    analyze_position() runs per-stock without portfolio context, so its verdict
+    can't include the position-size signal. Once the whole portfolio is known,
+    this applies the final verdict — the size penalty can flip a HOLD to TRIM
+    for overweight positions. Idempotent; returns the live portfolio total.
+
+    MUST run before tax analysis: the tax section selects SELL/TRIM positions,
+    so any verdict that flips after the tax loop would silently get no tax card.
+    Watchlist items aren't re-run (you don't own them, so size doesn't apply).
+    """
     live_total = sum(
         r.live_market_value for r in results if r.live_market_value is not None
     )
@@ -2882,11 +2889,6 @@ def generate_html_report(
         if r.live_market_value is not None and live_total > 0:
             r.live_pct_portfolio = r.live_market_value / live_total * 100
 
-    # Re-run v2 verdict now that live_pct_portfolio is populated. This is the
-    # last signal the verdict needs — couldn't be applied earlier because
-    # position size requires knowing the total portfolio, which only this
-    # function does (analyze_position runs per-stock without portfolio context).
-    # Watchlist items aren't re-run (you don't own them, so size doesn't apply).
     for r in results:
         if (r.bucket == "compounder"
                 and r.composite_score is not None
@@ -2916,6 +2918,18 @@ def generate_html_report(
                 position_pct_portfolio=r.live_pct_portfolio,
                 is_holding=True,
             )
+    return live_total
+
+
+def generate_html_report(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    screening_results: Optional[dict] = None,
+    realized_ytd: Optional[dict] = None,
+) -> str:
+    # Final verdicts with portfolio context (idempotent — main() already ran
+    # this before tax analysis; other callers may not have).
+    live_total = finalize_holding_verdicts(results)
 
     statement_total = sum(r.statement_market_value for r in results)
     delta = live_total - statement_total
@@ -4292,6 +4306,13 @@ def main():
                 analyzed_items.append(ticker_cache[t])
             if analyzed_items:
                 watchlists_analyzed[wl_name] = analyzed_items
+
+    # Finalize verdicts with portfolio context BEFORE selecting tax candidates.
+    # analyze_position() can't see position size, so the size overlay applied
+    # here can flip HOLD → TRIM (overweight positions). Running it only inside
+    # generate_html_report() meant such positions showed TRIM in the report but
+    # were never flagged for tax analysis — missing from the tax section.
+    finalize_holding_verdicts(results)
 
     # Tax analysis for SELL/TRIM positions (holding period + trim timing).
     try:

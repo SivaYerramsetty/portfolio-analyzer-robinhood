@@ -358,6 +358,14 @@ def _run_section(section: str):
             log("Fetching YTD realized gains…")
             realized_ytd = rhs.fetch_realized_ytd(verbose=False)
 
+            # Apply the portfolio-level verdict overlay (position size) before
+            # selecting tax candidates — analyze_position alone can't flip an
+            # overweight HOLD to TRIM, so without this those positions would
+            # show TRIM in the report but be missing from the tax section.
+            from analyze_portfolio import finalize_holding_verdicts
+            log("Finalizing verdicts with portfolio context…")
+            finalize_holding_verdicts(results)
+
             from tax_analysis import TaxConfig, analyze_tax, analyze_tax_with_lots
             tax_cfg = TaxConfig.from_env()
             flagged = [r for r in results
