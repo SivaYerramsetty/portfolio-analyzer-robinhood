@@ -3424,6 +3424,23 @@ def generate_html_report(
   thead th:hover {{ background: var(--bg-table-header-hover); color: var(--fg-strong); }}
   thead th.sort-asc::after {{ content: " ▲"; font-size: 9px; opacity: 0.7; }}
   thead th.sort-desc::after {{ content: " ▼"; font-size: 9px; opacity: 0.7; }}
+  /* Sticky column headers (desktop): pin the thead just below the sticky h2
+     while scrolling a long table. Needs overflow:visible on .table-wrap —
+     any overflow other than visible would trap the sticky cells inside the
+     wrapper instead of pinning to the viewport — so this is desktop-only;
+     narrow screens keep overflow-x:auto for horizontal table scrolling.
+     --h2-pin-h is measured by JS at load (h2 height varies with theme/font).
+     The inset box-shadow replaces the th border-bottom while pinned:
+     border-collapse drops cell borders from stuck cells in Chrome. */
+  @media (min-width: 901px) {{
+    .table-wrap {{ overflow-x: visible; }}
+    thead th {{ position: sticky;
+                top: var(--h2-pin-h, 49px);
+                z-index: 10;   /* below the h2 (15), above row content */
+                box-shadow: inset 0 -2px 0 var(--border-medium); }}
+    thead th:first-child {{ border-top-left-radius: 9px; }}
+    thead th:last-child {{ border-top-right-radius: 9px; }}
+  }}
   td {{ padding: 9px 8px; border-bottom: 1px solid var(--border-soft);
         vertical-align: middle; color: var(--fg-body); }}
   tbody tr:nth-child(even) td {{ background: var(--bg-row-even); }}
@@ -3946,6 +3963,22 @@ Click any column header to sort. Click again to reverse.
 Verdicts are framework outputs, not investment advice.
 </p>
 <script>
+// Measure the sticky h2 height so pinned table headers (thead) sit exactly
+// beneath it (CSS uses top: var(--h2-pin-h)). Re-measured on resize because
+// the h2 height changes with viewport font scaling.
+(function() {
+  function setPinOffset() {
+    var h2 = document.querySelector('h2');
+    if (h2) {
+      // -1px overlap avoids a hairline gap between h2 and pinned thead
+      document.documentElement.style.setProperty(
+        '--h2-pin-h', (h2.offsetHeight - 1) + 'px');
+    }
+  }
+  setPinOffset();
+  window.addEventListener('resize', setPinOffset);
+  window.addEventListener('load', setPinOffset);
+})();
 (function() {
   function sortableValue(td) {
     var s = td.getAttribute('data-sort');
