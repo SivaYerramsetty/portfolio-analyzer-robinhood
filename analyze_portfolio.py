@@ -138,10 +138,13 @@ from zoneinfo import ZoneInfo   # Python 3.9+; add near top of file if not alrea
 import math as _math
 import argparse
 import csv
+import io
 import os
 import smtplib
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -1738,6 +1741,119 @@ def analyze_position(
 
 
 # ============================================================
+# Parallel position analysis
+# ============================================================
+# analyze_position() is ~99% network waiting (yfinance info/financials,
+# analyst ratings, SEC insider filings), so a thread pool turns the
+# 4-5s-per-ticker sequential loop into a near-constant-time batch.
+# Module caches touched by workers (_SECTOR_MOMENTUM_CACHE, _RATINGS_CACHE,
+# _INSIDER_CACHE, _CIK_CACHE) are plain dicts: GIL-atomic get/set, and a
+# race only costs a duplicated fetch. Default worker count stays moderate
+# because SEC EDGAR allows ~10 req/s and Yahoo rate-limits aggressive bursts.
+
+class _ThreadOutputRouter:
+    """stdout proxy that diverts print() output to a thread-local buffer.
+
+    Workers run analyze_position concurrently, but its progress prints
+    would interleave unreadably. Each worker pushes a buffer, and the
+    coordinator prints the collected block when the ticker completes.
+    Threads without an active buffer (e.g. the main thread) write through.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def push(self) -> None:
+        self._local.buf = io.StringIO()
+
+    def pop(self) -> str:
+        buf = getattr(self._local, "buf", None)
+        self._local.buf = None
+        return buf.getvalue() if buf is not None else ""
+
+    def write(self, s):
+        buf = getattr(self._local, "buf", None)
+        return (buf if buf is not None else self._real).write(s)
+
+    def flush(self):
+        buf = getattr(self._local, "buf", None)
+        if buf is None:
+            self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def analyze_positions_parallel(
+    rows: list[dict],
+    use_robinhood_ratings: bool = False,
+    is_watchlist: bool = False,
+    max_workers: Optional[int] = None,
+    log_fn=None,
+) -> list[PositionAnalysis]:
+    """Run analyze_position over rows concurrently, preserving input order.
+
+    Progress is reported per completed ticker (to stdout, and to log_fn when
+    given — used by server.py to stream into the dashboard log panel). A
+    ticker whose analysis errored is retried once after a short pause, which
+    absorbs transient Yahoo rate-limit hiccups.
+    """
+    if max_workers is None:
+        try:
+            max_workers = int(os.environ.get("ANALYZE_MAX_WORKERS", "6"))
+        except ValueError:
+            max_workers = 6
+    max_workers = max(1, min(max_workers, len(rows) or 1))
+
+    total = len(rows)
+    results: list[Optional[PositionAnalysis]] = [None] * total
+
+    def work(row: dict) -> tuple[PositionAnalysis, str, float]:
+        t0 = time.time()
+        router.push()
+        try:
+            pa = analyze_position(row, use_robinhood_ratings=use_robinhood_ratings,
+                                  is_watchlist=is_watchlist)
+            if pa.error:
+                time.sleep(2)  # transient rate limits usually clear quickly
+                retry = analyze_position(row, use_robinhood_ratings=use_robinhood_ratings,
+                                         is_watchlist=is_watchlist)
+                if not retry.error:
+                    pa = retry
+        finally:
+            captured = router.pop()
+        return pa, captured, time.time() - t0
+
+    router = _ThreadOutputRouter(sys.stdout)
+    old_stdout, sys.stdout = sys.stdout, router
+    done = 0
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(work, row): i for i, row in enumerate(rows)}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                pa, captured, elapsed = fut.result()
+                results[i] = pa
+                done += 1
+                v = (f"ERROR: {pa.error}" if pa.error
+                     else f"{pa.verdict.label if pa.verdict else '?'} ({pa.bucket})")
+                print(f"  [{done:>2}/{total}] {pa.ticker} -> {v} [{elapsed:.1f}s]",
+                      flush=True)
+                captured = captured.strip()
+                if captured:
+                    for line in captured.splitlines():
+                        print(f"      {line}")
+                if log_fn:
+                    log_fn(f"[{done:>3}/{total}] {pa.ticker} → "
+                           f"{pa.verdict.label if pa.verdict else '?'} ({pa.bucket})")
+    finally:
+        sys.stdout = old_stdout
+
+    return results  # type: ignore[return-value]
+
+
+# ============================================================
 # HTML report
 # ============================================================
 
@@ -1752,6 +1868,160 @@ def _fmt_pct(x: Optional[float], decimals: int = 1, signed: bool = False) -> str
         return "—"
     fmt = f"{{:{'+' if signed else ''}.{decimals}f}}%"
     return fmt.format(x)
+
+
+def _gh_repo_slug() -> str:
+    """Resolve 'owner/repo' for the GitHub-Actions refresh button.
+
+    Prefers GITHUB_REPOSITORY (set automatically inside Actions), then the
+    GH_REPO secret, then the local git remote. Returns "" when unknown —
+    the report then renders without the refresh button.
+    """
+    import re as _re
+    slug = (os.environ.get("GITHUB_REPOSITORY")
+            or os.environ.get("GH_REPO") or "").strip()
+    if slug:
+        # Accept either 'owner/repo' or a full GitHub URL
+        m = _re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?/?$", slug)
+        if m:
+            return m.group(1)
+        if "/" in slug and "://" not in slug:
+            return slug
+    try:
+        import subprocess
+        url = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        m = _re.search(r"github\.com[:/](?:[^@/]+@)?([^/]+/[^/\s]+?)(?:\.git)?/?$", url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _build_refresh_widget() -> str:
+    """Button + JS that triggers the Actions workflow_dispatch from the report.
+
+    The GitHub API allows CORS from any origin, so the static Pages report
+    can call it directly — no server needed. Auth uses a fine-grained PAT
+    (Actions: read/write on this one repo) that the user pastes once per
+    browser; it lives only in localStorage, never in the published HTML.
+    """
+    repo = _gh_repo_slug()
+    if not repo:
+        return ""
+    widget = """
+<div class="sub" style="margin-top:6px;">
+  <button id="ghRefreshBtn" onclick="ghTriggerRefresh()"
+          style="background:var(--bg-card);color:var(--fg-body);border:1px solid var(--border-medium);
+                 border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">
+    &#10227; Refresh data</button>
+  <span id="ghRefreshStatus" style="margin-left:8px;font-size:12px;color:var(--fg-muted);"></span>
+</div>
+<script>
+(function() {
+  var REPO = "__REPO__";
+  var API = "https://api.github.com/repos/" + REPO;
+  var WORKFLOW = "portfolio.yml";   // file name under .github/workflows/
+  var REF = "main";
+  var TOKEN_KEY = "gh-dispatch-token";
+  var pollTimer = null, startedAt = null;
+
+  function setStatus(msg, isError) {
+    var el = document.getElementById("ghRefreshStatus");
+    el.textContent = msg;
+    el.style.color = isError ? "#c0392b" : "var(--fg-muted)";
+  }
+  function headers(tok) {
+    return {"Authorization": "Bearer " + tok,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"};
+  }
+  function getToken(forcePrompt) {
+    var tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok || forcePrompt) {
+      tok = prompt(
+        "Paste a GitHub fine-grained personal access token to trigger the refresh.\\n\\n" +
+        "Create one at github.com -> Settings -> Developer settings -> " +
+        "Fine-grained tokens:\\n" +
+        "  - Repository access: only " + REPO + "\\n" +
+        "  - Permissions: Actions = Read and write\\n\\n" +
+        "It is stored only in this browser (localStorage), never on any server.");
+      if (tok) localStorage.setItem(TOKEN_KEY, tok.trim());
+    }
+    return tok ? tok.trim() : null;
+  }
+  function elapsedStr() {
+    var s = Math.floor((Date.now() - startedAt) / 1000);
+    return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+
+  window.ghTriggerRefresh = async function() {
+    var tok = getToken(false);
+    if (!tok) return;
+    var btn = document.getElementById("ghRefreshBtn");
+    btn.disabled = true;
+    setStatus("Triggering workflow\\u2026");
+    try {
+      var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
+        method: "POST", headers: headers(tok),
+        body: JSON.stringify({ref: REF})
+      });
+      if (r.status === 204) {
+        startedAt = Date.now();
+        setStatus("Workflow queued \\u2014 a fresh report usually takes a few minutes\\u2026");
+        pollTimer = setInterval(pollRun, 12000);
+      } else if (r.status === 401 || r.status === 403) {
+        localStorage.removeItem(TOKEN_KEY);
+        setStatus("Token rejected (HTTP " + r.status + ") \\u2014 click Refresh again to re-enter it.", true);
+        btn.disabled = false;
+      } else {
+        var body = await r.text();
+        setStatus("Dispatch failed: HTTP " + r.status + " " + body.slice(0, 120), true);
+        btn.disabled = false;
+      }
+    } catch (e) {
+      setStatus("Network error: " + e, true);
+      btn.disabled = false;
+    }
+  };
+
+  async function pollRun() {
+    var tok = getToken(false);
+    if (!tok) return;
+    try {
+      var r = await fetch(API + "/actions/runs?event=workflow_dispatch&per_page=1",
+                          {headers: headers(tok)});
+      if (!r.ok) return;
+      var data = await r.json();
+      var run = (data.workflow_runs || [])[0];
+      // Ignore runs from before this click (clock skew margin of 90s)
+      if (!run || new Date(run.created_at).getTime() < startedAt - 90000) {
+        setStatus("Waiting for run to appear\\u2026 " + elapsedStr());
+        return;
+      }
+      if (run.status !== "completed") {
+        setStatus("Run " + run.status.replace("_", " ") + "\\u2026 " + elapsedStr());
+        return;
+      }
+      clearInterval(pollTimer);
+      if (run.conclusion === "success") {
+        setStatus("\\u2713 Done in " + elapsedStr() +
+                  " \\u2014 reloading the fresh report in ~20s (Pages deploy lag)\\u2026");
+        setTimeout(function() { location.reload(); }, 20000);
+      } else {
+        setStatus("Run finished: " + run.conclusion +
+                  " \\u2014 see the repo's Actions tab for logs.", true);
+        document.getElementById("ghRefreshBtn").disabled = false;
+      }
+    } catch (e) { /* transient polling error — try again next tick */ }
+  }
+})();
+</script>
+"""
+    return widget.replace("__REPO__", repo)
 
 
 # For sortable verdict column: most urgent action first.
@@ -2961,6 +3231,7 @@ def generate_html_report(
         return f"{mins}m ago"
 
     relative_now = _relative_time(_now_est)
+    refresh_widget = _build_refresh_widget()
     delta_class = "pos-up" if delta >= 0 else "pos-down"
     delta_sign = "+" if delta >= 0 else ""
 
@@ -3330,6 +3601,7 @@ def generate_html_report(
 
 <h1>{report_title}</h1>
 <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
+{refresh_widget}
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
@@ -4257,53 +4529,33 @@ def main():
             rows = list(csv.DictReader(f))
 
     print(f"Analyzing {len(rows)} positions...")
-    results: list[PositionAnalysis] = []
-    for i, row in enumerate(rows, 1):
-        print(f"  [{i:>2}/{len(rows)}] {row['ticker']}", end=" ", flush=True)
-        pa = analyze_position(row, use_robinhood_ratings=use_rh_ratings)
-        results.append(pa)
-        if pa.error:
-            print(f"ERROR: {pa.error}")
-        else:
-            v = pa.verdict.label if pa.verdict else "?"
-            print(f"-> {v} ({pa.bucket})")
+    results: list[PositionAnalysis] = analyze_positions_parallel(
+        rows, use_robinhood_ratings=use_rh_ratings)
 
-    # Analyze watchlists. Cache results by ticker so a stock in multiple lists
-    # only triggers one yfinance/Robinhood call.
+    # Analyze watchlists. Dedupe by ticker (a stock in multiple lists is
+    # analyzed once), then fan the cached results back out per list.
     watchlists_analyzed: dict[str, list[PositionAnalysis]] = {}
     if watchlist_lookup:
         held_set = {r.ticker for r in results}
-        ticker_cache: dict[str, PositionAnalysis] = {}
-        total_to_fetch = sum(
-            1 for items in watchlist_lookup.values()
-            for it in items if it["ticker"] not in held_set
-        )
-        print(f"\nAnalyzing {total_to_fetch} unique watchlist tickers...")
-        seen = 0
-        for wl_name, items in watchlist_lookup.items():
-            analyzed_items: list[PositionAnalysis] = []
+        unique_rows: dict[str, dict] = {}
+        for items in watchlist_lookup.values():
             for it in items:
                 t = it["ticker"]
-                if t in held_set:
-                    continue  # already covered as a holding
-                if t not in ticker_cache:
-                    seen += 1
-                    print(f"  [{seen:>2}/{total_to_fetch}] {t}", end=" ", flush=True)
-                    pa = analyze_position(
-                        {
-                            "ticker": t, "name": it["name"],
-                            "shares": 0, "market_value": 0, "pct_portfolio": 0,
-                        },
-                        use_robinhood_ratings=use_rh_ratings,
-                        is_watchlist=True,
-                    )
-                    ticker_cache[t] = pa
-                    if pa.error:
-                        print(f"ERROR: {pa.error}")
-                    else:
-                        v = pa.verdict.label if pa.verdict else "?"
-                        print(f"-> {v} ({pa.bucket})")
-                analyzed_items.append(ticker_cache[t])
+                if t not in held_set and t not in unique_rows:
+                    unique_rows[t] = {
+                        "ticker": t, "name": it["name"],
+                        "shares": 0, "market_value": 0, "pct_portfolio": 0,
+                    }
+        print(f"\nAnalyzing {len(unique_rows)} unique watchlist tickers...")
+        analyzed = analyze_positions_parallel(
+            list(unique_rows.values()),
+            use_robinhood_ratings=use_rh_ratings,
+            is_watchlist=True,
+        )
+        ticker_cache = {pa.ticker: pa for pa in analyzed}
+        for wl_name, items in watchlist_lookup.items():
+            analyzed_items = [ticker_cache[it["ticker"]] for it in items
+                              if it["ticker"] in ticker_cache]
             if analyzed_items:
                 watchlists_analyzed[wl_name] = analyzed_items
 

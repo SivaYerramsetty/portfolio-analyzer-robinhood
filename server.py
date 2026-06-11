@@ -63,21 +63,12 @@ def _rh_login():
     return rhs
 
 def _analyze_rows(rows, use_rh_ratings=True, is_watchlist=False, log_fn=None):
-    """Run analyze_position on each row, return list[PositionAnalysis]."""
-    from analyze_portfolio import analyze_position
-    results = []
-    total = len(rows)
-    for i, row in enumerate(rows, 1):
-        ticker = row.get("ticker", "?")
-        if log_fn:
-            log_fn(f"[{i:>3}/{total}] {ticker} …")
-        pa = analyze_position(row, use_robinhood_ratings=use_rh_ratings,
-                              is_watchlist=is_watchlist)
-        if log_fn:
-            v = pa.verdict.label if pa.verdict else "?"
-            log_fn(f"[{i:>3}/{total}] {ticker} → {v} ({pa.bucket})")
-        results.append(pa)
-    return results
+    """Run analyze_position on each row (in parallel), return list[PositionAnalysis]."""
+    from analyze_portfolio import analyze_positions_parallel
+    return analyze_positions_parallel(
+        rows, use_robinhood_ratings=use_rh_ratings,
+        is_watchlist=is_watchlist, log_fn=log_fn,
+    )
 
 def _render_section_html(section: str, results, watchlists=None, realized_ytd=None,
                           tax_lots=None) -> str:
@@ -273,8 +264,6 @@ def _run_section(section: str):
         _log(section, msg)
 
     try:
-        from analyze_portfolio import analyze_position, compute_verdict_v2
-
         # ── Compounders ──────────────────────────────────────────────────────
         if section == "compounders":
             log("Logging into Robinhood…")
@@ -317,24 +306,22 @@ def _run_section(section: str):
             total = sum(len(v) for v in watchlist_lookup.values())
             log(f"Found {len(watchlist_lookup)} watchlists, {total} tickers. Analyzing…")
 
-            ticker_cache = {}
-            watchlists_analyzed = {}
-            for wl_name, items in watchlist_lookup.items():
-                analyzed = []
+            unique_rows = {}
+            for items in watchlist_lookup.values():
                 for it in items:
                     t = it["ticker"]
-                    if t not in ticker_cache:
-                        log(f"  Analyzing {t}…")
-                        pa = analyze_position(
-                            {"ticker": t, "name": it["name"], "shares": 0,
-                             "market_value": 0, "pct_portfolio": 0},
-                            use_robinhood_ratings=True,
-                            is_watchlist=True,
-                        )
-                        ticker_cache[t] = pa
-                        v = pa.verdict.label if pa.verdict else "?"
-                        log(f"  {t} → {v}")
-                    analyzed.append(ticker_cache[t])
+                    if t not in unique_rows:
+                        unique_rows[t] = {"ticker": t, "name": it["name"],
+                                          "shares": 0, "market_value": 0,
+                                          "pct_portfolio": 0}
+            analyzed_list = _analyze_rows(list(unique_rows.values()),
+                                          use_rh_ratings=True,
+                                          is_watchlist=True, log_fn=log)
+            ticker_cache = {pa.ticker: pa for pa in analyzed_list}
+            watchlists_analyzed = {}
+            for wl_name, items in watchlist_lookup.items():
+                analyzed = [ticker_cache[it["ticker"]] for it in items
+                            if it["ticker"] in ticker_cache]
                 if analyzed:
                     watchlists_analyzed[wl_name] = analyzed
 
