@@ -30,8 +30,10 @@ SECURITY NOTES:
   - Never commit credentials. Add `.env`, `*.pickle`, and `.tokens/` to .gitignore.
 """
 
+import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -59,6 +61,68 @@ except ImportError:
 
 # Cache for ratings (avoid duplicate fetches in one run)
 _RATINGS_CACHE: dict[str, Optional[dict]] = {}
+
+# Full order history is paginated and slow to fetch, and it's needed by both
+# fetch_tax_lots() and fetch_realized_ytd() in the same run. Cache it with a
+# short TTL: one pipeline run shares a single fetch, while a long-lived
+# server process still refreshes on the next dashboard refresh.
+_ORDERS_CACHE: Optional[tuple[float, list]] = None
+_ORDERS_TTL_S = 600
+
+
+def _get_all_orders(verbose: bool = False) -> list:
+    global _ORDERS_CACHE
+    now = time.time()
+    if _ORDERS_CACHE is not None and now - _ORDERS_CACHE[0] <= _ORDERS_TTL_S:
+        return _ORDERS_CACHE[1]
+    if verbose:
+        print("[orders] Fetching full order history (may take a moment)...")
+    orders = rh.orders.get_all_stock_orders() or []
+    _ORDERS_CACHE = (now, orders)
+    return orders
+
+
+# Instrument-URL -> ticker symbol mappings never change, but resolving one
+# costs an API call. Persist them so reruns (and CI via actions/cache) skip
+# the lookups entirely.
+_INSTRUMENT_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "instruments.json"
+_INSTRUMENT_CACHE: Optional[dict] = None
+
+
+def _instrument_cache() -> dict:
+    global _INSTRUMENT_CACHE
+    if _INSTRUMENT_CACHE is None:
+        try:
+            _INSTRUMENT_CACHE = json.loads(_INSTRUMENT_CACHE_PATH.read_text())
+        except Exception:
+            _INSTRUMENT_CACHE = {}
+    return _INSTRUMENT_CACHE
+
+
+def _save_instrument_cache() -> None:
+    try:
+        _INSTRUMENT_CACHE_PATH.parent.mkdir(exist_ok=True)
+        _INSTRUMENT_CACHE_PATH.write_text(json.dumps(_instrument_cache()))
+    except Exception:
+        pass  # cache is an optimization — never fail the run over it
+
+
+def _resolve_instrument_symbol(inst_url: str) -> Optional[str]:
+    cache = _instrument_cache()
+    if inst_url in cache:
+        return cache[inst_url]
+    sym = None
+    try:
+        sym = rh.stocks.get_symbol_by_url(inst_url)
+    except Exception:
+        try:
+            inst = rh.helper.request_get(inst_url)
+            sym = (inst or {}).get("symbol")
+        except Exception:
+            sym = None
+    if sym:
+        cache[inst_url] = sym
+    return sym
 
 
 def _require_rh():
@@ -252,13 +316,7 @@ def _fetch_position_open_dates() -> dict[str, str]:
                     continue
                 date_str = created[:10]  # 'YYYY-MM-DD' from ISO timestamp
                 inst_url = pos.get("instrument")
-                sym = None
-                if inst_url:
-                    try:
-                        sym = rh.stocks.get_symbol_by_url(inst_url)
-                    except Exception:
-                        inst = rh.helper.request_get(inst_url)
-                        sym = (inst or {}).get("symbol")
+                sym = _resolve_instrument_symbol(inst_url) if inst_url else None
                 if sym:
                     # Keep the EARLIEST date if ticker appears more than once
                     if sym not in out or date_str < out[sym]:
@@ -267,6 +325,7 @@ def _fetch_position_open_dates() -> dict[str, str]:
                 continue
     except Exception as e:
         print(f"[robinhood] Could not fetch position dates: {e}")
+    _save_instrument_cache()
     return out
 
 
@@ -294,16 +353,13 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
     try:
         if verbose:
             print("[tax-lots] Fetching full order history (may take a moment)...")
-        orders = rh.orders.get_all_stock_orders()
+        orders = _get_all_orders(verbose=verbose)
     except Exception as e:
         print(f"[tax-lots] Could not fetch orders: {e}")
         return lots_by_ticker
 
     if not orders:
         return lots_by_ticker
-
-    # Resolve instrument URLs to symbols (cache to avoid repeat calls)
-    inst_cache: dict[str, str] = {}
 
     def resolve_symbol(order: dict) -> Optional[str]:
         # Newer responses sometimes include 'symbol' directly
@@ -312,20 +368,7 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
         inst_url = order.get("instrument")
         if not inst_url:
             return None
-        if inst_url in inst_cache:
-            return inst_cache[inst_url]
-        sym = None
-        try:
-            sym = rh.stocks.get_symbol_by_url(inst_url)
-        except Exception:
-            try:
-                inst = rh.helper.request_get(inst_url)
-                sym = (inst or {}).get("symbol")
-            except Exception:
-                sym = None
-        if sym:
-            inst_cache[inst_url] = sym
-        return sym
+        return _resolve_instrument_symbol(inst_url)
 
     # Group filled buy/sell executions by ticker, each with date/shares/price
     # Structure: {ticker: [{"side","date","shares","price"}, ...]}
@@ -415,6 +458,7 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
 
     if verbose:
         print(f"[tax-lots] Reconstructed lots for {len(lots_by_ticker)} ticker(s).")
+    _save_instrument_cache()
     return lots_by_ticker
 
 
@@ -469,7 +513,7 @@ def fetch_realized_ytd(year: Optional[int] = None,
     try:
         if verbose:
             print(f"[realized-ytd] Computing realized gains for {year}...")
-        orders = rh.orders.get_all_stock_orders()
+        orders = _get_all_orders(verbose=verbose)
     except Exception as e:
         print(f"[realized-ytd] Could not fetch orders: {e}")
         return empty
@@ -477,29 +521,13 @@ def fetch_realized_ytd(year: Optional[int] = None,
     if not orders:
         return empty
 
-    # Resolve instrument URLs to symbols (cache to avoid repeat calls)
-    inst_cache: dict[str, str] = {}
-
     def resolve_symbol(order: dict) -> Optional[str]:
         if order.get("symbol"):
             return order["symbol"]
         inst_url = order.get("instrument")
         if not inst_url:
             return None
-        if inst_url in inst_cache:
-            return inst_cache[inst_url]
-        sym = None
-        try:
-            sym = rh.stocks.get_symbol_by_url(inst_url)
-        except Exception:
-            try:
-                inst = rh.helper.request_get(inst_url)
-                sym = (inst or {}).get("symbol")
-            except Exception:
-                sym = None
-        if sym:
-            inst_cache[inst_url] = sym
-        return sym
+        return _resolve_instrument_symbol(inst_url)
 
     # Same grouping as fetch_tax_lots
     txns: dict[str, list[dict]] = {}
@@ -595,6 +623,7 @@ def fetch_realized_ytd(year: Optional[int] = None,
         print(f"[realized-ytd] {len(realized_gains)} matched sale(s) in {year}: "
               f"ST net ${st_gains - st_losses:,.0f}, LT net ${lt_gains - lt_losses:,.0f}")
 
+    _save_instrument_cache()
     return {
         "year": year,
         "realized_gains": realized_gains,

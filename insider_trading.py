@@ -25,11 +25,14 @@ Cached by ticker so repeated lookups across watchlist + holdings are free.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import socket
+import threading
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -63,7 +66,76 @@ def _default_sec_ua() -> str:
 
 _SEC_UA = _default_sec_ua()
 
+# SEC EDGAR fair-use limit is 10 requests/second per user agent. With
+# parallel ticker analysis, uncoordinated workers burst past that and get
+# HTTP 429s (silently degrading insider data). All SEC requests go through
+# _sec_get(), which enforces a global minimum spacing across threads and
+# retries once on 429.
+_SEC_MIN_INTERVAL_S = 0.13   # ~7.5 req/s, comfortably under the limit
+_sec_gate = threading.Lock()
+_sec_last_request = 0.0
+
+
+def _sec_get(url: str, timeout: int = 10) -> "requests.Response":
+    global _sec_last_request
+    for attempt in (1, 2):
+        with _sec_gate:
+            wait = _SEC_MIN_INTERVAL_S - (time.time() - _sec_last_request)
+            if wait > 0:
+                time.sleep(wait)
+            _sec_last_request = time.time()
+        resp = requests.get(url, headers={"User-Agent": _SEC_UA}, timeout=timeout)
+        if resp.status_code != 429 or attempt == 2:
+            return resp
+        time.sleep(1.0)  # back off once, then return whatever we get
+    return resp
+
+
 _INSIDER_CACHE: dict[str, Optional[dict]] = {}
+
+# Scanning a company's recent Form 4s costs ~2 gated SEC requests per filing
+# (mega-caps have 25-45 in a 90-day window — 10+ seconds each). The
+# underlying filings change at most a few times a day, so results are
+# persisted to disk with a TTL: only the first run of the day pays the
+# scan cost. Delete .cache/insider.json (or set INSIDER_CACHE_TTL_HOURS=0)
+# to force a fresh scan.
+_INSIDER_DISK_PATH = Path(__file__).resolve().parent / ".cache" / "insider.json"
+try:
+    _INSIDER_TTL_S = float(os.environ.get("INSIDER_CACHE_TTL_HOURS", "12")) * 3600
+except ValueError:
+    _INSIDER_TTL_S = 12 * 3600
+_insider_disk_lock = threading.Lock()
+_insider_disk: Optional[dict] = None
+
+
+def _insider_disk_load() -> dict:
+    global _insider_disk
+    if _insider_disk is None:
+        try:
+            _insider_disk = json.loads(_INSIDER_DISK_PATH.read_text())
+        except Exception:
+            _insider_disk = {}
+    return _insider_disk
+
+
+def _insider_disk_get(key: str) -> Optional[dict]:
+    with _insider_disk_lock:
+        entry = _insider_disk_load().get(key)
+    if not entry or time.time() - entry.get("ts", 0) > _INSIDER_TTL_S:
+        return None
+    return entry.get("result")
+
+
+def _insider_disk_put(key: str, result: dict) -> None:
+    with _insider_disk_lock:
+        cache = _insider_disk_load()
+        cache[key] = {"ts": time.time(), "result": result}
+        try:
+            _INSIDER_DISK_PATH.parent.mkdir(exist_ok=True)
+            _INSIDER_DISK_PATH.write_text(json.dumps(cache))
+        except Exception:
+            pass  # cache is an optimization — never fail the run over it
+
 
 # How many days of insider activity to consider "recent"
 DEFAULT_LOOKBACK_DAYS = 90
@@ -89,6 +161,14 @@ def get_insider_activity(
     cache_key = f"{ticker}:{lookback_days}"
     if cache_key in _INSIDER_CACHE:
         return _INSIDER_CACHE[cache_key]
+
+    disk_hit = _insider_disk_get(cache_key)
+    if disk_hit is not None:
+        if verbose:
+            print(f"[insider:{ticker}] {disk_hit.get('net_signal', '?')} "
+                  f"(cached, source={disk_hit.get('source', '?')})")
+        _INSIDER_CACHE[cache_key] = disk_hit
+        return disk_hit
 
     cutoff = date.today() - timedelta(days=lookback_days)
     result = None
@@ -163,12 +243,25 @@ def get_insider_activity(
         print(f"[insider:{ticker}] no data ({'; '.join(errors)})")
 
     _INSIDER_CACHE[cache_key] = result
+    if result is not None:
+        # Persist only real results: a None from a transient SEC outage
+        # shouldn't suppress retries for the whole TTL window.
+        _insider_disk_put(cache_key, result)
     return result
 
 
 def _has_real_sec_ua() -> bool:
     """Kept for backward compatibility with --debug-insider flag."""
     return True  # _SEC_UA is now always set to a sensible default
+
+
+# Share-class twins (GOOG/GOOGL) resolve to the same CIK and would scan the
+# same filings twice. Scans are cached per (CIK, cutoff); a per-key lock
+# makes a concurrent worker for the twin wait for the first scan instead of
+# duplicating ~50 gated SEC requests.
+_SEC_SCAN_CACHE: dict[str, Optional[dict]] = {}
+_SEC_SCAN_LOCKS: dict[str, threading.Lock] = {}
+_sec_scan_registry_lock = threading.Lock()
 
 
 def _fetch_sec_insider(ticker: str, cutoff: date,
@@ -187,9 +280,27 @@ def _fetch_sec_insider(ticker: str, cutoff: date,
             print(f"[insider:{ticker}] SEC: no CIK found")
         return None
 
+    scan_key = f"{cik}:{cutoff.isoformat()}"
+    with _sec_scan_registry_lock:
+        scan_lock = _SEC_SCAN_LOCKS.setdefault(scan_key, threading.Lock())
+    with scan_lock:
+        if scan_key in _SEC_SCAN_CACHE:
+            if verbose:
+                print(f"[insider:{ticker}] SEC: reusing scan for CIK {cik}")
+        else:
+            _SEC_SCAN_CACHE[scan_key] = _scan_sec_form4s(
+                ticker, cik, cutoff, verbose=verbose)
+        result = _SEC_SCAN_CACHE[scan_key]
+    # Copy so per-ticker post-processing never mutates the shared entry
+    return dict(result) if result is not None else None
+
+
+def _scan_sec_form4s(ticker: str, cik: int, cutoff: date,
+                     verbose: bool = False) -> Optional[dict]:
+    """The actual EDGAR crawl: submissions index + every Form 4 in window."""
     url = f"https://data.sec.gov/submissions/CIK{cik:010d}.json"
     try:
-        resp = requests.get(url, headers={"User-Agent": _SEC_UA}, timeout=15)
+        resp = _sec_get(url, timeout=15)
         if verbose:
             print(f"[insider:{ticker}] SEC submissions: HTTP {resp.status_code} "
                   f"(CIK {cik})")
@@ -224,9 +335,10 @@ def _fetch_sec_insider(ticker: str, cutoff: date,
         if f_d < cutoff:
             break  # filings are reverse-chrono
         form4_count += 1
+        # No politeness sleep needed here — every request already goes
+        # through _sec_get()'s global rate gate.
         parsed = _parse_form4(cik, acc, verbose=verbose)
         if not parsed:
-            time.sleep(0.12)
             continue
         for code, value in (parsed.get("by_code") or {}).items():
             slot = code_totals.setdefault(code, {"count": 0, "value": 0.0})
@@ -236,7 +348,6 @@ def _fetch_sec_insider(ticker: str, cutoff: date,
         if parsed.get("is_10b5_1"):
             plan_filings += 1
             total_plan_value += parsed.get("plan_value", 0.0)
-        time.sleep(0.12)
 
     # Buy = P codes only (genuine discretionary buys)
     buy_count = code_totals.get("P", {}).get("count", 0)
@@ -299,7 +410,7 @@ def _resolve_cik(ticker: str) -> Optional[int]:
         return None
     try:
         url = "https://www.sec.gov/files/company_tickers.json"
-        resp = requests.get(url, headers={"User-Agent": _SEC_UA}, timeout=20)
+        resp = _sec_get(url, timeout=20)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -452,7 +563,7 @@ def _parse_form4(cik: int, accession: str,
     # --- Step 1: enumerate files via structured JSON endpoint ---
     try:
         idx_json = f"{base}/index.json"
-        resp = requests.get(idx_json, headers={"User-Agent": _SEC_UA}, timeout=10)
+        resp = _sec_get(idx_json, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             items = (data.get("directory") or {}).get("item") or []
@@ -485,7 +596,7 @@ def _parse_form4(cik: int, accession: str,
     # --- Step 3: try each candidate until one parses successfully ---
     for url in candidate_urls:
         try:
-            r = requests.get(url, headers={"User-Agent": _SEC_UA}, timeout=10)
+            r = _sec_get(url, timeout=10)
             if r.status_code != 200:
                 continue
             parsed = _aggregate_form4_transactions(r.text)

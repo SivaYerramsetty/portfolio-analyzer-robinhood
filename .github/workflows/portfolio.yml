@@ -41,6 +41,17 @@ jobs:
           key: robinhood-session-${{ github.run_id }}
           restore-keys: robinhood-session-
 
+      # .cache holds instrument-URL -> ticker mappings (never change) and
+      # SEC insider-scan results (12h TTL) — carrying them across runs skips
+      # hundreds of rate-gated SEC requests. run_id keying means each run
+      # saves a fresh copy; restore-keys picks up the most recent previous one.
+      - name: Restore analyzer cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: analyzer-cache-${{ github.run_id }}
+          restore-keys: analyzer-cache-
+
       - name: Run portfolio analyzer
         env:
           RH_USERNAME:        ${{ secrets.RH_USERNAME }}
