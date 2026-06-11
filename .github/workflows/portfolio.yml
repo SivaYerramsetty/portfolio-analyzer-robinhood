@@ -1,8 +1,8 @@
 name: Portfolio Analyzer
 on:
-  schedule:
-    - cron: '30 14 * * 1-5'   # 9:30 AM EST — market open
-    - cron: '0 21 * * 1-5'    # 4:00 PM EST — market close
+    # schedule:                          # ← comment these out
+  #   - cron: '30 13 * * 1-5'
+  #   - cron: '0 20 * * 1-5'
   workflow_dispatch:
 
 permissions:
