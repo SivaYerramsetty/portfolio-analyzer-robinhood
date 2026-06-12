@@ -1870,6 +1870,30 @@ def _fmt_pct(x: Optional[float], decimals: int = 1, signed: bool = False) -> str
     return fmt.format(x)
 
 
+def select_watchlist_prune_candidates(
+    watchlists_analyzed: dict[str, list[PositionAnalysis]],
+    threshold: float = 60.0,
+) -> dict[str, list[str]]:
+    """Pick watchlist tickers whose verdict score fell below `threshold`.
+
+    Returns {watchlist_name: [tickers_to_remove]}. Only positions with a
+    real numeric verdict score qualify — analysis errors (score None) are
+    never pruned, so a transient data failure can't empty a watchlist.
+    Held positions never appear here: watchlist analysis skips tickers you
+    own, so a low-scoring holding stays on its watchlist.
+    """
+    out: dict[str, list[str]] = {}
+    for wl_name, items in (watchlists_analyzed or {}).items():
+        ticks = [pa.ticker for pa in items
+                 if not pa.error
+                 and pa.verdict is not None
+                 and pa.verdict.score is not None
+                 and pa.verdict.score < threshold]
+        if ticks:
+            out[wl_name] = ticks
+    return out
+
+
 def _gh_repo_slug() -> str:
     """Resolve 'owner/repo' for the GitHub-Actions refresh button.
 
@@ -1901,25 +1925,27 @@ def _gh_repo_slug() -> str:
     return ""
 
 
-def _build_refresh_widget() -> str:
+def _build_refresh_widget() -> tuple[str, str]:
     """Button + JS that triggers the Actions workflow_dispatch from the report.
 
     The GitHub API allows CORS from any origin, so the static Pages report
     can call it directly — no server needed. Auth uses a fine-grained PAT
     (Actions: read/write on this one repo) that the user pastes once per
     browser; it lives only in localStorage, never in the published HTML.
+
+    Returns (button_html, status_and_script_html) so the button can sit in
+    the header controls cluster while the status line + script live below.
+    Both are "" when the repo can't be resolved.
     """
     repo = _gh_repo_slug()
     if not repo:
-        return ""
+        return "", ""
+    button = ('<button id="ghRefreshBtn" class="refresh-btn" '
+              'onclick="ghTriggerRefresh()" '
+              'title="Trigger the GitHub Actions workflow to regenerate this report">'
+              '&#10227; Refresh data</button>')
     widget = """
-<div class="sub" style="margin-top:6px;">
-  <button id="ghRefreshBtn" onclick="ghTriggerRefresh()"
-          style="background:var(--bg-card);color:var(--fg-body);border:1px solid var(--border-medium);
-                 border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">
-    &#10227; Refresh data</button>
-  <span id="ghRefreshStatus" style="margin-left:8px;font-size:12px;color:var(--fg-muted);"></span>
-</div>
+<div id="ghRefreshStatus" class="refresh-status"></div>
 <script>
 (function() {
   var REPO = "__REPO__";
@@ -2021,7 +2047,7 @@ def _build_refresh_widget() -> str:
 })();
 </script>
 """
-    return widget.replace("__REPO__", repo)
+    return button, widget.replace("__REPO__", repo)
 
 
 # For sortable verdict column: most urgent action first.
@@ -3231,7 +3257,7 @@ def generate_html_report(
         return f"{mins}m ago"
 
     relative_now = _relative_time(_now_est)
-    refresh_widget = _build_refresh_widget()
+    refresh_button_html, refresh_status_html = _build_refresh_widget()
     delta_class = "pos-up" if delta >= 0 else "pos-down"
     delta_sign = "+" if delta >= 0 else ""
 
@@ -3271,6 +3297,7 @@ def generate_html_report(
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   /* ---------- Theme tokens (light by default) ---------- */
   :root {{
@@ -3378,7 +3405,26 @@ def generate_html_report(
           transition: background 0.2s, color 0.2s; }}
 
   /* ---------- Headers ---------- */
-  h1 {{ font-size: 28px; margin: 0 0 6px; font-weight: 600;
+  /* Compact report header: title + meta on the left, controls (refresh,
+     theme toggle) on the right, all in one wrapping flex row. */
+  .report-header {{ display: flex; justify-content: space-between;
+                    align-items: center; gap: 16px; flex-wrap: wrap;
+                    margin: 0 0 12px; }}
+  .report-header .sub {{ margin: 3px 0 0; }}
+  .report-controls {{ display: flex; align-items: center; gap: 8px; }}
+  .refresh-btn {{ height: 34px; padding: 0 14px; border-radius: 17px;
+                  border: 1px solid var(--border-medium);
+                  background: var(--bg-card); color: var(--fg-body);
+                  cursor: pointer; font-size: 12px; font-weight: 600;
+                  display: flex; align-items: center; gap: 6px;
+                  box-shadow: var(--shadow-card);
+                  transition: transform 0.15s, background 0.2s; }}
+  .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
+  .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
+  .refresh-status {{ font-size: 12px; color: var(--fg-muted);
+                     text-align: right; margin: -6px 0 10px; }}
+  .refresh-status:empty {{ display: none; }}
+  h1 {{ font-size: 24px; margin: 0; font-weight: 600;
         letter-spacing: -0.3px; color: var(--fg-strong); }}
   h2 {{ font-size: 19px; margin: 36px 0 12px; font-weight: 600;
         color: var(--fg-strong);
@@ -3397,8 +3443,8 @@ def generate_html_report(
 
   /* ---------- Summary card ---------- */
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
-                   border-radius: 10px; padding: 20px 24px;
-                   margin-bottom: 24px;
+                   border-radius: 10px; padding: 14px 20px;
+                   margin-bottom: 16px;
                    box-shadow: var(--shadow-card); }}
   .summary-row {{ display: flex; gap: 36px; flex-wrap: wrap; }}
   .stat {{ font-size: 12px; color: var(--fg-muted);
@@ -3528,15 +3574,13 @@ def generate_html_report(
                     font-variant-numeric: tabular-nums;
                     white-space: nowrap; }}
 
-  /* ---------- Theme toggle button (floating in top-right) ---------- */
-  .theme-toggle {{ position: fixed; top: 20px; right: 20px;
-                   width: 38px; height: 38px;
+  /* ---------- Theme toggle button (in the header controls cluster) ---------- */
+  .theme-toggle {{ width: 34px; height: 34px; flex: 0 0 auto;
                    border-radius: 50%; border: 1px solid var(--border-medium);
                    background: var(--bg-card); color: var(--fg-body);
-                   cursor: pointer; font-size: 18px;
+                   cursor: pointer; font-size: 16px;
                    display: flex; align-items: center; justify-content: center;
                    box-shadow: var(--shadow-card);
-                   z-index: 100;
                    transition: transform 0.15s, background 0.2s; }}
   .theme-toggle:hover {{ transform: scale(1.08); background: var(--bg-card-hover); }}
 
@@ -3594,8 +3638,7 @@ def generate_html_report(
     .filter-group-label {{ min-width: auto; }}
     table {{ font-size: 12px; }}
     thead th, td {{ padding: 8px 6px; }}
-    .theme-toggle {{ top: 12px; right: 12px;
-                     width: 34px; height: 34px; font-size: 16px; }}
+    .refresh-status {{ text-align: left; margin-top: 0; }}
   }}
 </style>
 </head>
@@ -3613,12 +3656,18 @@ def generate_html_report(
     }} catch (e) {{}}
   }})();
 </script>
-<button class="theme-toggle" id="themeToggle"
-        title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
-
-<h1>{report_title}</h1>
-<div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
-{refresh_widget}
+<div class="report-header">
+  <div>
+    <h1>{report_title}</h1>
+    <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
+  </div>
+  <div class="report-controls">
+    {refresh_button_html}
+    <button class="theme-toggle" id="themeToggle"
+            title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+  </div>
+</div>
+{refresh_status_html}
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
@@ -4374,6 +4423,17 @@ def main():
     ap.add_argument("--sync-dry-run", action="store_true",
                     help="With --sync-screening-watchlist, preview adds/removes "
                          "without writing.")
+    ap.add_argument("--prune-watchlists", action="store_true",
+                    help="With --include-watchlists: remove tickers whose verdict "
+                         "score is below --prune-threshold from their Robinhood "
+                         "watchlist (read-write). Tickers you hold and tickers "
+                         "whose analysis failed are never removed.")
+    ap.add_argument("--prune-threshold", type=float, default=60.0,
+                    help="Verdict-score cutoff for --prune-watchlists "
+                         "(default 60 — keeps BUY and WATCH, removes WAIT/PASS).")
+    ap.add_argument("--prune-dry-run", action="store_true",
+                    help="With --prune-watchlists, print what would be removed "
+                         "without writing.")
     ap.add_argument("--debug-insider", default=None,
                     help="Diagnose insider lookup for one ticker. Prints which "
                          "data sources are reachable and what each returns. "
@@ -4591,6 +4651,29 @@ def main():
                               if it["ticker"] in ticker_cache]
             if analyzed_items:
                 watchlists_analyzed[wl_name] = analyzed_items
+
+    # Prune weak watchlist tickers (verdict score below threshold) from the
+    # actual Robinhood watchlists. Removal is verified by re-reading, and
+    # errored analyses are never pruned (see select_watchlist_prune_candidates).
+    if args.prune_watchlists and watchlists_analyzed and args.source == "robinhood":
+        try:
+            import robinhood_source as rhs
+            candidates = select_watchlist_prune_candidates(
+                watchlists_analyzed, threshold=args.prune_threshold)
+            if not candidates:
+                print(f"\n[prune] No watchlist tickers below verdict score "
+                      f"{args.prune_threshold:g} — nothing to remove.")
+            for wl_name, ticks in candidates.items():
+                scores = {pa.ticker: pa.verdict.score
+                          for pa in watchlists_analyzed[wl_name]
+                          if pa.ticker in ticks}
+                detail = ", ".join(f"{t} ({scores[t]:.0f})" for t in ticks)
+                print(f"\n[prune] '{wl_name}': below {args.prune_threshold:g} "
+                      f"→ {detail}")
+                rhs.prune_watchlist(wl_name, ticks,
+                                    dry_run=args.prune_dry_run, verbose=True)
+        except Exception as e:
+            print(f"[prune] Skipped watchlist pruning: {e}")
 
     # Finalize verdicts with portfolio context BEFORE selecting tax candidates.
     # analyze_position() can't see position size, so the size overlay applied

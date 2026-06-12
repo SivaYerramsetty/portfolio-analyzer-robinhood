@@ -9,3 +9,4 @@ venv/
 *.bak*
 .DS_Store
 .cache/
+portfolio_report.html

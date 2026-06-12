@@ -942,6 +942,72 @@ def sync_watchlist(
     return result
 
 
+def prune_watchlist(
+    watchlist_name: str,
+    tickers: list[str],
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    Remove specific tickers from a Robinhood watchlist (remove-only — never
+    adds). Like sync_watchlist, the outcome is confirmed by re-reading the
+    watchlist afterward because the underlying robin_stocks calls have been
+    historically flaky.
+
+    Returns: {"requested": [...], "removed": [...], "failed": [...],
+              "errors": [...]}
+    """
+    _require_rh()
+    result = {
+        "requested": sorted({t.upper() for t in tickers}),
+        "removed": [], "failed": [], "errors": [],
+    }
+    if not result["requested"]:
+        return result
+
+    if dry_run:
+        if verbose:
+            print(f"[prune] '{watchlist_name}': DRY RUN — would remove "
+                  f"{', '.join(result['requested'])}")
+        return result
+
+    try:
+        rh.account.delete_symbols_from_watchlist(
+            inputSymbols=result["requested"], name=watchlist_name
+        )
+    except Exception as e:
+        result["errors"].append(f"delete_symbols_from_watchlist: {e}")
+
+    # Confirm by re-reading
+    try:
+        items = rh.account.get_watchlist_by_name(watchlist_name)
+        if isinstance(items, dict):
+            items = items.get("results", []) or []
+        after: set[str] = set()
+        for it in (items or []):
+            if isinstance(it, str):
+                after.add(it.upper())
+            elif isinstance(it, dict):
+                sym = it.get("symbol")
+                if sym:
+                    after.add(sym.upper())
+        result["removed"] = sorted(set(result["requested"]) - after)
+        result["failed"] = sorted(set(result["requested"]) & after)
+    except Exception as e:
+        result["errors"].append(f"verify-read: {e}")
+
+    if verbose:
+        if result["removed"]:
+            print(f"[prune] '{watchlist_name}': removed "
+                  f"{', '.join(result['removed'])}")
+        if result["failed"]:
+            print(f"[prune] '{watchlist_name}': FAILED to remove "
+                  f"{', '.join(result['failed'])}")
+        for err in result["errors"]:
+            print(f"[prune] ERROR: {err}")
+    return result
+
+
 def add_to_watchlist(
     watchlist_name: str,
     tickers: list[str],
