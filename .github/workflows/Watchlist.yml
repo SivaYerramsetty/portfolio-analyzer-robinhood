@@ -68,8 +68,11 @@ jobs:
           SMTP_PASS:          ${{ secrets.SMTP_PASS }}
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
         run: |
-          python analyze_portfolio.py \
+            python analyze_portfolio.py \
             --source robinhood \
+            --include-watchlists \
+            --prune-watchlists \
+            --save-positions positions.csv \
             --out report.html
 
       - name: Build site
