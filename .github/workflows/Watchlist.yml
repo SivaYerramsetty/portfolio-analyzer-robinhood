@@ -1,4 +1,4 @@
-name: Portfolio Analyzer
+name: Portfolio Analyzer with watchlist
 on:
     # schedule:                          # ← comment these out
   #   - cron: '30 13 * * 1-5'
