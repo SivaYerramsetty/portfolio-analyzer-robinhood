@@ -1979,6 +1979,10 @@ def _build_refresh_widget() -> tuple[str, str]:
     }
     return tok ? tok.trim() : null;
   }
+  // Hooks for the hourly auto-refresh toggle: check for a stored token
+  // without prompting, and ensure one exists (prompting once) at enable time.
+  window.ghHasToken = function() { return !!localStorage.getItem(TOKEN_KEY); };
+  window.ghEnsureToken = function() { return getToken(false); };
   function elapsedStr() {
     var s = Math.floor((Date.now() - startedAt) / 1000);
     return Math.floor(s / 60) + "m " + (s % 60) + "s";
@@ -3421,6 +3425,9 @@ def generate_html_report(
                   transition: transform 0.15s, background 0.2s; }}
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
   .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
+  .auto-toggle.active {{ background: var(--bg-chip-green);
+                         color: var(--fg-chip-green);
+                         border-color: var(--pos-up); }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);
                      text-align: right; margin: -6px 0 10px; }}
   .refresh-status:empty {{ display: none; }}
@@ -3663,6 +3670,9 @@ def generate_html_report(
   </div>
   <div class="report-controls">
     {refresh_button_html}
+    <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
+            title="Auto-reload this page every hour to pick up the latest published report">
+      &#9201; Auto</button>
     <button class="theme-toggle" id="themeToggle"
             title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
   </div>
@@ -4027,6 +4037,91 @@ Verdicts are framework outputs, not investment advice.
   setPinOffset();
   window.addEventListener('resize', setPinOffset);
   window.addEventListener('load', setPinOffset);
+})();
+// Hourly auto-refresh toggle: when enabled (persisted in localStorage), every
+// hour it triggers the GitHub Actions workflow (same flow as the manual
+// Refresh button: dispatch -> poll -> reload when the new report deploys).
+// Fallbacks: no stored token or no refresh widget -> plain page reload; a
+// refresh already in progress -> skip this cycle (its success path reloads).
+// The reload keeps the password session (sessionStorage) and re-arms the
+// timer. A 30s interval checking a deadline (rather than one long setTimeout)
+// survives background-tab throttling and laptop sleep.
+(function() {
+  var KEY = 'auto-reload-hourly';
+  var PERIOD_MS = 3600000;
+  var btn = document.getElementById('autoReloadToggle');
+  if (!btn) return;
+  var timer = null;
+
+  function canDispatch() {
+    var rb = document.getElementById('ghRefreshBtn');
+    return typeof window.ghTriggerRefresh === 'function' && rb &&
+           typeof window.ghHasToken === 'function' && window.ghHasToken();
+  }
+  function label() {
+    if (!btn.classList.contains('active')) {
+      btn.innerHTML = '&#9201; Auto';
+      btn.title = 'Every hour: trigger the GitHub workflow to regenerate the '
+                + 'report, then reload this page when it deploys. (Without a '
+                + 'saved token it only reloads the page.)';
+      return;
+    }
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    var mins = Math.max(1, Math.round((nextAt - Date.now()) / 60000));
+    btn.innerHTML = '&#9201; Auto &middot; ' + mins + 'm';
+    btn.title = 'Auto-refresh is ON — in ~' + mins + ' min: '
+              + (canDispatch()
+                 ? 'trigger the workflow and reload when the new report deploys.'
+                 : 'reload the page (no saved token, so the workflow is not triggered).')
+              + ' Click to turn off.';
+  }
+  function fire() {
+    // Re-arm first so a failed run is retried next hour, not every 30s.
+    btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+    var rb = document.getElementById('ghRefreshBtn');
+    if (rb && rb.disabled) {
+      label();   // a refresh is already running — it reloads the page itself
+      return;
+    }
+    if (canDispatch()) {
+      window.ghTriggerRefresh();
+    } else {
+      location.reload();
+    }
+    label();
+  }
+  function check() {
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    if (nextAt && Date.now() >= nextAt) { fire(); return; }
+    label();
+  }
+  function setState(on, save, interactive) {
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (save) { try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {} }
+    if (timer) { clearInterval(timer); timer = null; }
+    if (on) {
+      // Ask for the token now (once) so the unattended hourly trigger can
+      // work later — prompting at 3am when the timer fires would be useless.
+      if (interactive && typeof window.ghEnsureToken === 'function'
+          && !((window.ghHasToken && window.ghHasToken()))) {
+        window.ghEnsureToken();
+      }
+      btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+      timer = setInterval(check, 30000);
+      document.addEventListener('visibilitychange', check);
+    } else {
+      delete btn.dataset.nextAt;
+      document.removeEventListener('visibilitychange', check);
+    }
+    label();
+  }
+  btn.addEventListener('click', function() {
+    setState(!btn.classList.contains('active'), true, true);
+  });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  setState(saved === '1', false, false);
 })();
 (function() {
   function sortableValue(td) {
