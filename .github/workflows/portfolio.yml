@@ -70,9 +70,6 @@ jobs:
         run: |
           python analyze_portfolio.py \
             --source robinhood \
-            --include-watchlists \
-            --prune-watchlists \
-            --save-positions positions.csv \
             --out report.html
 
       - name: Build site
