@@ -30,6 +30,7 @@ SECURITY NOTES:
   - Never commit credentials. Add `.env`, `*.pickle`, and `.tokens/` to .gitignore.
 """
 
+import base64
 import json
 import os
 import sys
@@ -132,14 +133,87 @@ def _require_rh():
         )
 
 
+def _session_is_valid() -> bool:
+    """True if the current robin_stocks session can read the account.
+
+    rh.login() can swallow a failed challenge and return as if logged in
+    (it prints 'Login failed' but doesn't raise), so callers must verify.
+    """
+    try:
+        from robin_stocks.robinhood.urls import positions_url
+        res = rh.helper.request_get(positions_url(), 'pagination',
+                                    {'nonzero': 'true'}, jsonify_data=False)
+        return res is not None and res.status_code == 200
+    except Exception:
+        return False
+
+
+def _try_pickle_session(pickle_path: Path) -> bool:
+    """Activate a cached session pickle WITHOUT touching the login endpoint.
+
+    rh.login() validates the pickle too, but on failure it falls through to
+    a fresh password login — which triggers Robinhood's device-approval
+    challenge and, in CI, polls for an approval nobody is there to tap
+    (until Robinhood 429s the poll). Doing the pickle validation ourselves
+    keeps full control of what happens when the session is stale.
+    """
+    if not pickle_path.exists():
+        return False
+    try:
+        import pickle as _pickle
+        with open(pickle_path, "rb") as f:
+            data = _pickle.load(f)
+        rh.helper.set_login_state(True)
+        rh.helper.update_session(
+            "Authorization", f"{data['token_type']} {data['access_token']}")
+        if _session_is_valid():
+            return True
+    except Exception:
+        pass
+    try:
+        rh.helper.set_login_state(False)
+        rh.helper.update_session("Authorization", None)
+    except Exception:
+        pass
+    return False
+
+
+# Module-level so tests can point it at a temp dir instead of the real one.
+SESSION_PICKLE_PATH = Path.home() / ".tokens" / "robinhood.pickle"
+
+_REAUTH_HELP = """\
+============================================================
+❌ No valid Robinhood session available in this environment.
+============================================================
+A fresh password login from CI triggers Robinhood's device-approval
+challenge, which needs a human. Two ways to fix:
+
+OPTION A (recommended) — refresh the session seed from your machine:
+  1. On your local machine (where the analyzer works):
+       python update_rh_session_secret.py
+     This logs in locally if needed and uploads your session to the
+     repo secret RH_SESSION_B64.
+  2. Re-run this workflow.
+
+OPTION B — approve the login from your phone:
+  1. Re-run the workflow with the 'device_approval' input checked.
+  2. Watch the live log; when it says 'Check robinhood app', open the
+     Robinhood app and tap Approve (you have ~2 minutes).
+============================================================"""
+
+
 def login(verbose: bool = True) -> None:
     """Login to Robinhood. Strategy:
 
     1. If RH_MFA_CODE is set (workflow input or shell var): use it for fresh login.
-    2. Else if RH_MFA_SECRET is set: generate TOTP code (legacy; unlikely to work with
-       Robinhood's new device-approval auth, but kept for backward compatibility).
-    3. Else: rely on cached session pickle at ~/.tokens/robinhood.pickle.
-    4. If no cached session AND running non-interactively (CI): fail with clear message.
+    2. Else: validate the cached session pickle at ~/.tokens/robinhood.pickle
+       ourselves (never hits the login endpoint, so no device-approval risk).
+    3. Else: seed the session from the RH_SESSION_B64 env var / repo secret
+       (base64 of a working pickle, uploaded via update_rh_session_secret.py).
+    4. Else: a fresh password login is needed. In CI this requires a human
+       (device approval), so fail fast with instructions unless
+       RH_DEVICE_APPROVAL is set (workflow input) — then let robin_stocks
+       run the device-approval flow and verify the result.
     """
     _require_rh()
 
@@ -172,52 +246,80 @@ def login(verbose: bool = True) -> None:
         if verbose:
             print(f"[robinhood] Auto-generated TOTP code: {mfa_code}")
 
-    # Detect if cached session exists at the default path
-    cached_session = Path.home() / ".tokens" / "robinhood.pickle"
-    has_cache = cached_session.exists()
+    cached_session = SESSION_PICKLE_PATH
     is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+
+    if not mfa_code:
+        # Fast path 1: cached session pickle, validated without any login call.
+        if _try_pickle_session(cached_session):
+            if verbose:
+                print("[robinhood] Authenticated (cached session).", flush=True)
+            return
+
+        # Fast path 2: seed the session from the RH_SESSION_B64 secret.
+        seed = os.environ.get("RH_SESSION_B64", "").strip()
+        if seed:
+            try:
+                cached_session.parent.mkdir(exist_ok=True)
+                # Never destroy an existing pickle: the seed might be staler
+                # than what's on disk, and a fresh device-approval login can
+                # be needed to replace a lost session.
+                if cached_session.exists():
+                    cached_session.replace(
+                        cached_session.with_suffix(".pickle.bak"))
+                cached_session.write_bytes(base64.b64decode(seed))
+                if _try_pickle_session(cached_session):
+                    if verbose:
+                        print("[robinhood] Authenticated (session seeded from "
+                              "RH_SESSION_B64).", flush=True)
+                    return
+                print("[robinhood] RH_SESSION_B64 seed is stale — it needs "
+                      "refreshing (see update_rh_session_secret.py).", flush=True)
+            except Exception as e:
+                print(f"[robinhood] Could not apply RH_SESSION_B64 seed: {e}",
+                      flush=True)
+
+    # A fresh password login is required from here on. In CI that triggers
+    # Robinhood's device-approval challenge (a human must tap Approve), so
+    # don't even attempt it unless explicitly allowed — the poll would hang
+    # for ~25 minutes and then get rate-limited.
+    allow_device_approval = str(
+        os.environ.get("RH_DEVICE_APPROVAL", "")).lower() in ("1", "true", "yes")
+    if is_ci and not mfa_code and not allow_device_approval:
+        print(_REAUTH_HELP, flush=True)
+        sys.exit(2)
 
     if verbose:
         msg = f"[robinhood] Logging in as {username}"
         if mfa_code:
             msg += " (with MFA code)"
-        elif has_cache:
-            msg += " (using cached session)"
-        else:
-            msg += " (no MFA, no cache)"
-        print(msg + "...")
+        elif allow_device_approval and is_ci:
+            msg += " (device approval — tap Approve in the Robinhood app!)"
+        print(msg + "...", flush=True)
 
-    try:
-        rh.login(
-            username=username,
-            password=password,
-            mfa_code=mfa_code or None,
-            store_session=True,
-        )
-    except Exception as e:
-        err = str(e)
-        # Detect the most common failure: session expired and no MFA provided
-        if is_ci and not mfa_code and ("MFA" in err or "verification" in err.lower()
-                                       or "code" in err.lower()):
-            print(
-                "\n" + "=" * 60 + "\n"
-                "❌ Robinhood session expired or invalid.\n"
-                "=" * 60 + "\n"
-                "To re-authenticate:\n"
-                "  1. Open robinhood.com in a browser and try to log in.\n"
-                "     Robinhood will text an SMS code to your phone.\n"
-                "  2. Within ~5 minutes, go to GitHub Actions:\n"
-                "     Actions tab → 'Portfolio Analysis' → 'Run workflow'\n"
-                "  3. Paste the SMS code into the 'mfa_code' input field.\n"
-                "  4. Click 'Run workflow' — fresh login + new cached session.\n"
-                "=" * 60,
-                flush=True,
-            )
+    rh.login(
+        username=username,
+        password=password,
+        mfa_code=mfa_code or None,
+        store_session=True,
+    )
+
+    # rh.login() can swallow a failed/unapproved challenge and return anyway
+    # (this is exactly what produced 'Authenticated.' followed by
+    # 'build_holdings can only be called when logged in'). Verify for real.
+    if not _session_is_valid():
+        if is_ci:
+            print("[robinhood] Login did not produce a valid session "
+                  "(challenge failed, not approved in time, or rate-limited).",
+                  flush=True)
+            print(_REAUTH_HELP, flush=True)
             sys.exit(2)
-        raise
+        raise RuntimeError(
+            "Robinhood login did not produce a valid session — the challenge "
+            "was not completed. Try again and approve promptly in the app.")
 
     if verbose:
-        print("[robinhood] Authenticated.")
+        print("[robinhood] Authenticated.", flush=True)
 
 
 def logout(verbose: bool = False) -> None:

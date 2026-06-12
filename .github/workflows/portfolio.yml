@@ -4,6 +4,11 @@ on:
   #   - cron: '30 13 * * 1-5'
   #   - cron: '0 20 * * 1-5'
   workflow_dispatch:
+    inputs:
+      device_approval:
+        description: "Robinhood device approval: watch the live log and tap Approve in the Robinhood app when it says 'Check robinhood app'"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +22,10 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # A stale session used to leave robin_stocks polling for a device
+    # approval for ~25 min before Robinhood rate-limited it. The code now
+    # fails fast instead, but cap the job as a backstop.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -54,8 +63,11 @@ jobs:
 
       - name: Run portfolio analyzer
         env:
+          PYTHONUNBUFFERED:   "1"   # stream logs live (a silent 20-min hang was just buffering)
           RH_USERNAME:        ${{ secrets.RH_USERNAME }}
           RH_PASSWORD:        ${{ secrets.RH_PASSWORD }}
+          RH_SESSION_B64:     ${{ secrets.RH_SESSION_B64 }}
+          RH_DEVICE_APPROVAL: ${{ inputs.device_approval }}
           FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
           TAX_FILING_STATUS:  ${{ secrets.TAX_FILING_STATUS }}
           TAX_TAXABLE_INCOME: ${{ secrets.TAX_TAXABLE_INCOME }}
