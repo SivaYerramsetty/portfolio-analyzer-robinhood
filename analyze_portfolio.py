@@ -3647,6 +3647,37 @@ def generate_html_report(
     thead th, td {{ padding: 8px 6px; }}
     .refresh-status {{ text-align: left; margin-top: 0; }}
   }}
+
+  /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
+     Touch devices can't hover, so the title="" tooltips on cells (quality
+     dots, score breakdown, verdict reason, insider detail, cost/gain) are
+     invisible. On touch-primary devices a tap reveals that text here.
+     The elements are only created/shown by JS in touch mode, so these
+     rules are inert on desktop. */
+  .m-tip-backdrop {{ position: fixed; inset: 0; z-index: 199;
+                     background: rgba(0, 0, 0, 0.35); opacity: 0;
+                     pointer-events: none; transition: opacity 0.2s; }}
+  .m-tip-backdrop.show {{ opacity: 1; pointer-events: auto; }}
+  .m-tip {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+            background: var(--bg-card); color: var(--fg-body);
+            border-top: 1px solid var(--border-medium);
+            border-radius: 14px 14px 0 0;
+            box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.28);
+            padding: 18px 20px calc(16px + env(safe-area-inset-bottom, 0px));
+            transform: translateY(110%);
+            transition: transform 0.24s ease;
+            max-height: 64vh; overflow-y: auto;
+            -webkit-overflow-scrolling: touch; }}
+  .m-tip.show {{ transform: translateY(0); }}
+  .m-tip-label {{ font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
+                  text-transform: uppercase; color: var(--fg-muted);
+                  margin-bottom: 8px; }}
+  .m-tip-body {{ font-size: 14px; line-height: 1.5; white-space: pre-wrap;
+                 word-break: break-word; }}
+  .m-tip-close {{ margin-top: 16px; width: 100%; padding: 11px;
+                  border: 1px solid var(--border-medium); border-radius: 8px;
+                  background: var(--bg-page); color: var(--fg-body);
+                  font-size: 14px; font-weight: 600; cursor: pointer; }}
 </style>
 </head>
 <body>
@@ -4439,6 +4470,84 @@ Verdicts are framework outputs, not investment advice.
 
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
+})();
+</script>
+<script>
+// Mobile tap-to-reveal tooltips. Native title="" tooltips never appear on a
+// tap, so on touch-primary devices (no hover, coarse pointer) tapping any
+// element that carries a title — quality dots, score cell, verdict pill,
+// insider detail, cost/gain, range/trend — shows that text in a bottom
+// sheet. Sortable column headers and buttons are excluded so tap still
+// performs their action. Desktop hover is untouched (this only runs when
+// hover is unavailable).
+(function() {
+  var touch = false;
+  try {
+    touch = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+  } catch (e) {}
+  if (!touch) return;
+
+  var backdrop = document.createElement('div');
+  backdrop.className = 'm-tip-backdrop';
+  var sheet = document.createElement('div');
+  sheet.className = 'm-tip';
+  sheet.setAttribute('role', 'dialog');
+  sheet.innerHTML =
+    '<div class="m-tip-label" id="mTipLabel"></div>' +
+    '<div class="m-tip-body" id="mTipBody"></div>' +
+    '<button type="button" class="m-tip-close" id="mTipClose">Got it</button>';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(sheet);
+  var bodyEl = sheet.querySelector('#mTipBody');
+  var labelEl = sheet.querySelector('#mTipLabel');
+
+  function openTip(text, label) {
+    bodyEl.textContent = text;
+    labelEl.textContent = label || '';
+    labelEl.style.display = label ? '' : 'none';
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  }
+  function closeTip() {
+    backdrop.classList.remove('show');
+    sheet.classList.remove('show');
+  }
+
+  // Elements with their own tap action (or that aren't real tooltips).
+  var SKIP = 'th,button,a,summary,label,input,select,' +
+             '.refresh-btn,.theme-toggle,#autoReloadToggle';
+
+  // Best-effort: the column header text for a tapped data cell, as a label.
+  function columnLabel(cell) {
+    if (!cell || cell.tagName !== 'TD') return '';
+    var table = cell.closest('table');
+    if (!table) return '';
+    var idx = Array.prototype.indexOf.call(cell.parentNode.children, cell);
+    var ths = table.querySelectorAll('thead th');
+    if (idx >= 0 && idx < ths.length) {
+      // Trim a trailing info glyph (ⓘ / ℹ) and whitespace.
+      return (ths[idx].textContent || '')
+        .replace(/[ⓘℹ\s]+$/g, '').trim();
+    }
+    return '';
+  }
+
+  document.addEventListener('click', function(e) {
+    if (sheet.contains(e.target) || backdrop.contains(e.target)) return;
+    if (e.target.closest(SKIP)) return;
+    var el = e.target.closest('[title]');
+    if (!el) return;
+    var text = el.getAttribute('title');
+    if (!text || !text.trim()) return;
+    e.preventDefault();
+    openTip(text, columnLabel(el.closest('td')));
+  }, false);
+
+  backdrop.addEventListener('click', closeTip);
+  document.getElementById('mTipClose').addEventListener('click', closeTip);
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeTip();
+  });
 })();
 </script>
 </body></html>
