@@ -1397,6 +1397,10 @@ class PositionAnalysis:
     current_price: Optional[float] = None
     live_market_value: Optional[float] = None
     live_pct_portfolio: Optional[float] = None
+    # Today's move (regular session): per-share $ + %, and prior close
+    prev_close: Optional[float] = None
+    day_change: Optional[float] = None          # per-share $ change today
+    day_change_pct: Optional[float] = None      # % change today
     # Analyst data
     target_mean: Optional[float] = None
     target_high: Optional[float] = None
@@ -1507,6 +1511,18 @@ def analyze_position(
         # Compute LIVE market value from live price × shares
         if pa.current_price is not None:
             pa.live_market_value = pa.current_price * pa.shares
+
+        # Today's move — regular-session change vs prior close. Computed from
+        # change/prevClose (unambiguous) rather than regularMarketChangePercent
+        # (which yfinance returns inconsistently as fraction vs percent).
+        pa.prev_close = (_safe_get(info, "regularMarketPreviousClose")
+                         or _safe_get(info, "previousClose"))
+        _chg = _safe_get(info, "regularMarketChange")
+        if _chg is None and pa.prev_close and _regular:
+            _chg = _regular - pa.prev_close
+        pa.day_change = _chg
+        if pa.prev_close and pa.prev_close > 0 and _chg is not None:
+            pa.day_change_pct = _chg / pa.prev_close * 100
 
         # Determine FCF YoY growth from historical cashflow statements.
         info["_fcfGrowing"] = None  # default: unknown
@@ -2162,6 +2178,7 @@ def _tr_open(r) -> str:
     quality = sum(1 for f in r.filters if f.passed) if r.filters else ""
     gain = "" if r.unrealized_gain is None else r.unrealized_gain
     gain_pct = "" if r.unrealized_gain_pct is None else r.unrealized_gain_pct
+    day_pct = "" if getattr(r, "day_change_pct", None) is None else r.day_change_pct
     upside = "" if r.upside_pct is None else r.upside_pct
     bucket = r.bucket or ""
     # NOTE: data-sector-mom is the Hot/Cool/Neutral *label*; data-sector is
@@ -2208,6 +2225,7 @@ def _tr_open(r) -> str:
         f"<tr data-verdict='{verdict}' data-verdict-score='{verdict_score}' "
         f"data-quality='{quality}' "
         f"data-gain='{gain}' data-gain-pct='{gain_pct}' "
+        f"data-day-pct='{day_pct}' "
         f"data-upside='{upside}' "
         f"data-bucket='{bucket}' "
         f"data-sector-mom='{sector_mom_label}' data-sector='{sector_raw}' "
@@ -2383,6 +2401,22 @@ def _cost_gain_cell(r) -> str:
     return cost_part + gain_part
 
 
+def _today_cell(r) -> str:
+    """Today's move: per-share % (primary) + position $ impact (for holdings)."""
+    if getattr(r, "day_change_pct", None) is None:
+        return "<span style='color:var(--fg-faint);'>—</span>"
+    cls = "pos-up" if r.day_change_pct > 0 else (
+          "pos-down" if r.day_change_pct < 0 else "")
+    out = (f"<div class='{cls}' style='font-weight:600;'>"
+           f"{_fmt_pct(r.day_change_pct, 2, True)}</div>")
+    # Dollar impact on the position, when shares are held.
+    if getattr(r, "shares", 0) and r.day_change is not None:
+        impact = r.day_change * r.shares
+        out += (f"<div class='{cls}' style='font-size:10px;margin-top:1px;'>"
+                f"{_fmt_money(impact)}</div>")
+    return out
+
+
 def _price_target_cell(r) -> str:
     """Combined Price + Target + Upside — arrow shows direction; subtitle shows %."""
     if r.current_price is None:
@@ -2453,11 +2487,13 @@ def _score_cell(score: Optional[float], q: Optional[float] = None,
                 g: Optional[float] = None, v: Optional[float] = None,
                 a: Optional[float] = None,
                 ins: Optional[float] = None) -> str:
-    """Render the Composite Score as a single bold number.
+    """Render the Composite Score as a bold number with a compact Q/G/V/A/I
+    sub-score strip beneath it.
 
-    Sub-score breakdown (Q/G/V/A/I) moves to the hover tooltip so the cell
-    stays compact — just the number. The header column also has a tooltip
-    explaining what the composite is.
+    The strip puts the column's empty space to use and surfaces the sub-score
+    breakdown that previously hid in the tooltip (also visible on mobile).
+    Each letter is colored green/amber/red by its sub-score and carries its
+    own number in a tooltip; the full breakdown stays in the number's tooltip.
     """
     if score is None:
         return "<span style='color:var(--fg-faint);'>—</span>"
@@ -2483,10 +2519,30 @@ def _score_cell(score: Optional[float], q: Optional[float] = None,
             lines.append(f"{name:<8} {sub:.0f}")
     title = "\n".join(lines).replace("'", "&#39;").replace('"', "&quot;")
 
+    # Compact sub-score strip: one colored letter per dimension.
+    def _sub_color(s: float) -> str:
+        return ("var(--pos-up)" if s >= 60
+                else "#e67e22" if s >= 40 else "var(--pos-down)")
+    letters = [("Q", "Quality", q), ("G", "Growth", g), ("V", "Value", v),
+               ("A", "Analyst", a), ("I", "Insider", ins)]
+    strip = ""
+    for ltr, full, sub in letters:
+        if sub is None:
+            strip += (f"<span style='color:var(--fg-faint);' "
+                      f"title='{full}: n/a'>{ltr}</span>")
+        else:
+            strip += (f"<span style='color:{_sub_color(sub)};' "
+                      f"title='{full}: {sub:.0f}'>{ltr}</span>")
+
     return (
+        f"<div style='display:flex;flex-direction:column;align-items:flex-end;"
+        f"line-height:1.1;'>"
         f"<span title='{title}' style='font-weight:700;color:{color};"
         f"font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>"
         f"{score:.0f}</span>"
+        f"<span style='font-size:9px;font-weight:700;letter-spacing:1.5px;"
+        f"margin-top:1px;cursor:help;'>{strip}</span>"
+        f"</div>"
     )
 
 
@@ -2658,18 +2714,26 @@ def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
         # Pct widths
         pcts = [buy / total * 100, hold / total * 100, sell / total * 100]
         colors = ["#27ae60", "#f39c12", "#c0392b"]
+        # Compact: narrower bar + counts-only label (B/H/S color-coded), with
+        # the full "X Buy · Y Hold · Z Sell · source" in the tooltip. Saves
+        # ~30% of the column's width versus the spelled-out label.
+        full = f"{buy} Buy · {hold} Hold · {sell} Sell · {source}"
         bar = (
-            f'<div style="display:flex;height:10px;border-radius:3px;overflow:hidden;'
-            f'min-width:90px;margin-bottom:2px;">'
+            f'<div title="{full}" style="display:flex;height:9px;border-radius:3px;'
+            f'overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;'
+            f'cursor:help;">'
         )
         for pct, color in zip(pcts, colors):
             if pct > 0:
                 bar += f'<div style="width:{pct:.1f}%;background:{color};"></div>'
         bar += "</div>"
         bar += (
-            f'<div style="font-size:10px;color:#7f8c8d;">'
-            f'{buy} Buy · {hold} Hold · {sell} Sell'
-            f'<span style="color:#bdc3c7;"> · {source}</span></div>'
+            f'<div title="{full}" style="font-size:10px;cursor:help;'
+            f'font-variant-numeric:tabular-nums;">'
+            f'<span style="color:#27ae60;">{buy}</span>·'
+            f'<span style="color:#f39c12;">{hold}</span>·'
+            f'<span style="color:#c0392b;">{sell}</span>'
+            f'<span style="color:var(--fg-faint);"> {total}</span></div>'
         )
         return bar
     if rec_key:
@@ -3271,6 +3335,18 @@ def generate_html_report(
     delta = live_total - statement_total
     delta_pct = (delta / statement_total * 100) if statement_total else 0
 
+    # Today's portfolio move: sum per-position $ impact, % vs prior-day total.
+    day_change_total = sum(
+        (r.day_change or 0) * (r.shares or 0)
+        for r in results if r.day_change is not None and r.shares
+    )
+    prev_day_total = sum(
+        (r.prev_close or 0) * (r.shares or 0)
+        for r in results if r.prev_close is not None and r.shares
+    )
+    day_change_pct = (day_change_total / prev_day_total * 100
+                      if prev_day_total else None)
+
     compounders = [r for r in results if r.bucket == "compounder"]
     thematics = [r for r in results if r.bucket == "thematic"]
     compounders.sort(key=lambda r: r.live_market_value or 0, reverse=True)
@@ -3326,8 +3402,21 @@ def generate_html_report(
     report_title = "Portfolio Analysis" if has_holdings else "Stock Analysis"
     holdings_summary = ""
     if has_holdings:
+        # Today's-change stat (colored), only when we have the data.
+        if day_change_pct is not None:
+            dc_color = ("var(--pos-up)" if day_change_total > 0
+                        else "var(--pos-down)" if day_change_total < 0
+                        else "var(--fg-strong)")
+            today_stat = (
+                f'<div class="stat"><strong style="color:{dc_color};">'
+                f'{_fmt_money(day_change_total)} '
+                f'({_fmt_pct(day_change_pct, 2, True)})</strong>'
+                f'Today\'s change</div>')
+        else:
+            today_stat = ""
         holdings_summary = f"""
     <div class="stat"><strong>{_fmt_money(live_total)}</strong>Portfolio value (live)</div>
+    {today_stat}
     <div class="stat"><strong>{len(compounders)}</strong>Compounder positions</div>
     <div class="stat"><strong>{len(thematics)}</strong>Thematic / ETF positions</div>
     <div class="stat"><strong>{len(action_items)}</strong>Sell / Trim flags</div>
@@ -3489,12 +3578,16 @@ def generate_html_report(
                    border-radius: 10px; padding: 14px 20px;
                    margin-bottom: 16px;
                    box-shadow: var(--shadow-card); }}
-  .summary-row {{ display: flex; gap: 36px; flex-wrap: wrap; }}
-  .stat {{ font-size: 12px; color: var(--fg-muted);
-           text-transform: uppercase; letter-spacing: 0.4px;
-           font-weight: 600; }}
-  .stat strong {{ font-size: 22px; display: block;
-                  color: var(--fg-strong); margin-top: 4px;
+  /* Stats laid out to fit on a single row on desktop; gap + sizes tuned so
+     six stats stay one line, while flex-wrap still lets them stack on narrow
+     screens. justify-content spreads them across the card width. */
+  .summary-row {{ display: flex; gap: 14px 26px; flex-wrap: wrap;
+                  justify-content: space-between; }}
+  .stat {{ font-size: 11px; color: var(--fg-muted);
+           text-transform: uppercase; letter-spacing: 0.3px;
+           font-weight: 600; white-space: nowrap; }}
+  .stat strong {{ font-size: 19px; display: block;
+                  color: var(--fg-strong); margin-top: 3px;
                   font-weight: 700; letter-spacing: -0.3px;
                   text-transform: none; }}
 
@@ -3831,6 +3924,13 @@ def generate_html_report(
       <button class="filter-pill" data-filter="very-overvalued">Above target by 15%+</button>
     </div>
     <div class="filter-group">
+      <span class="filter-group-label">Today</span>
+      <button class="filter-pill" data-filter="up-today">▲ Up today</button>
+      <button class="filter-pill" data-filter="down-today">▼ Down today</button>
+      <button class="filter-pill" data-filter="big-up-today">▲ Movers (+3%)</button>
+      <button class="filter-pill" data-filter="big-down-today">▼ Movers (-3%)</button>
+    </div>
+    <div class="filter-group">
       <span class="filter-group-label">Analyst rating</span>
       <button class="filter-pill" data-filter="analyst-strong-buy">Strong Buy</button>
       <button class="filter-pill" data-filter="analyst-buy">Buy rated</button>
@@ -3888,6 +3988,7 @@ def generate_html_report(
             "<th class='num'>Position</th>"
             "<th class='num'>Cost / Gain</th>"
             "<th class='num'>Price → Target</th>"
+            "<th class='num'>Today</th>"
             "<th>Range / Trend</th>"
             "<th>Quality (9)</th>"
             "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
@@ -3917,6 +4018,9 @@ def generate_html_report(
                         "num")
             html += _td(_price_target_cell(r),
                         r.upside_pct if r.upside_pct is not None else -1e6,
+                        "num")
+            html += _td(_today_cell(r),
+                        r.day_change_pct if r.day_change_pct is not None else -1e6,
                         "num")
             html += _td(_range_trend_cell(r),
                         r.week52_position if r.week52_position is not None else -1)
@@ -3967,8 +4071,6 @@ def generate_html_report(
             html += (
                 "<th>Ticker</th>"
                 "<th>Name / Sector</th>"
-                "<th class='num'>Position</th>"
-                "<th class='num'>Cost / Gain</th>"
                 "<th class='num'>Price → Target</th>"
                 "<th>Range / Trend</th>"
                 "<th>Quality (9)</th>"
@@ -4000,10 +4102,7 @@ def generate_html_report(
                 html += _tr_open(r)
                 html += _td(_ticker_cell(r), r.ticker, "ticker")
                 html += _td(_name_sector_cell(r), r.name)
-                # Watchlist items have no Position or Cost/Gain (you don't own them)
-                na = "<span style='color:var(--fg-faint);'>—</span>"
-                html += _td(na, -1, "num")
-                html += _td(na, -1e12, "num")
+                # Watchlist items omit Position / Cost-Gain (you don't own them)
                 html += _td(_price_target_cell(r),
                             r.upside_pct if r.upside_pct is not None else -1e6,
                             "num")
@@ -4034,6 +4133,7 @@ def generate_html_report(
             "<th class='num'>Position</th>"
             "<th class='num'>Cost / Gain</th>"
             "<th class='num'>Price → Target</th>"
+            "<th class='num'>Today</th>"
             "<th>Range / Trend</th>"
             "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
             "<th>Analyst Ratings</th>"
@@ -4061,6 +4161,9 @@ def generate_html_report(
                         "num")
             html += _td(_price_target_cell(r),
                         r.upside_pct if r.upside_pct is not None else -1e6,
+                        "num")
+            html += _td(_today_cell(r),
+                        r.day_change_pct if r.day_change_pct is not None else -1e6,
                         "num")
             html += _td(_range_trend_cell(r),
                         r.week52_position if r.week52_position is not None else -1)
@@ -4277,6 +4380,7 @@ Verdicts are framework outputs, not investment advice.
     var quality = num(row.getAttribute('data-quality'));
     var gain = num(row.getAttribute('data-gain'));
     var gainPct = num(row.getAttribute('data-gain-pct'));
+    var dayPct = num(row.getAttribute('data-day-pct'));
     var upside = num(row.getAttribute('data-upside'));
     var pos52 = num(row.getAttribute('data-pos52'));
     var score = num(row.getAttribute('data-score'));
@@ -4369,6 +4473,12 @@ Verdicts are framework outputs, not investment advice.
       case 'massive-upside':  return !isNaN(upside) && upside >= 40;
       case 'overvalued':      return !isNaN(upside) && upside < 0;
       case 'very-overvalued': return !isNaN(upside) && upside <= -15;
+
+      // ------------- Today's move -------------
+      case 'up-today':        return !isNaN(dayPct) && dayPct > 0;
+      case 'down-today':      return !isNaN(dayPct) && dayPct < 0;
+      case 'big-up-today':    return !isNaN(dayPct) && dayPct >= 3;
+      case 'big-down-today':  return !isNaN(dayPct) && dayPct <= -3;
 
       // ------------- Analyst rating -------------
       case 'analyst-strong-buy': return recommendation === 'strong_buy';
