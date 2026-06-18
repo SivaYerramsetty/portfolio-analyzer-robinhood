@@ -4564,19 +4564,13 @@ Verdicts are framework outputs, not investment advice.
       clearBtn.style.opacity = hasAny ? '1' : '0.4';
       clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
     }
-    // If any "more filter" is active, auto-open the more section so user sees it
-    if (moreSection) {
-      var anyMoreActive = false;
-      moreSection.querySelectorAll('.filter-pill.active').forEach(function() {
-        anyMoreActive = true;
-      });
-      if (anyMoreActive && !moreSection.classList.contains('show')) {
-        moreSection.classList.add('show');
-        if (moreToggle) {
-          moreToggle.classList.add('expanded');
-          moreToggle.textContent = 'More filters ▴';
-        }
-      }
+    // Highlight the More-filters button when advanced filters are active,
+    // WITHOUT force-opening — the panel is hover/scroll controlled below, so
+    // it stays hidden until hovered even while an advanced filter is on.
+    if (moreSection && moreToggle) {
+      var anyMoreActive =
+        moreSection.querySelectorAll('.filter-pill.active').length > 0;
+      moreToggle.classList.toggle('expanded', anyMoreActive);
     }
   }
 
@@ -4605,13 +4599,28 @@ Verdicts are framework outputs, not investment advice.
     });
   }
 
-  // More-filters toggle (expand/collapse advanced pills)
+  // More-filters: hover the button to open; auto-hide when the pointer
+  // leaves the filter bar or the page scrolls. Click still toggles — needed
+  // on touch devices, where hover/mouseleave don't fire. The 'expanded'
+  // highlight (active advanced filters) is managed separately in applyFilters,
+  // so only the arrow + .show reflect open/closed here.
   if (moreToggle && moreSection) {
+    function openMore() {
+      moreSection.classList.add('show');
+      moreToggle.textContent = 'More filters ▴';
+    }
+    function closeMore() {
+      if (!moreSection.classList.contains('show')) return;
+      moreSection.classList.remove('show');
+      moreToggle.textContent = 'More filters ▾';
+    }
+    moreToggle.addEventListener('mouseenter', openMore);
     moreToggle.addEventListener('click', function() {
-      var isOpen = moreSection.classList.toggle('show');
-      moreToggle.classList.toggle('expanded', isOpen);
-      moreToggle.textContent = isOpen ? 'More filters ▴' : 'More filters ▾';
+      moreSection.classList.contains('show') ? closeMore() : openMore();
     });
+    var filterBar = moreToggle.closest('.filter-bar');
+    if (filterBar) filterBar.addEventListener('mouseleave', closeMore);
+    window.addEventListener('scroll', closeMore, { passive: true });
   }
 
   searchInput.addEventListener('input', applyFilters);
@@ -4757,6 +4766,10 @@ def main():
     ap.add_argument("--include-watchlists", action="store_true",
                     help="When --source robinhood, also analyze Robinhood watchlists "
                          "and add a 'should I buy?' section to the report")
+    ap.add_argument("--tax", action="store_true",
+                    help="Opt in to the Tax-Aware Trim Guidance section. Off by "
+                         "default — it's the only step that fetches your full "
+                         "order history, so skipping it keeps runs fast.")
     ap.add_argument("--tickers", default=None,
                     help="Ad-hoc mode: analyze just these tickers (comma-separated, "
                          "e.g. 'AAPL,MSFT,GOOGL'). Skips Robinhood/holdings entirely "
@@ -4932,6 +4945,7 @@ def main():
     use_rh_ratings = False
     watchlist_lookup: dict[str, list[dict]] = {}
     tax_lots_lookup: dict[str, list[dict]] = {}
+    realized_ytd = None   # populated only when --tax is set
     if args.source == "robinhood":
         try:
             import robinhood_source as rhs
@@ -4946,11 +4960,13 @@ def main():
         if args.include_watchlists:
             print("[robinhood] Fetching watchlists...")
             watchlist_lookup = rhs.fetch_watchlists()
-        # Reconstruct exact tax lots from order history for precise tax analysis
-        print("[robinhood] Reconstructing tax lots from order history...")
-        tax_lots_lookup = rhs.fetch_tax_lots(verbose=True)
-        # Same order history can compute YTD realized gains for the tax section
-        realized_ytd = rhs.fetch_realized_ytd(verbose=True)
+        # Tax analysis is opt-in (--tax): it's the only thing that needs the
+        # full order history, so skipping it keeps normal runs fast.
+        if args.tax:
+            print("[robinhood] Reconstructing tax lots from order history...")
+            tax_lots_lookup = rhs.fetch_tax_lots(verbose=True)
+            # Same order history computes YTD realized gains for the tax section
+            realized_ytd = rhs.fetch_realized_ytd(verbose=True)
         if args.save_positions:
             # Mirror CSV format from parse_statement.py
             import csv as _csv
@@ -5037,8 +5053,11 @@ def main():
         from tax_analysis import (TaxConfig, analyze_tax, analyze_tax_with_lots,
                                   reconcile_lots_with_position)
         tax_cfg = TaxConfig.from_env()
-        flagged = [r for r in results
-                   if r.verdict and r.verdict.label in ("SELL", "TRIM")]
+        # Tax analysis is opt-in (--tax). When off, leave `flagged` empty so no
+        # r.tax is populated and the tax section is omitted from the report.
+        flagged = ([r for r in results
+                    if r.verdict and r.verdict.label in ("SELL", "TRIM")]
+                   if args.tax else [])
         if flagged:
             has_lots = bool(tax_lots_lookup)
             method = "exact lot-level" if has_lots else "position-level estimate"
@@ -5146,7 +5165,7 @@ def main():
     html = generate_html_report(
         results, watchlists=watchlists_analyzed or None,
         screening_results=screening_results,
-        realized_ytd=realized_ytd if 'realized_ytd' in locals() else None,
+        realized_ytd=realized_ytd,   # None unless --tax populated it
     )
 
     out = Path(args.out)
