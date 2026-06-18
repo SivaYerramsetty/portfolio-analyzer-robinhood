@@ -110,7 +110,7 @@ def _render_table_only(rows, section: str) -> str:
     """
     from analyze_portfolio import (
         _tr_open, _td, _ticker_cell, _name_sector_cell, _position_cell,
-        _cost_gain_cell, _price_target_cell, _range_trend_cell,
+        _cost_gain_cell, _price_target_cell, _today_cell, _range_trend_cell,
         _filter_dots, _score_cell, _rating_bar, _insider_cell,
         _verdict_cell, _VERDICT_ORDER,
         generate_html_report,
@@ -131,7 +131,8 @@ def _render_table_only(rows, section: str) -> str:
         headers = (
             "<th>Ticker</th><th>Name / Sector</th>"
             "<th class='num'>Position</th><th class='num'>Cost / Gain</th>"
-            "<th class='num'>Price → Target</th><th>Range / Trend</th>"
+            "<th class='num'>Price → Target</th><th class='num'>Today</th>"
+            "<th>Range / Trend</th>"
             "<th>Quality (9)</th>"
             "<th class='num'>Composite</th>"
             "<th>Analyst Ratings</th><th>Insider 90d</th>"
@@ -141,7 +142,8 @@ def _render_table_only(rows, section: str) -> str:
         headers = (
             "<th>Ticker</th><th>Name</th>"
             "<th class='num'>Position</th><th class='num'>Cost / Gain</th>"
-            "<th class='num'>Price → Target</th><th>Range / Trend</th>"
+            "<th class='num'>Price → Target</th><th class='num'>Today</th>"
+            "<th>Range / Trend</th>"
             "<th class='num'>Composite</th>"
             "<th>Analyst Ratings</th><th>Insider 90d</th>"
             "<th>Verdict <span style='font-weight:400;font-size:10px;'>(score)</span></th>"
@@ -167,6 +169,8 @@ def _render_table_only(rows, section: str) -> str:
                     r.unrealized_gain if r.unrealized_gain is not None else -1e12, "num")
         html += _td(_price_target_cell(r),
                     r.upside_pct if r.upside_pct is not None else -1e6, "num")
+        html += _td(_today_cell(r),
+                    r.day_change_pct if r.day_change_pct is not None else -1e6, "num")
         html += _td(_range_trend_cell(r),
                     r.week52_position if r.week52_position is not None else -1)
         if section == "compounders":
