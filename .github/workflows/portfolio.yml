@@ -9,6 +9,10 @@ on:
         description: "Robinhood device approval: watch the live log and tap Approve in the Robinhood app when it says 'Check robinhood app'"
         type: boolean
         default: false
+      include_tax:
+        description: "Include the Tax-Aware Trim Guidance section (fetches full order history; off by default)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -81,10 +85,15 @@ jobs:
           SMTP_PASS:          ${{ secrets.SMTP_PASS }}
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
         run: |
+          # --tax only when the dispatch checkbox is set (empty on schedule).
+          TAX_FLAG=""
+          if [ "${{ inputs.include_tax }}" = "true" ]; then TAX_FLAG="--tax"; fi
           python analyze_portfolio.py \
             --source robinhood \
             --include-watchlists \
             --prune-watchlists \
+            $TAX_FLAG \
+            --save-positions positions.csv \
             --out report.html
 
       - name: Build site
