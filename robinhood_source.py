@@ -55,6 +55,15 @@ except ImportError:
     rh = None
 
 try:
+    import requests
+except ImportError:
+    requests = None
+
+# Robinhood OAuth (same public client the official app + robin_stocks use).
+_RH_TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
+_RH_CLIENT_ID = "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS"
+
+try:
     import pyotp
 except ImportError:
     pyotp = None
@@ -178,6 +187,80 @@ def _try_pickle_session(pickle_path: Path) -> bool:
     return False
 
 
+def _refresh_session(pickle_path: Path, verbose: bool = True) -> bool:
+    """Silently renew the access token using the stored refresh_token.
+
+    Robinhood access tokens last ~24h, but the pickle also holds a
+    refresh_token (valid ~2 weeks) that mints a fresh access token via the
+    standard OAuth refresh grant — NO MFA and NO device approval, the same
+    silent renewal the official app does. The rotated tokens are written
+    back to the pickle, which CI caches (~/.tokens), so a workflow that runs
+    at least once every ~2 weeks keeps its session alive indefinitely with
+    zero human steps. Returns True only if the renewed session actually works.
+    """
+    if requests is None or not pickle_path.exists():
+        return False
+    try:
+        import pickle as _pickle
+        with open(pickle_path, "rb") as f:
+            data = _pickle.load(f)
+    except Exception:
+        return False
+
+    refresh_token = data.get("refresh_token")
+    device_token = data.get("device_token")
+    if not refresh_token:
+        return False
+
+    payload = {
+        "client_id": _RH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "internal",
+        "expires_in": 86400,
+        "device_token": device_token or "",
+    }
+    try:
+        resp = requests.post(_RH_TOKEN_URL, data=payload, timeout=20)
+    except Exception as e:
+        if verbose:
+            print(f"[robinhood] Token refresh request failed: {e}", flush=True)
+        return False
+    if resp.status_code != 200:
+        if verbose:
+            print(f"[robinhood] Token refresh rejected (HTTP "
+                  f"{resp.status_code}) — refresh token likely expired.",
+                  flush=True)
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    access_token = body.get("access_token")
+    if not access_token:
+        return False
+    token_type = body.get("token_type", "Bearer")
+    new_refresh = body.get("refresh_token", refresh_token)
+
+    rh.helper.set_login_state(True)
+    rh.helper.update_session(
+        "Authorization", f"{token_type} {access_token}")
+    # Persist rotated tokens so the next run (and the CI cache) inherits them.
+    try:
+        pickle_path.parent.mkdir(exist_ok=True)
+        with open(pickle_path, "wb") as f:
+            __import__("pickle").dump({
+                "token_type": token_type,
+                "access_token": access_token,
+                "refresh_token": new_refresh,
+                "device_token": device_token,
+            }, f)
+    except Exception:
+        pass  # in-memory session still works for this run
+
+    return _session_is_valid()
+
+
 # Module-level so tests can point it at a temp dir instead of the real one.
 SESSION_PICKLE_PATH = Path.home() / ".tokens" / "robinhood.pickle"
 
@@ -185,35 +268,43 @@ _REAUTH_HELP = """\
 ============================================================
 ❌ No valid Robinhood session available in this environment.
 ============================================================
-A fresh password login from CI triggers Robinhood's device-approval
-challenge, which needs a human. Two ways to fix:
+The cached session and its refresh token are both expired, and no
+unattended login method is configured.
 
-OPTION A (recommended) — refresh the session seed from your machine:
-  1. On your local machine (where the analyzer works):
-       python update_rh_session_secret.py
-     This logs in locally if needed and uploads your session to the
-     repo secret RH_SESSION_B64.
-  2. Re-run this workflow.
+OPTION A (recommended — set up ONCE, then fully automatic forever):
+  Configure authenticator-app 2FA so CI can log in headlessly with a
+  generated code (no phone tap, no local script):
+    1. Robinhood app → Security → Two-Factor → Authenticator App.
+       When it shows the QR, tap "Can't scan?" to reveal the base32
+       SECRET. Copy it.
+    2. Add it as the GitHub Actions secret RH_MFA_SECRET.
+       (Settings → Secrets and variables → Actions → New secret.)
+    3. Re-run this workflow. From now on every run renews itself via
+       the refresh token, and re-logs in automatically with a TOTP code
+       only if the refresh token ever lapses. No more manual steps.
 
-OPTION B — approve the login from your phone:
-  1. Re-run the workflow with the 'device_approval' input checked.
-  2. Watch the live log; when it says 'Check robinhood app', open the
-     Robinhood app and tap Approve (you have ~2 minutes).
+OPTION B (one-off — approve from your phone):
+    Re-run the workflow with the 'device_approval' input checked, watch
+    the live log, and tap Approve in the Robinhood app within ~2 min.
 ============================================================"""
 
 
 def login(verbose: bool = True) -> None:
-    """Login to Robinhood. Strategy:
+    """Login to Robinhood, preferring fully-automatic paths. In order:
 
-    1. If RH_MFA_CODE is set (workflow input or shell var): use it for fresh login.
-    2. Else: validate the cached session pickle at ~/.tokens/robinhood.pickle
-       ourselves (never hits the login endpoint, so no device-approval risk).
-    3. Else: seed the session from the RH_SESSION_B64 env var / repo secret
-       (base64 of a working pickle, uploaded via update_rh_session_secret.py).
-    4. Else: a fresh password login is needed. In CI this requires a human
-       (device approval), so fail fast with instructions unless
-       RH_DEVICE_APPROVAL is set (workflow input) — then let robin_stocks
-       run the device-approval flow and verify the result.
+    1. Cached session pickle (~/.tokens/robinhood.pickle), validated locally.
+    2. Silent refresh-token renewal of that pickle (no MFA / no approval) —
+       the primary mechanism that keeps CI self-sustaining between logins.
+    3. RH_SESSION_B64 seed secret, tried directly then via refresh.
+    4. Fresh login with a generated TOTP code (RH_MFA_SECRET) — still
+       automatic, no human, as long as the account uses authenticator 2FA.
+    5. Device-approval login (needs a human) ONLY if RH_DEVICE_APPROVAL is
+       set; otherwise fail fast in CI with setup instructions.
+
+    Steps 1-2 cover the steady state, so once seeded the workflow renews
+    itself with no manual step; step 4 auto-recovers if the refresh token
+    ever lapses. A successful login persists rotated tokens to the pickle,
+    which CI caches, compounding the effect.
     """
     _require_rh()
 
@@ -256,14 +347,22 @@ def login(verbose: bool = True) -> None:
                 print("[robinhood] Authenticated (cached session).", flush=True)
             return
 
-        # Fast path 2: seed the session from the RH_SESSION_B64 secret.
+        # Fast path 2: silently renew the access token from the cached
+        # refresh token (no MFA, no device approval). This is what keeps
+        # the workflow self-sustaining between full logins.
+        if _refresh_session(cached_session, verbose=verbose):
+            if verbose:
+                print("[robinhood] Authenticated (refreshed access token).",
+                      flush=True)
+            return
+
+        # Fast path 3: seed the session from the RH_SESSION_B64 secret, then
+        # try it directly and (if stale) via a refresh.
         seed = os.environ.get("RH_SESSION_B64", "").strip()
         if seed:
             try:
                 cached_session.parent.mkdir(exist_ok=True)
-                # Never destroy an existing pickle: the seed might be staler
-                # than what's on disk, and a fresh device-approval login can
-                # be needed to replace a lost session.
+                # Never destroy a usable pickle: back it up before overwriting.
                 if cached_session.exists():
                     cached_session.replace(
                         cached_session.with_suffix(".pickle.bak"))
@@ -273,16 +372,21 @@ def login(verbose: bool = True) -> None:
                         print("[robinhood] Authenticated (session seeded from "
                               "RH_SESSION_B64).", flush=True)
                     return
-                print("[robinhood] RH_SESSION_B64 seed is stale — it needs "
-                      "refreshing (see update_rh_session_secret.py).", flush=True)
+                if _refresh_session(cached_session, verbose=verbose):
+                    if verbose:
+                        print("[robinhood] Authenticated (seed refreshed).",
+                              flush=True)
+                    return
+                print("[robinhood] RH_SESSION_B64 seed is stale (refresh token "
+                      "expired too).", flush=True)
             except Exception as e:
                 print(f"[robinhood] Could not apply RH_SESSION_B64 seed: {e}",
                       flush=True)
 
-    # A fresh password login is required from here on. In CI that triggers
-    # Robinhood's device-approval challenge (a human must tap Approve), so
-    # don't even attempt it unless explicitly allowed — the poll would hang
-    # for ~25 minutes and then get rate-limited.
+    # No cached/refreshed session worked. A fresh login is needed. With a
+    # TOTP code (RH_MFA_SECRET) that's still fully automatic; without one, in
+    # CI it would trigger Robinhood's device-approval challenge — which needs
+    # a human — so only attempt that when explicitly allowed.
     allow_device_approval = str(
         os.environ.get("RH_DEVICE_APPROVAL", "")).lower() in ("1", "true", "yes")
     if is_ci and not mfa_code and not allow_device_approval:
@@ -292,7 +396,7 @@ def login(verbose: bool = True) -> None:
     if verbose:
         msg = f"[robinhood] Logging in as {username}"
         if mfa_code:
-            msg += " (with MFA code)"
+            msg += " (with TOTP code — automatic)"
         elif allow_device_approval and is_ci:
             msg += " (device approval — tap Approve in the Robinhood app!)"
         print(msg + "...", flush=True)
