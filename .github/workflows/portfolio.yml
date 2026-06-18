@@ -66,6 +66,7 @@ jobs:
           PYTHONUNBUFFERED:   "1"   # stream logs live (a silent 20-min hang was just buffering)
           RH_USERNAME:        ${{ secrets.RH_USERNAME }}
           RH_PASSWORD:        ${{ secrets.RH_PASSWORD }}
+          RH_MFA_SECRET:      ${{ secrets.RH_MFA_SECRET }}   # authenticator-app TOTP secret → fully automatic login
           RH_SESSION_B64:     ${{ secrets.RH_SESSION_B64 }}
           RH_DEVICE_APPROVAL: ${{ inputs.device_approval }}
           FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
