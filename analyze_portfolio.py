@@ -330,6 +330,10 @@ class FilterResult:
     actual: Optional[float]
     threshold: str
     note: str = ""
+    # Optional pre-formatted tooltip value. When set, it replaces the
+    # auto-formatted number (used by P/E to show trailing + forward side by
+    # side, which the generic % formatter can't express).
+    display: Optional[str] = None
 
 
 def _safe_get(d: dict, key: str) -> Optional[float]:
@@ -340,6 +344,26 @@ def _safe_get(d: dict, key: str) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _pe_values(
+    info: dict,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (effective_pe, trailing_pe, forward_pe).
+
+    effective_pe is the LOWER of trailing/forward (positive values only), so a
+    stock counts as reasonably valued if EITHER basis is cheap. Trailing PE
+    alone overstates valuation for fast growers and cyclical-trough names
+    (e.g. MU ~49x trailing / ~9x forward), red-flagging the very compounders
+    this framework hunts for. Forward PE still fails names that are expensive
+    on next year's earnings too (VRT, ANET both stay >30x), so it remains a
+    discriminating gate rather than a rubber stamp.
+    """
+    trailing = _safe_get(info, "trailingPE")
+    forward = _safe_get(info, "forwardPE")
+    candidates = [p for p in (trailing, forward) if p is not None and p > 0]
+    effective = min(candidates) if candidates else None
+    return effective, trailing, forward
 
 
 def _compute_multi_year_growth(tkr, info: dict) -> None:
@@ -566,13 +590,23 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
         note=eps_lookback or "",
     ))
 
-    # 3. P/E < 30 (prefer trailing, fall back to forward)
-    pe = _safe_get(info, "trailingPE") or _safe_get(info, "forwardPE")
+    # 3. P/E < 30 — pass if EITHER trailing or forward PE is under 30 (uses
+    #    the lower of the two; see _pe_values for the rationale).
+    pe, trailing_pe, forward_pe = _pe_values(info)
+    if trailing_pe and forward_pe:
+        pe_display = f"{trailing_pe:.1f} trailing / {forward_pe:.1f} fwd"
+    elif trailing_pe:
+        pe_display = f"{trailing_pe:.1f} trailing"
+    elif forward_pe:
+        pe_display = f"{forward_pe:.1f} fwd"
+    else:
+        pe_display = None
     results.append(FilterResult(
         name="P/E < 30",
         passed=(pe is not None and pe < 30),
         actual=pe,
         threshold="< 30",
+        display=pe_display,
     ))
 
     # 4. PEG < 2
@@ -716,7 +750,7 @@ def compute_composite_score(pa, info: dict) -> None:
     # when annual statements are available; we fall back to 1-year YoY otherwise.
     rev_g = _safe_get(info, "revenueCAGR3y") or _safe_get(info, "revenueGrowth")
     eps_g = _safe_get(info, "earningsCAGR3y") or _safe_get(info, "earningsGrowth")
-    pe = _safe_get(info, "trailingPE") or _safe_get(info, "forwardPE")
+    pe, _, _ = _pe_values(info)   # lower of trailing/forward (see _pe_values)
     peg = _safe_get(info, "trailingPegRatio") or _safe_get(info, "pegRatio")
     # Quality sub-score prefers multi-year averages for ROE and op margin
     # (same logic as the quality filters — sustained quality matters more
@@ -2590,7 +2624,9 @@ def _filter_dots(filters: list[FilterResult]) -> str:
         # behavior). For filters whose `note` is descriptive metadata
         # like "3yr CAGR" / "1yr YoY", append it as a separate clause
         # in the tooltip so it doesn't get smashed into the number.
-        if f.actual is None:
+        if f.display is not None:
+            actual_str = f.display
+        elif f.actual is None:
             actual_str = "n/a"
         elif f.note in (None, "", "%"):
             actual_str = f"{f.actual:.1f}{f.note or '%'}"
