@@ -125,7 +125,12 @@ def _render_table_only(rows, section: str) -> str:
         if r.live_market_value and live_total:
             r.live_pct_portfolio = r.live_market_value / live_total * 100
 
-    rows_sorted = sorted(rows, key=lambda r: r.live_market_value or 0, reverse=True)
+    # Default order: verdict score high → low (market value as tiebreak).
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: ((r.verdict.score if r.verdict and r.verdict.score is not None
+                        else -1), r.live_market_value or 0),
+        reverse=True)
 
     if section == "compounders":
         headers = (
@@ -209,9 +214,9 @@ def _render_watchlist_tables(watchlists: dict) -> str:
         if not items:
             continue
         items_sorted = sorted(items, key=lambda r: (
-            _VERDICT_ORDER.get(r.verdict.label if r.verdict else "ERROR", 99),
-            -(r.upside_pct or -1e6),
-        ))
+            (r.verdict.score if r.verdict and r.verdict.score is not None else -1),
+            (r.upside_pct if r.upside_pct is not None else -1e6),
+        ), reverse=True)
         html += (f"<h3 style='margin-top:24px;color:#34495e;'>"
                  f"📋 {wl_name} ({len(items_sorted)})</h3>\n")
         html += ("<div class='table-wrap'><table>\n<thead><tr>"

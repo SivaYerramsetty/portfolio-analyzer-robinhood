@@ -3321,6 +3321,74 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
     return live_total
 
 
+def _portfolio_insights(results: list[PositionAnalysis]) -> list[str]:
+    """Build prioritized, data-driven recommendations for the top banner.
+
+    Turns the per-position analysis into a few concise, actionable findings
+    (exit/trim flags, concentration, high-conviction adds, stretched
+    valuations, weak fundamentals, insider selling). Returns HTML-safe
+    strings, most important first; empty list means nothing notable.
+    """
+    held = [r for r in results if (r.shares or 0) > 0]
+    if not held:
+        return []
+
+    def names(rs, n=4):
+        shown = ", ".join(r.ticker for r in rs[:n])
+        if len(rs) > n:
+            shown += f" +{len(rs) - n} more"
+        return shown
+
+    def qpass(r):
+        return sum(1 for f in r.filters if f.passed) if r.filters else None
+
+    out: list[str] = []
+
+    sells = [r for r in held if r.verdict and r.verdict.label == "SELL"]
+    if sells:
+        out.append(f"🚩 <strong>Review for exit:</strong> {names(sells)} — "
+                   f"scoring below the framework's keep threshold.")
+
+    trims = [r for r in held if r.verdict and r.verdict.label == "TRIM"]
+    if trims:
+        out.append(f"✂️ <strong>Trim candidates:</strong> {names(trims)}.")
+
+    over = sorted((r for r in held if (r.live_pct_portfolio or 0) >= 15),
+                  key=lambda r: r.live_pct_portfolio or 0, reverse=True)
+    if over:
+        parts = ", ".join(f"{r.ticker} ({r.live_pct_portfolio:.0f}%)"
+                          for r in over[:3])
+        out.append(f"📊 <strong>Concentration:</strong> {parts} — sizeable "
+                   f"position(s); consider rebalancing.")
+
+    adds = [r for r in held if r.verdict and r.verdict.label == "ADD"]
+    if adds:
+        out.append(f"➕ <strong>High-conviction adds:</strong> {names(adds)}.")
+
+    stretched = sorted((r for r in held
+                        if r.upside_pct is not None and r.upside_pct <= -15),
+                       key=lambda r: r.upside_pct)
+    if stretched:
+        out.append(f"🎯 <strong>Above analyst target:</strong> {names(stretched)} "
+                   f"— limited upside to consensus.")
+
+    weak = [r for r in held
+            if qpass(r) is not None and qpass(r) <= 4
+            and (not r.verdict or r.verdict.label not in ("SELL", "TRIM"))]
+    if weak:
+        parts = ", ".join(f"{r.ticker} ({qpass(r)}/9)" for r in weak[:3])
+        out.append(f"🔻 <strong>Weak fundamentals:</strong> {parts} — "
+                   f"watch quality trend.")
+
+    caution = [r for r in held
+               if (r.insider_activity or {}).get("net_signal") == "Selling"]
+    if caution:
+        out.append(f"👀 <strong>Insider selling:</strong> {names(caution)} — "
+                   f"discretionary sales worth a look.")
+
+    return out[:6]
+
+
 def generate_html_report(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
@@ -3349,8 +3417,13 @@ def generate_html_report(
 
     compounders = [r for r in results if r.bucket == "compounder"]
     thematics = [r for r in results if r.bucket == "thematic"]
-    compounders.sort(key=lambda r: r.live_market_value or 0, reverse=True)
-    thematics.sort(key=lambda r: r.live_market_value or 0, reverse=True)
+    # Default order: verdict score high → low (market value as tiebreak).
+    def _verdict_sort_key(r):
+        score = (r.verdict.score if r.verdict and r.verdict.score is not None
+                 else -1)
+        return (score, r.live_market_value or 0)
+    compounders.sort(key=_verdict_sort_key, reverse=True)
+    thematics.sort(key=_verdict_sort_key, reverse=True)
 
     action_items = [r for r in results
                     if r.verdict and r.verdict.label in ("SELL", "TRIM")]
@@ -3650,6 +3723,29 @@ def generate_html_report(
             font-size: 13px; border-radius: 6px;
             color: var(--fg-alert); }}
 
+  /* Quick recommendations — subtle, hover-revealed (like More filters).
+     A muted trigger chip is always visible; hovering opens a floating panel
+     with the top findings. Auto-hides on scroll / mouse-leave (JS). */
+  .qr-wrap {{ position: relative; display: inline-block; margin-bottom: 18px; }}
+  .qr-trigger {{ background: var(--bg-card); color: var(--fg-muted);
+                 border: 1px solid var(--border-medium); border-radius: 14px;
+                 padding: 5px 13px; font-size: 12px; font-weight: 600;
+                 cursor: default; user-select: none; transition: all 0.15s; }}
+  .qr-trigger:hover {{ background: var(--bg-card-hover); color: var(--fg-body); }}
+  .qr-wrap.open .qr-trigger {{ background: var(--bg-card-hover);
+                               color: var(--fg-body); }}
+  .qr-panel {{ display: none; position: absolute; top: calc(100% + 6px);
+               left: 0; z-index: 30; min-width: 340px; max-width: 560px;
+               background: var(--bg-card); color: var(--fg-body);
+               border: 1px solid var(--border-medium); border-radius: 8px;
+               box-shadow: var(--shadow-card);
+               padding: 12px 16px 12px; }}
+  .qr-wrap.open .qr-panel {{ display: block; }}
+  .qr-panel ul {{ margin: 0; padding-left: 18px;
+                  font-size: 12.5px; line-height: 1.55; color: var(--fg-body); }}
+  .qr-panel li {{ margin-bottom: 5px; }}
+  .qr-panel li:last-child {{ margin-bottom: 0; }}
+
   /* ---------- Filter bar ----------
      Note: filter bar is intentionally NOT sticky. We tried scroll-direction
      toggling (sticky-on-scroll-up) but the attribute-conditional sticky rules
@@ -3684,6 +3780,12 @@ def generate_html_report(
                  background: var(--bg-page); }}
   .clear-pill:hover {{ background: var(--bg-chip-red); color: var(--fg-chip-red);
                        border-color: var(--fg-chip-red); }}
+  /* Frequent-combo pills live in #freqFilters; display:contents lets the
+     buttons flow directly in the filter-bar-top flex row. The ★ marks them
+     as your saved/most-used combos vs. the regular pills in More filters. */
+  #freqFilters {{ display: contents; }}
+  .freq-pill::before {{ content: "★ "; color: var(--accent, #e6a817);
+                        font-size: 10px; }}
   .more-toggle {{ background: var(--bg-table-header); color: var(--fg-pill);
                   border: 1px solid var(--border-strong);
                   border-radius: 14px; padding: 3px 11px;
@@ -3848,16 +3950,23 @@ def generate_html_report(
 <div class="filter-bar">
   <div class="filter-bar-top">
     <input type="text" id="searchInput" placeholder="🔍 Search ticker or name…" autocomplete="off">
-    <button class="filter-pill" data-filter="buy">Buy signals</button>
-    <button class="filter-pill" data-filter="action">Action (SELL/TRIM)</button>
-    <button class="filter-pill" data-filter="high-quality">Quality 7+</button>
-    <button class="filter-pill" data-filter="hot-sector">🔥 Hot</button>
-    <button class="filter-pill" data-filter="insider-buy">✓ Insider buying</button>
+    <!-- Your most-used filter combos, populated from localStorage by JS
+         (persists across regenerated reports — same Pages origin). Seeds
+         with the Quick-picks defaults below until usage history builds up. -->
+    <span id="freqFilters"></span>
     <button class="more-toggle" id="moreToggle">More filters ▾</button>
     <button class="filter-pill clear-pill" id="clearFilters">✕ Clear</button>
     <span class="filter-status" id="filterStatus"></span>
   </div>
   <div class="filter-more" id="filterMore">
+    <div class="filter-group">
+      <span class="filter-group-label">Quick picks</span>
+      <button class="filter-pill" data-filter="buy">Buy signals</button>
+      <button class="filter-pill" data-filter="action">Action (SELL/TRIM)</button>
+      <button class="filter-pill" data-filter="high-quality">Quality 7+</button>
+      <button class="filter-pill" data-filter="hot-sector">🔥 Hot</button>
+      <button class="filter-pill" data-filter="insider-buy">✓ Insider buying</button>
+    </div>
     <div class="filter-group">
       <span class="filter-group-label">Verdict</span>
       <button class="filter-pill" data-filter="verdict-add">ADD only</button>
@@ -3971,12 +4080,24 @@ def generate_html_report(
 </div>
 """
 
-    if action_items:
-        html += '<div class="alert"><strong>Action items:</strong> '
-        html += ", ".join(
-            f"{r.ticker} ({r.verdict.label})" for r in action_items
-        )
-        html += "</div>\n"
+    # Quick recommendations — subtle, hover-revealed chip (top 3 findings with
+    # full messages). Hidden until you hover the chip; auto-hides on scroll or
+    # mouse-leave (JS below), mirroring the More-filters behavior.
+    if has_holdings:
+        insights = _portfolio_insights(results)
+        if insights:
+            top = insights[:3]
+            html += ('<div class="qr-wrap" id="qrWrap">'
+                     f'<button class="qr-trigger" id="qrTrigger">💡 Quick '
+                     f'recommendations ({len(insights)})</button>'
+                     '<div class="qr-panel" id="qrPanel"><ul>')
+            for s in top:
+                html += f"<li>{s}</li>"
+            html += "</ul></div></div>\n"
+        else:
+            html += ('<div class="qr-wrap"><button class="qr-trigger" '
+                     'style="cursor:default;">✅ No critical issues flagged'
+                     "</button></div>\n")
 
     # Compounder section (only if there are compounder holdings)
     if compounders:
@@ -4061,11 +4182,12 @@ def generate_html_report(
             items = [r for r in items if r.ticker not in held_tickers]
             if not items:
                 continue
-            # Sort by best opportunity first (BUY < WATCH < WAIT < PASS)
+            # Default order: verdict score high → low (upside as tiebreak).
             items.sort(key=lambda r: (
-                _VERDICT_ORDER.get(r.verdict.label if r.verdict else "ERROR", 99),
-                -(r.upside_pct or -1e6),
-            ))
+                (r.verdict.score if r.verdict and r.verdict.score is not None
+                 else -1),
+                (r.upside_pct if r.upside_pct is not None else -1e6),
+            ), reverse=True)
             html += f"<h3 style='margin-top:24px;color:#34495e;'>📋 {wl_name} ({len(items)})</h3>\n"
             html += "<div class='table-wrap'><table>\n<thead><tr>"
             html += (
@@ -4586,6 +4708,8 @@ Verdicts are framework outputs, not investment advice.
         pill.classList.add('active');
       }
       applyFilters();
+      recordUsageDebounced();   // learn the user's combos over time
+      renderFreqActive();
     });
   });
 
@@ -4596,6 +4720,7 @@ Verdicts are framework outputs, not investment advice.
       pills.forEach(function(p) { p.classList.remove('active'); });
       searchInput.value = '';
       applyFilters();
+      renderFreqActive();
     });
   }
 
@@ -4623,8 +4748,129 @@ Verdicts are framework outputs, not investment advice.
     window.addEventListener('scroll', closeMore, { passive: true });
   }
 
+  // ----- Frequent filter combos -----
+  // Most-used filter combinations, persisted in localStorage and shown as ★
+  // pills at the top — adapting to how you actually filter. localStorage is
+  // per-origin, so this history survives every regenerated/republished report.
+  var freqEl = document.getElementById('freqFilters');
+  var USAGE_KEY = 'filterComboUsage';
+  var FREQ_MAX = 6;   // how many ★ combo pills to show
+  // Seed (and fallback) combos = the former fixed quick-picks.
+  var DEFAULT_COMBOS = [['buy'], ['action'], ['high-quality'],
+                        ['hot-sector'], ['insider-buy']];
+
+  function loadUsage() {
+    try { return JSON.parse(localStorage.getItem(USAGE_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+  function saveUsage(u) {
+    try { localStorage.setItem(USAGE_KEY, JSON.stringify(u)); } catch (e) {}
+  }
+  function comboKey(keys) { return keys.slice().sort().join('+'); }
+  function currentKey() { return Array.from(activeFilters).sort().join('+'); }
+
+  var recordTimer = null;
+  function recordUsageDebounced() {
+    // Record the combo the user settles on (not every intermediate toggle).
+    clearTimeout(recordTimer);
+    recordTimer = setTimeout(function() {
+      if (!activeFilters.size) return;        // never record the empty set
+      var u = loadUsage();
+      u[currentKey()] = (u[currentKey()] || 0) + 1;
+      var keys = Object.keys(u);
+      if (keys.length > 40) {                 // cap growth: keep the top 40
+        keys.sort(function(a, b) { return u[b] - u[a]; });
+        var t = {}; keys.slice(0, 40).forEach(function(x) { t[x] = u[x]; });
+        u = t;
+      }
+      saveUsage(u);
+    }, 1500);
+  }
+
+  function comboLabel(keys) {
+    var out = [];
+    for (var i = 0; i < keys.length; i++) {
+      var p = document.querySelector('.filter-pill[data-filter="' + keys[i] + '"]');
+      if (!p) return null;                    // key absent in this report version
+      out.push(p.textContent.trim());
+    }
+    return out.join(' + ');
+  }
+
+  function setCombo(keys) {
+    activeFilters.clear();
+    pills.forEach(function(p) {
+      var on = keys.indexOf(p.getAttribute('data-filter')) >= 0;
+      p.classList.toggle('active', on);
+      if (on) activeFilters.add(p.getAttribute('data-filter'));
+    });
+    applyFilters();
+    renderFreqActive();
+  }
+
+  function renderFreqActive() {
+    if (!freqEl) return;
+    var cur = currentKey();
+    freqEl.querySelectorAll('.freq-pill').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.combo === cur);
+    });
+  }
+
+  function renderFrequent() {
+    if (!freqEl) return;
+    var u = loadUsage();
+    var combos = Object.keys(u)
+      .sort(function(a, b) { return u[b] - u[a]; })
+      .map(function(k) { return k.split('+'); });
+    // Pad with default quick-picks not already present so the bar is never empty.
+    var seen = {};
+    combos.forEach(function(c) { seen[comboKey(c)] = 1; });
+    DEFAULT_COMBOS.forEach(function(c) {
+      if (!seen[comboKey(c)]) { combos.push(c); seen[comboKey(c)] = 1; }
+    });
+    freqEl.innerHTML = '';
+    var shown = 0;
+    for (var i = 0; i < combos.length && shown < FREQ_MAX; i++) {
+      var label = comboLabel(combos[i]);
+      if (!label) continue;                   // skip combos with stale keys
+      var b = document.createElement('button');
+      b.className = 'filter-pill freq-pill';
+      b.textContent = label;
+      b.dataset.combo = comboKey(combos[i]);
+      b.title = 'Saved filter combo — click to apply, click again to clear';
+      (function(keys) {
+        b.addEventListener('click', function() {
+          if (currentKey() === comboKey(keys)) { setCombo([]); }   // toggle off
+          else { setCombo(keys); recordUsageDebounced(); }
+        });
+      })(combos[i]);
+      freqEl.appendChild(b);
+      shown++;
+    }
+    renderFreqActive();
+  }
+
+  renderFrequent();
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
+})();
+</script>
+<script>
+// Quick recommendations: hover the chip to reveal the panel; auto-hide when
+// the pointer leaves or the page scrolls. Click toggles for touch devices
+// (where hover/mouseleave don't fire). Same pattern as the More-filters panel.
+(function() {
+  var wrap = document.getElementById('qrWrap');
+  var trigger = document.getElementById('qrTrigger');
+  if (!wrap || !trigger) return;
+  function open() { wrap.classList.add('open'); }
+  function close() { wrap.classList.remove('open'); }
+  trigger.addEventListener('mouseenter', open);
+  trigger.addEventListener('click', function() {
+    wrap.classList.contains('open') ? close() : open();
+  });
+  wrap.addEventListener('mouseleave', close);
+  window.addEventListener('scroll', close, { passive: true });
 })();
 </script>
 <script>
