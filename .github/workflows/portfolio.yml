@@ -100,8 +100,6 @@ jobs:
         run: |
           mkdir -p _site
           cp report.html _site/index.html
-          TIMESTAMP=$(date -u '+%B %d, %Y at %I:%M %p UTC')
-          sed -i "s|<body>|<body><div style='background:#1a2028;color:#8b95a3;font-size:11px;text-align:center;padding:6px;'>Auto-updated: ${TIMESTAMP}</div>|" _site/index.html
 
       - name: Add password protection        # ← MOVED before upload
         run: python add_password_protection.py _site/index.html --in-place
