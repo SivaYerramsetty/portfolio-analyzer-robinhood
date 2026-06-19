@@ -3386,7 +3386,7 @@ def _portfolio_insights(results: list[PositionAnalysis]) -> list[str]:
         out.append(f"👀 <strong>Insider selling:</strong> {names(caution)} — "
                    f"discretionary sales worth a look.")
 
-    return out[:6]
+    return out
 
 
 def generate_html_report(
@@ -3473,6 +3473,27 @@ def generate_html_report(
 
     has_holdings = bool(results)
     report_title = "Portfolio Analysis" if has_holdings else "Stock Analysis"
+
+    # Quick-recommendations chip — sits in the header controls beside Refresh.
+    # Hover reveals the full list (JS handles hover/scroll/leave auto-hide).
+    qr_chip_html = ""
+    if has_holdings:
+        _insights = _portfolio_insights(results)
+        if _insights:
+            _items = "".join(f"<li>{s}</li>" for s in _insights)
+            qr_chip_html = (
+                '<div class="qr-wrap" id="qrWrap">'
+                f'<button class="qr-trigger" id="qrTrigger">💡 Quick '
+                f'recommendations ({len(_insights)})</button>'
+                f'<div class="qr-panel" id="qrPanel"><ul>{_items}</ul></div>'
+                "</div>"
+            )
+        else:
+            qr_chip_html = (
+                '<div class="qr-wrap"><button class="qr-trigger" '
+                'style="cursor:default;">✅ No critical issues</button></div>'
+            )
+
     holdings_summary = ""
     if has_holdings:
         # Today's-change stat (colored), only when we have the data.
@@ -3723,23 +3744,29 @@ def generate_html_report(
             font-size: 13px; border-radius: 6px;
             color: var(--fg-alert); }}
 
-  /* Quick recommendations — subtle, hover-revealed (like More filters).
-     A muted trigger chip is always visible; hovering opens a floating panel
-     with the top findings. Auto-hides on scroll / mouse-leave (JS). */
-  .qr-wrap {{ position: relative; display: inline-block; margin-bottom: 18px; }}
-  .qr-trigger {{ background: var(--bg-card); color: var(--fg-muted);
-                 border: 1px solid var(--border-medium); border-radius: 14px;
-                 padding: 5px 13px; font-size: 12px; font-weight: 600;
-                 cursor: default; user-select: none; transition: all 0.15s; }}
+  /* Quick recommendations — subtle, hover-revealed chip in the header
+     controls (beside Refresh). Hovering opens a floating panel with the full
+     list; auto-hides on scroll / mouse-leave (JS). Sized to sit in the
+     34px control row; panel is right-anchored so it stays on screen. */
+  .qr-wrap {{ position: relative; display: inline-flex; align-items: center; }}
+  .qr-trigger {{ height: 34px; padding: 0 13px; box-sizing: border-box;
+                 display: flex; align-items: center; gap: 5px;
+                 background: var(--bg-card); color: var(--fg-muted);
+                 border: 1px solid var(--border-medium); border-radius: 17px;
+                 font-size: 12px; font-weight: 600;
+                 cursor: default; user-select: none; white-space: nowrap;
+                 box-shadow: var(--shadow-card);
+                 transition: background 0.2s, color 0.2s; }}
   .qr-trigger:hover {{ background: var(--bg-card-hover); color: var(--fg-body); }}
   .qr-wrap.open .qr-trigger {{ background: var(--bg-card-hover);
                                color: var(--fg-body); }}
   .qr-panel {{ display: none; position: absolute; top: calc(100% + 6px);
-               left: 0; z-index: 30; min-width: 340px; max-width: 560px;
+               right: 0; left: auto; z-index: 30;
+               min-width: 340px; max-width: min(560px, 92vw);
                background: var(--bg-card); color: var(--fg-body);
                border: 1px solid var(--border-medium); border-radius: 8px;
                box-shadow: var(--shadow-card);
-               padding: 12px 16px 12px; }}
+               padding: 12px 16px 12px; text-align: left; }}
   .qr-wrap.open .qr-panel {{ display: block; }}
   .qr-panel ul {{ margin: 0; padding-left: 18px;
                   font-size: 12.5px; line-height: 1.55; color: var(--fg-body); }}
@@ -3877,6 +3904,10 @@ def generate_html_report(
     table {{ font-size: 12px; }}
     thead th, td {{ padding: 8px 6px; }}
     .refresh-status {{ text-align: left; margin-top: 0; }}
+    /* Chip can sit anywhere once the controls wrap, so anchor the panel to
+       the viewport (full-width sheet) instead of the chip to avoid clipping. */
+    .qr-panel {{ position: fixed; top: auto; bottom: 12px;
+                 left: 10px; right: 10px; min-width: 0; max-width: none; }}
   }}
 
   /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
@@ -3931,6 +3962,7 @@ def generate_html_report(
     <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
   </div>
   <div class="report-controls">
+    {qr_chip_html}
     {refresh_button_html}
     <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
             title="Auto-reload this page every hour to pick up the latest published report">
@@ -4080,24 +4112,7 @@ def generate_html_report(
 </div>
 """
 
-    # Quick recommendations — subtle, hover-revealed chip (top 3 findings with
-    # full messages). Hidden until you hover the chip; auto-hides on scroll or
-    # mouse-leave (JS below), mirroring the More-filters behavior.
-    if has_holdings:
-        insights = _portfolio_insights(results)
-        if insights:
-            top = insights[:3]
-            html += ('<div class="qr-wrap" id="qrWrap">'
-                     f'<button class="qr-trigger" id="qrTrigger">💡 Quick '
-                     f'recommendations ({len(insights)})</button>'
-                     '<div class="qr-panel" id="qrPanel"><ul>')
-            for s in top:
-                html += f"<li>{s}</li>"
-            html += "</ul></div></div>\n"
-        else:
-            html += ('<div class="qr-wrap"><button class="qr-trigger" '
-                     'style="cursor:default;">✅ No critical issues flagged'
-                     "</button></div>\n")
+    # (Quick recommendations now live in the header controls — see qr_chip_html.)
 
     # Compounder section (only if there are compounder holdings)
     if compounders:
