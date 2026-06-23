@@ -10,3 +10,7 @@ venv/
 .DS_Store
 .cache/
 portfolio_report.html
+# Recommendation-history ledger for the Missed Opportunities section. Holds real
+# allocations/holdings, so it stays out of this public repo — it persists across
+# CI runs via the GitHub Actions cache instead (see .github/workflows/portfolio.yml).
+recs_history.json

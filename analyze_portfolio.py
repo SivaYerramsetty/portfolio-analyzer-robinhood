@@ -139,6 +139,7 @@ import math as _math
 import argparse
 import csv
 import io
+import json
 import os
 import smtplib
 import sys
@@ -3321,6 +3322,269 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
     return live_total
 
 
+# ---------------------------------------------------------------------------
+# Missed-opportunity tracking
+# ---------------------------------------------------------------------------
+# A persistent ledger (recs_history.json) remembers the FIRST time each ticker
+# earned a buy-type verdict, with the price/allocation at that moment. Every run
+# we refresh the latest price/allocation for tickers we can still see, so the
+# report can show which recommendations we under-acted on while the stock ran up.
+# The ledger holds real allocations, so it is gitignored (kept out of the public
+# repo) and persisted across CI runs via the GitHub Actions cache instead — see
+# .github/workflows/portfolio.yml.
+
+RECS_HISTORY_FILE = "recs_history.json"
+# Verdicts that count as "we told you to get in / get more": ADD on holdings,
+# BUY/WATCH on watchlist items.
+REC_VERDICT_LABELS = {"ADD", "BUY", "WATCH"}
+# A tracked ticker is a "missed opportunity" once it is up at least this much
+# since the first recommendation...
+MISSED_OPP_GAIN_PCT = 5.0
+# ...AND we still hold less than this share of the portfolio (0% = never added;
+# a small position counts too — we under-allocated relative to the conviction).
+MISSED_OPP_ALLOC_THRESHOLD = 2.0
+
+
+def _fmt_short_date(iso: Optional[str]) -> str:
+    """ISO 'YYYY-MM-DD' -> 'Jun 23, 2026'. Falls back to the raw value."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%b %d, %Y")
+    except (ValueError, TypeError):
+        return iso or ""
+
+
+def load_recs_history(path: str = RECS_HISTORY_FILE) -> dict:
+    """Load the recommendation-history ledger; tolerant of a missing/corrupt file."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tickers"), dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {"version": 1, "tickers": {}}
+
+
+def _current_rec_snapshot(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]],
+) -> dict[str, dict]:
+    """Build {ticker: {price, alloc, verdict, name, sector}} for everything we
+    can see this run. Holdings win over watchlist entries (real allocation).
+    `alloc` is % of portfolio (0 for non-held watchlist names)."""
+    snapshot: dict[str, dict] = {}
+    # Watchlist first, so holdings overwrite with the real allocation.
+    for items in (watchlists or {}).values():
+        for r in items:
+            if r.current_price is None:
+                continue
+            snapshot[r.ticker] = {
+                "price": r.current_price,
+                "alloc": 0.0,
+                "verdict": (r.verdict.label if r.verdict else None),
+                "name": r.name,
+                "sector": r.sector,
+            }
+    for r in results:
+        if r.current_price is None:
+            continue
+        snapshot[r.ticker] = {
+            "price": r.current_price,
+            "alloc": (r.live_pct_portfolio if r.live_pct_portfolio is not None else 0.0),
+            "verdict": (r.verdict.label if r.verdict else None),
+            "name": r.name,
+            "sector": r.sector,
+        }
+    return snapshot
+
+
+def update_recs_history(
+    history: dict,
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    run_date: Optional[str] = None,
+) -> dict:
+    """Record first sightings of buy-type verdicts and refresh latest price/alloc
+    for already-tracked tickers. Mutates and returns `history`."""
+    if run_date is None:
+        run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    tickers = history.setdefault("tickers", {})
+    snapshot = _current_rec_snapshot(results, watchlists)
+
+    for ticker, cur in snapshot.items():
+        entry = tickers.get(ticker)
+        is_rec = cur["verdict"] in REC_VERDICT_LABELS
+        if entry is None:
+            # Only start tracking once a ticker actually earns a buy-type verdict.
+            if not is_rec:
+                continue
+            tickers[ticker] = {
+                "name": cur["name"],
+                "sector": cur["sector"],
+                "first_date": run_date,
+                "first_price": cur["price"],
+                "first_verdict": cur["verdict"],
+                "first_alloc": cur["alloc"],
+                "last_date": run_date,
+                "last_price": cur["price"],
+                "last_verdict": cur["verdict"],
+                "last_alloc": cur["alloc"],
+                "peak_price": cur["price"],
+                "peak_date": run_date,
+            }
+            continue
+        # Refresh latest snapshot for an already-tracked ticker.
+        entry["name"] = cur["name"] or entry.get("name")
+        entry["sector"] = cur["sector"] or entry.get("sector")
+        entry["last_date"] = run_date
+        entry["last_price"] = cur["price"]
+        entry["last_verdict"] = cur["verdict"]
+        entry["last_alloc"] = cur["alloc"]
+        if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
+            entry["peak_price"] = cur["price"]
+            entry["peak_date"] = run_date
+    return history
+
+
+def save_recs_history(history: dict, path: str = RECS_HISTORY_FILE) -> None:
+    """Write the ledger back out (pretty-printed for clean git diffs)."""
+    try:
+        with open(path, "w") as f:
+            json.dump(history, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except OSError as e:
+        print(f"[history] Could not save {path}: {e}")
+
+
+def compute_missed_opportunities(history: dict) -> list[dict]:
+    """From the ledger, return tickers that ran up >= MISSED_OPP_GAIN_PCT since
+    the first recommendation while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
+    Sorted by current gain (largest miss first)."""
+    out: list[dict] = []
+    for ticker, e in (history.get("tickers") or {}).items():
+        first_price = e.get("first_price")
+        last_price = e.get("last_price")
+        if not first_price or not last_price or first_price <= 0:
+            continue
+        gain_pct = (last_price - first_price) / first_price * 100
+        if gain_pct < MISSED_OPP_GAIN_PCT:
+            continue
+        last_alloc = e.get("last_alloc") or 0.0
+        if last_alloc >= MISSED_OPP_ALLOC_THRESHOLD:
+            continue
+        peak_price = e.get("peak_price") or last_price
+        peak_gain_pct = (peak_price - first_price) / first_price * 100
+        verdict = e.get("first_verdict") or "BUY/ADD"
+        date_str = _fmt_short_date(e.get("first_date"))
+        when = f" on {date_str}" if date_str else ""
+        if last_alloc <= 0:
+            hold_part = "you never added it to the portfolio"
+        else:
+            hold_part = (f"you only hold {last_alloc:.1f}% of the portfolio "
+                         f"(under the {MISSED_OPP_ALLOC_THRESHOLD:g}% conviction bar)")
+        reason = (f"Flagged <strong>{verdict}</strong>{when} at "
+                  f"{_fmt_money(first_price)}; now {_fmt_pct(gain_pct, 0, True)} "
+                  f"(${first_price:,.2f} → ${last_price:,.2f}), but {hold_part}.")
+        if peak_gain_pct - gain_pct >= 5:
+            reason += f" Was up as much as {_fmt_pct(peak_gain_pct, 0, True)} at its peak."
+        out.append({
+            "ticker": ticker,
+            "name": e.get("name") or ticker,
+            "sector": e.get("sector"),
+            "first_date": e.get("first_date"),
+            "first_verdict": e.get("first_verdict"),
+            "first_price": first_price,
+            "current_price": last_price,
+            "gain_pct": gain_pct,
+            "peak_gain_pct": peak_gain_pct,
+            "last_alloc": last_alloc,
+            "reason": reason,
+        })
+    out.sort(key=lambda d: d["gain_pct"], reverse=True)
+    return out
+
+
+def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> str:
+    """Render the 'Missed Opportunities' section. When there are no qualifying
+    misses, render an empty-state note so the section is still discoverable and
+    shows that tracking is live (option 2)."""
+
+    def _esc(s: str) -> str:
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    html = "<h2 style='margin-top:48px;'>🪟 Missed Opportunities</h2>\n"
+
+    # ----- Empty state -----
+    if not missed:
+        html += (
+            '<p style="color:var(--fg-muted);font-size:13px;line-height:1.5;'
+            'background:var(--bg-card);border:1px dashed var(--border-medium);'
+            'padding:14px 16px;border-radius:6px;max-width:760px;">'
+            f"No missed opportunities yet — tracking <strong>{tracked_count}</strong> "
+            f"recommendation{'' if tracked_count == 1 else 's'} since the analyzer "
+            f"started watching. A stock lands here once it climbs "
+            f"<strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> above its first-seen "
+            f"recommendation price while you still hold "
+            f"<strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> of the portfolio "
+            f"(never bought, or under-allocated). This fills in automatically on future "
+            f"runs as prices move.</p>\n"
+        )
+        return html
+
+    # ----- Populated table -----
+    verdict_colors = {"ADD": "#27ae60", "BUY": "#27ae60", "WATCH": "#2980b9"}
+    html += (
+        '<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:18px;">'
+        f"Stocks that earned an <strong>Add / Buy / Watch</strong> verdict, climbed "
+        f"<strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> since that first recommendation, "
+        f"yet you still hold <strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> of "
+        f"the portfolio (never bought, or under-allocated). Sorted by gain you left on "
+        f"the table.</p>\n"
+    )
+    html += "<div class='table-wrap'><table>\n<thead><tr>"
+    html += (
+        "<th>Ticker</th>"
+        "<th>Name / Sector</th>"
+        "<th>First rec</th>"
+        "<th class='num'>First price</th>"
+        "<th class='num'>Current</th>"
+        "<th class='num'>Gain since rec</th>"
+        "<th class='num' title='Largest gain over first price seen since the recommendation.' style='cursor:help;'>Peak gain</th>"
+        "<th class='num'>You hold</th>"
+        "<th>Why it&#39;s a miss</th>"
+        "</tr></thead><tbody>\n"
+    )
+    for m in missed:
+        label = m.get("first_verdict") or "—"
+        color = verdict_colors.get(label, "#7f8c8d")
+        sector = _esc(m["sector"]) if m.get("sector") else "—"
+        alloc = m.get("last_alloc") or 0.0
+        hold_html = ("<span style='color:var(--fg-faint);'>Not held</span>"
+                     if alloc <= 0 else _fmt_pct(alloc, 2))
+        date_part = (f"<span style='color:var(--fg-muted);font-size:11px;'>"
+                     f"{_esc(_fmt_short_date(m.get('first_date')))}</span><br>"
+                     if m.get("first_date") else "")
+        # reason is pre-built HTML (contains <strong>); render as-is.
+        reason_html = m.get("reason") or ""
+        html += "<tr>"
+        html += f"<td class='ticker'><strong>{_esc(m['ticker'])}</strong></td>"
+        html += (f"<td><div style='font-weight:500'>{_esc(m['name'])}</div>"
+                 f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
+        html += (f"<td>{date_part}"
+                 f"<span class='verdict' style='background:{color};'>{label}</span></td>")
+        html += f"<td class='num'>{_fmt_money(m['first_price'])}</td>"
+        html += f"<td class='num'>{_fmt_money(m['current_price'])}</td>"
+        html += (f"<td class='num pos-up' style='font-weight:600;'>"
+                 f"{_fmt_pct(m['gain_pct'], 1, True)}</td>")
+        html += f"<td class='num'>{_fmt_pct(m['peak_gain_pct'], 1, True)}</td>"
+        html += f"<td class='num'>{hold_html}</td>"
+        html += (f"<td style='font-size:12px;color:var(--fg-muted);max-width:320px;"
+                 f"white-space:normal;line-height:1.45;'>{reason_html}</td>")
+        html += "</tr>\n"
+    html += "</tbody></table></div>\n"
+    return html
+
+
 def _portfolio_insights(results: list[PositionAnalysis]) -> list[str]:
     """Build prioritized, data-driven recommendations for the top banner.
 
@@ -3394,6 +3658,8 @@ def generate_html_report(
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     screening_results: Optional[dict] = None,
     realized_ytd: Optional[dict] = None,
+    missed_opportunities: Optional[list[dict]] = None,
+    recs_tracked_count: int = 0,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -4256,6 +4522,13 @@ def generate_html_report(
                 html += "</tr>\n"
             html += "</tbody></table></div>\n"
 
+    # ---------- Missed Opportunities (recs we under-acted on) ----------
+    # `missed_opportunities is not None` signals the history-tracking flow is
+    # active (main portfolio run) — render even when empty so the section is
+    # discoverable. Ad-hoc/lookup mode passes None and the section is omitted.
+    if missed_opportunities is not None:
+        html += _render_missed_opportunities(missed_opportunities, recs_tracked_count)
+
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
         html += _render_screening_section(screening_results)
@@ -5031,6 +5304,12 @@ def main():
                     help="Opt in to the Tax-Aware Trim Guidance section. Off by "
                          "default — it's the only step that fetches your full "
                          "order history, so skipping it keeps runs fast.")
+    ap.add_argument("--lots-csv", default=None,
+                    help="Optional purchase-history CSV (columns: ticker,date,"
+                         "shares,price) for exact lot-level tax analysis in CSV "
+                         "mode. Each row is one buy lot; multiple rows per ticker "
+                         "are split into long/short-term automatically. Without "
+                         "this, CSV mode falls back to a position-level estimate.")
     ap.add_argument("--tickers", default=None,
                     help="Ad-hoc mode: analyze just these tickers (comma-separated, "
                          "e.g. 'AAPL,MSFT,GOOGL'). Skips Robinhood/holdings entirely "
@@ -5207,6 +5486,31 @@ def main():
     watchlist_lookup: dict[str, list[dict]] = {}
     tax_lots_lookup: dict[str, list[dict]] = {}
     realized_ytd = None   # populated only when --tax is set
+
+    # Optional lot-level purchase history (CSV mode). Builds the same
+    # ticker -> [{date, shares, price, cost}] structure that the Robinhood
+    # order-history reconstruction produces, so the exact lot-level tax
+    # rendering (LT/ST split, per-lot days-to-long-term) lights up.
+    if args.lots_csv:
+        import csv as _lots_csv
+        with open(args.lots_csv, newline="") as _lf:
+            for _row in _lots_csv.DictReader(_lf):
+                _tk = (_row.get("ticker") or "").strip().upper()
+                if not _tk:
+                    continue
+                try:
+                    _sh = float(_row["shares"])
+                    _pr = float(_row["price"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                tax_lots_lookup.setdefault(_tk, []).append({
+                    "date": (_row.get("date") or "").strip()[:10],
+                    "shares": _sh,
+                    "price": _pr,
+                    "cost": round(_sh * _pr, 2),
+                })
+        print(f"[tax] Loaded purchase history for {len(tax_lots_lookup)} "
+              f"ticker(s) from {args.lots_csv}")
     if args.source == "robinhood":
         try:
             import robinhood_source as rhs
@@ -5308,6 +5612,24 @@ def main():
     # generate_html_report() meant such positions showed TRIM in the report but
     # were never flagged for tax analysis — missing from the tax section.
     finalize_holding_verdicts(results)
+
+    # Missed-opportunity tracking. Refresh the git-tracked ledger with this run's
+    # buy-type verdicts (first sighting) and latest prices, then derive the set of
+    # recommendations we under-acted on while the stock ran up. Best-effort: any
+    # failure here must not block the report.
+    missed_opportunities: list[dict] = []
+    recs_tracked_count = 0
+    try:
+        recs_history = load_recs_history()
+        update_recs_history(recs_history, results, watchlists_analyzed or None)
+        save_recs_history(recs_history)
+        recs_tracked_count = len(recs_history.get("tickers", {}))
+        missed_opportunities = compute_missed_opportunities(recs_history)
+        print(f"[history] Tracking {recs_tracked_count} "
+              f"recommended ticker(s); {len(missed_opportunities)} missed "
+              f"opportunit{'y' if len(missed_opportunities) == 1 else 'ies'}.")
+    except Exception as e:
+        print(f"[history] Skipped missed-opportunity tracking: {e}")
 
     # Tax analysis for SELL/TRIM positions (holding period + trim timing).
     try:
@@ -5427,6 +5749,8 @@ def main():
         results, watchlists=watchlists_analyzed or None,
         screening_results=screening_results,
         realized_ytd=realized_ytd,   # None unless --tax populated it
+        missed_opportunities=missed_opportunities,
+        recs_tracked_count=recs_tracked_count,
     )
 
     out = Path(args.out)
