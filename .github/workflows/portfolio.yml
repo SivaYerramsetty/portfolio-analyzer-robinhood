@@ -65,6 +65,18 @@ jobs:
           key: analyzer-cache-${{ github.run_id }}
           restore-keys: analyzer-cache-
 
+      # recs_history.json is the Missed-Opportunities ledger (first-recommendation
+      # dates/prices + latest prices). It holds real allocations, so it's NOT
+      # committed to this public repo — it rides the Actions cache instead. Same
+      # run_id + restore-keys pattern: each run saves a fresh copy and restores
+      # the most recent previous one, so history accumulates across runs.
+      - name: Restore recommendation history
+        uses: actions/cache@v4
+        with:
+          path: recs_history.json
+          key: recs-history-${{ github.run_id }}
+          restore-keys: recs-history-
+
       - name: Run portfolio analyzer
         env:
           PYTHONUNBUFFERED:   "1"   # stream logs live (a silent 20-min hang was just buffering)

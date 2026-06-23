@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TrimSmart — Tax-smart sell decisions for self-directed investors</title>
+<meta name="description" content="Know which positions to trim, and when, so you keep more after taxes. Free early-access waitlist." />
+<style>
+  :root{
+    --bg-page:#fafbfc; --bg-card:#ffffff; --fg-strong:#1a2533; --fg-body:#2c3e50;
+    --fg-muted:#7f8c8d; --accent:#1e7e34; --accent-dark:#15592a; --amber:#fff3cd;
+    --amber-bd:#fde68a; --border:#e1e4e8; --shadow:0 1px 3px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       color:var(--fg-body);background:var(--bg-page);line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:760px;margin:0 auto;padding:0 20px}
+  header{padding:64px 0 16px;text-align:center}
+  .logo{font-weight:700;font-size:15px;letter-spacing:.5px;color:var(--accent);text-transform:uppercase}
+  h1{font-size:40px;line-height:1.15;color:var(--fg-strong);margin:18px 0 14px;font-weight:750}
+  h1 .hl{color:var(--accent)}
+  .sub{font-size:19px;color:var(--fg-muted);max-width:620px;margin:0 auto 8px}
+  .pill{display:inline-block;background:var(--amber);border:1px solid var(--amber-bd);
+        color:#7d6608;font-size:13px;font-weight:600;border-radius:999px;padding:5px 14px;margin-top:18px}
+
+  /* form */
+  .signup{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;
+          box-shadow:var(--shadow);padding:28px;margin:34px 0;text-align:center}
+  .signup h2{margin:0 0 6px;font-size:21px;color:var(--fg-strong)}
+  .signup p{margin:0 0 18px;color:var(--fg-muted);font-size:15px}
+  form{display:flex;gap:10px;max-width:480px;margin:0 auto;flex-wrap:wrap}
+  input[type=email]{flex:1;min-width:220px;padding:13px 15px;font-size:16px;border:1px solid var(--border);
+                    border-radius:9px;outline:none}
+  input[type=email]:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(30,126,52,.12)}
+  button{background:var(--accent);color:#fff;border:0;border-radius:9px;padding:13px 22px;font-size:16px;
+         font-weight:650;cursor:pointer;transition:background .15s}
+  button:hover{background:var(--accent-dark)}
+  .tiny{font-size:12.5px;color:var(--fg-muted);margin-top:12px}
+  .ok{display:none;color:var(--accent);font-weight:600;margin-top:14px}
+
+  /* problem / value */
+  section{padding:30px 0;border-top:1px solid var(--border)}
+  h3{font-size:22px;color:var(--fg-strong);margin:0 0 14px}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px}
+  .card h4{margin:0 0 6px;font-size:16px;color:var(--fg-strong)}
+  .card p{margin:0;font-size:14.5px;color:var(--fg-muted)}
+  .example{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;
+           padding:18px 20px;font-size:14.5px}
+  .example .row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px dashed var(--border)}
+  .example .row:last-child{border-bottom:0}
+  .example .t{font-weight:650;color:var(--fg-strong)}
+  .flag{font-size:12px;font-weight:700;padding:2px 8px;border-radius:6px}
+  .flag.trim{background:#fff3cd;color:#7d6608}
+  .flag.hold{background:#d4edda;color:#1e7e34}
+  .save{color:var(--accent);font-weight:650}
+  ul.lead{padding-left:20px;margin:0}
+  ul.lead li{margin:8px 0;font-size:15.5px}
+  footer{text-align:center;padding:40px 0 60px;color:var(--fg-muted);font-size:13px}
+  .disclaimer{max-width:620px;margin:24px auto 0;font-size:12px;color:var(--fg-muted);text-align:center;line-height:1.5}
+  @media(max-width:560px){h1{font-size:31px}.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="logo">TrimSmart</div>
+    <h1>Know which positions to trim — <span class="hl">and when</span> — so you keep more after taxes.</h1>
+    <p class="sub">A tax-aware analyzer for self-directed investors. Link your brokerage, and it tells you which
+       holdings are weakening, and the lowest-tax way to sell them.</p>
+    <div class="pill">⚡ Early access · free for the first 100 testers</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- WAITLIST FORM -->
+  <div class="signup" id="join">
+    <h2>Join the waitlist</h2>
+    <p>No payment, no account. Just tell us where to reach you when it's ready.</p>
+    <!-- TODO: replace YOUR_FORM_ID with your Formspree form id (formspree.io → New form) -->
+    <form action="https://formspree.io/f/YOUR_FORM_ID" method="POST" id="wl">
+      <input type="email" name="email" placeholder="you@email.com" required />
+      <button type="submit">Get early access</button>
+    </form>
+    <div class="ok" id="ok">✓ You're on the list. We'll be in touch.</div>
+    <div class="tiny">We'll only email you about the beta. No spam, unsubscribe anytime.</div>
+  </div>
+
+  <!-- PROBLEM -->
+  <section>
+    <h3>The problem</h3>
+    <p style="color:var(--fg-muted);font-size:16px;margin-top:0">
+      Most portfolio trackers show you charts. They don't tell you what to <em>do</em> — and none of them
+      factor in the tax bill when you sell. So people either hold losers too long, or sell winners weeks
+      before they'd qualify for long-term capital gains rates and hand thousands to the IRS for no reason.</p>
+  </section>
+
+  <!-- WHAT YOU GET -->
+  <section>
+    <h3>What TrimSmart does</h3>
+    <ul class="lead">
+      <li><strong>Scores every holding</strong> on a 9-point quality framework (growth, margins, debt, valuation vs. analyst targets).</li>
+      <li><strong>Flags what's weakening</strong> — positions failing quality checks <em>and</em> trading above fair value.</li>
+      <li><strong>Times the tax</strong> — shows your gain as short-term vs. long-term, the tax cost of selling now, and how many days until a position turns long-term.</li>
+      <li><strong>Suggests the least-taxable way to trim</strong> — specific-lot selling, loss harvesting pairs, and more.</li>
+    </ul>
+  </section>
+
+  <!-- EXAMPLE -->
+  <section>
+    <h3>What you'd see</h3>
+    <div class="example">
+      <div class="row"><span class="t">NVDA · 3/9 quality · +22% vs target</span>
+        <span><span class="flag trim">TRIM</span></span></div>
+      <div class="row"><span style="color:var(--fg-muted)">Short-term gain — wait 19 days for long-term rate</span>
+        <span class="save">save ~$1,840 in tax</span></div>
+      <div class="row"><span class="t">COST · 8/9 quality · −4% vs target</span>
+        <span><span class="flag hold">HOLD</span></span></div>
+    </div>
+    <p class="tiny" style="margin-top:10px">Illustrative example. Numbers are not a recommendation.</p>
+  </section>
+
+  <!-- WHO -->
+  <section>
+    <h3>Who it's for</h3>
+    <div class="cards">
+      <div class="card"><h4>DIY investors</h4><p>You pick your own stocks and hold a real-money portfolio you actively manage.</p></div>
+      <div class="card"><h4>Tax-conscious holders</h4><p>You care about after-tax returns and hate paying short-term rates by accident.</p></div>
+    </div>
+    <div style="text-align:center;margin-top:26px">
+      <a href="#join"><button>Join the waitlist →</button></a>
+    </div>
+  </section>
+
+  <p class="disclaimer">
+    TrimSmart is an informational analysis tool, not a registered investment adviser, broker-dealer, or
+    tax professional. Nothing here is personalized investment, legal, or tax advice. Investing involves risk,
+    including loss of principal. Consult a licensed professional before acting.
+  </p>
+</div>
+
+<footer>© 2026 TrimSmart · built by an independent developer · <a href="#join" style="color:var(--accent)">join the waitlist</a></footer>
+
+<script>
+  // Lightweight AJAX submit so the user stays on the page and sees a confirmation.
+  var f=document.getElementById('wl');
+  f.addEventListener('submit',function(e){
+    e.preventDefault();
+    var data=new FormData(f);
+    fetch(f.action,{method:'POST',body:data,headers:{'Accept':'application/json'}})
+      .then(function(r){
+        if(r.ok){f.style.display='none';document.getElementById('ok').style.display='block';}
+        else{alert('Something went wrong — please try again.');}
+      })
+      .catch(function(){alert('Network error — please try again.');});
+  });
+</script>
+</body>
+</html>
