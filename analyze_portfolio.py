@@ -563,6 +563,9 @@ _GROWTH_METRIC_KEYS = (
 )
 _fund_cache_lock = threading.Lock()
 _fund_cache: Optional[dict] = None
+_fund_cache_dirty = False          # True once a miss adds/updates an entry
+_fund_hits = 0
+_fund_misses = 0
 
 
 def _fundamentals_ttl_hours() -> float:
@@ -588,7 +591,9 @@ def _load_fund_cache() -> dict:
 def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
     """Cache-aware wrapper around _compute_multi_year_growth(). On a fresh cache
     hit, inject the stored metrics and skip the income_stmt + balance_sheet
-    fetches; otherwise compute live and store the result."""
+    fetches; otherwise compute live and stage the result in memory (the disk
+    write is batched once per run by _flush_fund_cache())."""
+    global _fund_cache_dirty, _fund_hits, _fund_misses
     ttl = _fundamentals_ttl_hours()
     if ttl > 0:
         with _fund_cache_lock:
@@ -596,6 +601,8 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
         if entry and (time.time() - entry.get("ts", 0)) < ttl * 3600:
             for k, v in (entry.get("metrics") or {}).items():
                 info[k] = v
+            with _fund_cache_lock:
+                _fund_hits += 1
             return  # cache hit — no statement fetches
 
     _compute_multi_year_growth(tkr, info)
@@ -603,13 +610,24 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
     if ttl > 0:
         metrics = {k: info[k] for k in _GROWTH_METRIC_KEYS if k in info}
         with _fund_cache_lock:
-            cache = _load_fund_cache()
-            cache[ticker] = {"ts": time.time(), "metrics": metrics}
-            try:
-                _FUNDAMENTALS_CACHE_PATH.parent.mkdir(exist_ok=True)
-                _FUNDAMENTALS_CACHE_PATH.write_text(json.dumps(cache))
-            except OSError:
-                pass
+            _load_fund_cache()[ticker] = {"ts": time.time(), "metrics": metrics}
+            _fund_cache_dirty = True
+            _fund_misses += 1
+
+
+def _flush_fund_cache() -> None:
+    """Write the staged fundamentals cache to disk once (called after a parallel
+    batch). Avoids the per-ticker full-file rewrites that O(n^2)'d large runs."""
+    global _fund_cache_dirty
+    with _fund_cache_lock:
+        if not _fund_cache_dirty or _fund_cache is None:
+            return
+        try:
+            _FUNDAMENTALS_CACHE_PATH.parent.mkdir(exist_ok=True)
+            _FUNDAMENTALS_CACHE_PATH.write_text(json.dumps(_fund_cache))
+            _fund_cache_dirty = False
+        except OSError:
+            pass
 
 
 def apply_quality_filters(info: dict) -> list[FilterResult]:
@@ -1973,6 +1991,13 @@ def analyze_positions_parallel(
     finally:
         sys.stdout = old_stdout
 
+    # Persist the staged fundamentals cache once for this batch, and report the
+    # hit rate so a slow run is easy to diagnose (cold cache vs. network).
+    _flush_fund_cache()
+    if _fund_hits or _fund_misses:
+        print(f"[fundamentals-cache] {_fund_hits} hit / {_fund_misses} miss "
+              f"(skipped {_fund_hits} statement-fetch pairs)")
+
     return results  # type: ignore[return-value]
 
 
@@ -2163,7 +2188,9 @@ def _build_refresh_widget() -> tuple[str, str]:
       if (run.conclusion === "success") {
         setStatus("\\u2713 Done in " + elapsedStr() +
                   " \\u2014 reloading the fresh report in ~20s (Pages deploy lag)\\u2026");
-        setTimeout(function() { location.reload(); }, 20000);
+        setTimeout(function() {
+          (window.reloadFreshReport || location.reload.bind(location))();
+        }, 20000);
       } else {
         setStatus("Run finished: " + run.conclusion +
                   " \\u2014 see the repo's Actions tab for logs.", true);
@@ -3878,6 +3905,14 @@ def generate_html_report(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- GitHub Pages serves HTML with Cache-Control: max-age=600, so a plain
+     browser refresh can show the previous report for up to ~10 min after a new
+     run deploys. Tell the browser to always revalidate the document so a manual
+     refresh fetches the freshly published HTML (the auto-refresh separately
+     cache-busts with a ?v=timestamp query). -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <style>
   /* ---------- Theme tokens (light by default) ---------- */
   :root {{
@@ -4328,6 +4363,20 @@ def generate_html_report(
       }}
     }} catch (e) {{}}
   }})();
+
+  // Cache-busting reload. GitHub Pages serves the report with Cache-Control:
+  // max-age=600, so a plain location.reload() can be answered from the browser
+  // or the Pages CDN with the OLD report even after a fresh deploy (stale HTML
+  // with a stale "Last updated" time). A unique ?v= query string is a distinct
+  // URL, forcing an origin fetch of the just-published file. sessionStorage
+  // (password session) survives same-origin reloads, so this stays unlocked.
+  window.reloadFreshReport = function() {{
+    try {{
+      location.replace(location.pathname + '?v=' + Date.now());
+    }} catch (e) {{
+      location.reload();
+    }}
+  }};
 </script>
 <script>
   // Apply saved theme BEFORE first paint to avoid a white flash on dark-mode loads.
@@ -4787,7 +4836,7 @@ Verdicts are framework outputs, not investment advice.
     if (canDispatch()) {
       window.ghTriggerRefresh();
     } else {
-      location.reload();
+      (window.reloadFreshReport || location.reload.bind(location))();
     }
     label();
   }
