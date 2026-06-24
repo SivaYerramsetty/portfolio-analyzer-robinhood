@@ -543,6 +543,75 @@ def _compute_multi_year_growth(tkr, info: dict) -> None:
         print(f"[multi-year growth] {info.get('symbol', '?')}: {e}")
 
 
+# --- Fundamentals (quarterly-derived growth metrics) disk cache --------------
+# _compute_multi_year_growth() makes the run's two heaviest yfinance calls per
+# ticker (income_stmt + balance_sheet) to derive metrics that only change when a
+# company reports — i.e. quarterly, never intraday. For an hourly-refreshing
+# report that's wasted work, so we cache the *output* metrics per ticker with a
+# TTL (default 24h). Live prices are NOT cached (they come from .info every run),
+# so verdicts are identical to a fresh run within the TTL window. The cache lives
+# in .cache/ (gitignored; carried across CI runs via the Actions cache), and any
+# error falls back to a live compute. Set FUNDAMENTALS_CACHE_TTL_HOURS=0 to
+# disable entirely.
+_FUNDAMENTALS_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "fundamentals.json"
+_GROWTH_METRIC_KEYS = (
+    "revenueCAGR3y", "revenueGrowthLookback",
+    "earningsCAGR3y", "earningsGrowthLookback",
+    "operatingMarginAvg3y", "operatingMarginLookback",
+    "roeAvg3y", "roeLookback",
+    "fcfConsistency", "fcfConsistencyLookback",
+)
+_fund_cache_lock = threading.Lock()
+_fund_cache: Optional[dict] = None
+
+
+def _fundamentals_ttl_hours() -> float:
+    try:
+        return float(os.environ.get("FUNDAMENTALS_CACHE_TTL_HOURS", "24"))
+    except ValueError:
+        return 24.0
+
+
+def _load_fund_cache() -> dict:
+    """Lazy-load the on-disk metrics cache into a shared in-memory dict (the
+    in-memory dict is the source of truth; disk is a write-through snapshot)."""
+    global _fund_cache
+    if _fund_cache is None:
+        try:
+            data = json.loads(_FUNDAMENTALS_CACHE_PATH.read_text())
+            _fund_cache = data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            _fund_cache = {}
+    return _fund_cache
+
+
+def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
+    """Cache-aware wrapper around _compute_multi_year_growth(). On a fresh cache
+    hit, inject the stored metrics and skip the income_stmt + balance_sheet
+    fetches; otherwise compute live and store the result."""
+    ttl = _fundamentals_ttl_hours()
+    if ttl > 0:
+        with _fund_cache_lock:
+            entry = _load_fund_cache().get(ticker)
+        if entry and (time.time() - entry.get("ts", 0)) < ttl * 3600:
+            for k, v in (entry.get("metrics") or {}).items():
+                info[k] = v
+            return  # cache hit — no statement fetches
+
+    _compute_multi_year_growth(tkr, info)
+
+    if ttl > 0:
+        metrics = {k: info[k] for k in _GROWTH_METRIC_KEYS if k in info}
+        with _fund_cache_lock:
+            cache = _load_fund_cache()
+            cache[ticker] = {"ts": time.time(), "metrics": metrics}
+            try:
+                _FUNDAMENTALS_CACHE_PATH.parent.mkdir(exist_ok=True)
+                _FUNDAMENTALS_CACHE_PATH.write_text(json.dumps(cache))
+            except OSError:
+                pass
+
+
 def apply_quality_filters(info: dict) -> list[FilterResult]:
     """
     Apply the nine-filter quality compounder framework.
@@ -1492,7 +1561,10 @@ def analyze_position(
         # prefer this over the 1-year YoY values yfinance provides directly,
         # because compounders are defined by sustained growth, not last-year
         # snapshots. Silently no-ops for tickers without annual data.
-        _compute_multi_year_growth(tkr, info)
+        # Cache-aware: a warm 24h cache skips the two heaviest statement fetches
+        # (income_stmt + balance_sheet) since these metrics only change at
+        # earnings, not intraday (see _compute_growth_cached).
+        _compute_growth_cached(tkr, info, ticker)
 
         pa.bucket = classify_position(ticker, info)
         _regular = _safe_get(info, "regularMarketPrice") or _safe_get(info, "currentPrice")
@@ -2693,9 +2765,8 @@ def _filter_dots(filters: list[FilterResult]) -> str:
             actual_str = f"{f.actual:.1f}% ({f.note})"
         title = f"{f.name}: {actual_str} (threshold {f.threshold})"
         parts.append(
-            f'<span title="{title}" '
-            f'style="display:inline-block;width:10px;height:10px;'
-            f'border-radius:50%;background:{color};margin:0 1px;"></span>'
+            f'<span title="{title}" class="qdot" '
+            f'style="background:{color};"></span>'
         )
     return "".join(parts)
 
@@ -2719,11 +2790,7 @@ def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
         # the full "X Buy · Y Hold · Z Sell · source" in the tooltip. Saves
         # ~30% of the column's width versus the spelled-out label.
         full = f"{buy} Buy · {hold} Hold · {sell} Sell · {source}"
-        bar = (
-            f'<div title="{full}" style="display:flex;height:9px;border-radius:3px;'
-            f'overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;'
-            f'cursor:help;">'
-        )
+        bar = f'<div title="{full}" class="rbar">'
         for pct, color in zip(pcts, colors):
             if pct > 0:
                 bar += f'<div style="width:{pct:.1f}%;background:{color};"></div>'
@@ -3962,11 +4029,12 @@ def generate_html_report(
                    border-radius: 10px; padding: 14px 20px;
                    margin-bottom: 16px;
                    box-shadow: var(--shadow-card); }}
-  /* Stats laid out to fit on a single row on desktop; gap + sizes tuned so
-     six stats stay one line, while flex-wrap still lets them stack on narrow
-     screens. justify-content spreads them across the card width. */
-  .summary-row {{ display: flex; gap: 14px 26px; flex-wrap: wrap;
-                  justify-content: space-between; }}
+  /* Stats packed left-to-right in order so each tile sits directly after the
+     previous one (e.g. Missed opportunities right after Watchlist BUY signals).
+     flex-wrap still lets them stack on narrow screens; the larger column gap
+     keeps them readable without space-between flinging tiles to the edges. */
+  .summary-row {{ display: flex; gap: 14px 34px; flex-wrap: wrap;
+                  justify-content: flex-start; }}
   .stat {{ font-size: 11px; color: var(--fg-muted);
            text-transform: uppercase; letter-spacing: 0.3px;
            font-weight: 600; white-space: nowrap; }}
@@ -3979,6 +4047,13 @@ def generate_html_report(
                       color: var(--fg-muted); transition: color 0.15s; }}
   a.stat.clickable:hover {{ color: var(--fg-strong); }}
   a.stat.clickable:hover strong {{ text-decoration: underline; }}
+
+  /* Utility classes for the most-repeated cell decorations — the static box
+     rules move out of every row (smaller markup, identical rendering); only
+     the dynamic color/width stays inline. */
+  .qdot {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin:0 1px; }}
+  .rbar {{ display:flex; height:9px; border-radius:3px; overflow:hidden;
+           min-width:60px; max-width:84px; margin-bottom:2px; cursor:help; }}
 
   /* ---------- Tables ---------- */
   .table-wrap {{ overflow-x: auto; border: 1px solid var(--border-medium);
@@ -4238,6 +4313,22 @@ def generate_html_report(
 </style>
 </head>
 <body>
+<script>
+  // Keep refreshes (browser reload or the hourly auto-refresh) anchored at the
+  // top. Two things otherwise scroll the page on reload: (1) the browser's
+  // default scroll-position restoration, and (2) a stale "#section" hash left in
+  // the URL (e.g. after a header tile jump) which makes the browser re-jump to
+  // that section on every load. Disable restoration and strip any hash before
+  // the target element is parsed, so reloads always start at the header.
+  (function() {{
+    try {{
+      if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+      if (location.hash) {{
+        history.replaceState(null, '', location.pathname + location.search);
+      }}
+    }} catch (e) {{}}
+  }})();
+</script>
 <script>
   // Apply saved theme BEFORE first paint to avoid a white flash on dark-mode loads.
   (function() {{
