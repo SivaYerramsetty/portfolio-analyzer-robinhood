@@ -3741,8 +3741,10 @@ def generate_html_report(
     watchlist_stat_html = ""
     if watchlist_total:
         watchlist_stat_html = (
-            f'<div class="stat"><strong>{watchlist_buys} / {watchlist_total}</strong>'
-            f'Watchlist BUY signals</div>'
+            f'<a class="stat clickable" href="#" '
+            f'onclick="applyHeaderFilter(\'verdict-buy\');return false;">'
+            f'<strong>{watchlist_buys} / {watchlist_total}</strong>'
+            f'Watchlist BUY signals</a>'
         )
 
     has_holdings = bool(results)
@@ -3768,20 +3770,18 @@ def generate_html_report(
                 'style="cursor:default;">✅ No critical issues</button></div>'
             )
 
-    # Missed-opportunities header chip — jumps to the section on click. Shown
-    # whenever tracking is active (main portfolio flow), even at zero, so it's
-    # discoverable; highlighted amber when there's at least one miss.
-    missed_chip_html = ""
+    # Missed-opportunities summary stat — sits in the stat row right after the
+    # watchlist stat, and scrolls to the section on click. Shown whenever
+    # tracking is active (main portfolio flow), even at zero, so it's
+    # discoverable; the count is tinted amber when there's at least one miss.
+    missed_stat_html = ""
     if missed_opportunities is not None:
         _mc = len(missed_opportunities)
-        if _mc > 0:
-            _chip_style = ("text-decoration:none;background:var(--bg-chip-amber);"
-                           "color:var(--fg-chip-amber);border-color:var(--bg-alert-border);")
-        else:
-            _chip_style = "text-decoration:none;"
-        missed_chip_html = (
-            f'<a class="refresh-btn" href="#missed-opps" style="{_chip_style}" '
-            f'title="Jump to Missed Opportunities">🪟 Missed opps ({_mc})</a>'
+        _num_style = " style='color:var(--fg-chip-amber);'" if _mc > 0 else ""
+        missed_stat_html = (
+            f'<a class="stat clickable" href="#missed-opps" '
+            f'onclick="scrollToSection(\'missed-opps\');return false;">'
+            f'<strong{_num_style}>{_mc}</strong>Missed opportunities</a>'
         )
 
     holdings_summary = ""
@@ -3801,10 +3801,10 @@ def generate_html_report(
         holdings_summary = f"""
     <div class="stat"><strong>{_fmt_money(live_total)}</strong>Portfolio value (live)</div>
     {today_stat}
-    <div class="stat"><strong>{len(compounders)}</strong>Compounder positions</div>
-    <div class="stat"><strong>{len(thematics)}</strong>Thematic / ETF positions</div>
-    <div class="stat"><strong>{len(action_items)}</strong>Sell / Trim flags</div>
-    <div class="stat"><strong>{len(add_items)}</strong>Add candidates</div>"""
+    <a class="stat clickable" href="#compounders" onclick="scrollToSection('compounders');return false;"><strong>{len(compounders)}</strong>Compounder positions</a>
+    <a class="stat clickable" href="#thematic" onclick="scrollToSection('thematic');return false;"><strong>{len(thematics)}</strong>Thematic / ETF positions</a>
+    <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{len(action_items)}</strong>Sell / Trim flags</a>
+    <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{len(add_items)}</strong>Add candidates</a>"""
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -3974,6 +3974,11 @@ def generate_html_report(
                   color: var(--fg-strong); margin-top: 3px;
                   font-weight: 700; letter-spacing: -0.3px;
                   text-transform: none; }}
+  /* Actionable stats (jump to a section or apply a filter). */
+  a.stat.clickable {{ cursor: pointer; text-decoration: none;
+                      color: var(--fg-muted); transition: color 0.15s; }}
+  a.stat.clickable:hover {{ color: var(--fg-strong); }}
+  a.stat.clickable:hover strong {{ text-decoration: underline; }}
 
   /* ---------- Tables ---------- */
   .table-wrap {{ overflow-x: auto; border: 1px solid var(--border-medium);
@@ -4249,11 +4254,10 @@ def generate_html_report(
 <div class="report-header">
   <div>
     <h1>{report_title}</h1>
-    <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ' · yfinance only'}</div>
+    <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
   </div>
   <div class="report-controls">
     {qr_chip_html}
-    {missed_chip_html}
     {refresh_button_html}
     <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
             title="Auto-reload this page every hour to pick up the latest published report">
@@ -4267,6 +4271,7 @@ def generate_html_report(
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
     {watchlist_stat_html}
+    {missed_stat_html}
   </div>
 </div>
 
@@ -4407,7 +4412,7 @@ def generate_html_report(
 
     # Compounder section (only if there are compounder holdings)
     if compounders:
-        html += "<h2>Quality Compounders</h2>\n"
+        html += "<h2 id='compounders'>Quality Compounders</h2>\n"
         html += "<div class='table-wrap'><table>\n<thead><tr>"
         html += (
             "<th>Ticker</th>"
@@ -4560,7 +4565,7 @@ def generate_html_report(
 
     # ---------- ETFs & Thematic positions (moved before Tax section) ----------
     if thematics:
-        html += "<h2>ETFs &amp; Thematic Positions</h2>\n"
+        html += "<h2 id='thematic'>ETFs &amp; Thematic Positions</h2>\n"
         html += "<div class='table-wrap'><table>\n<thead><tr>"
         html += (
             "<th>Ticker</th>"
@@ -5163,10 +5168,38 @@ Verdicts are framework outputs, not investment advice.
     renderFreqActive();
   }
 
+  // Header summary tiles: apply a single filter (toggle off if it's already the
+  // only active one) and scroll to the first non-empty results table so the
+  // effect is visible even when the matching rows live in a lower section.
+  window.applyHeaderFilter = function(key) {
+    var off = (currentKey() === key);
+    setCombo(off ? [] : [key]);
+    if (off) return;
+    var wraps = document.querySelectorAll('.table-wrap');
+    for (var i = 0; i < wraps.length; i++) {
+      if (wraps[i].style.display !== 'none') {
+        var prev = wraps[i].previousElementSibling, tgt = wraps[i];
+        while (prev) {
+          if (prev.tagName === 'H2' || prev.tagName === 'H3') { tgt = prev; break; }
+          prev = prev.previousElementSibling;
+        }
+        tgt.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        break;
+      }
+    }
+  };
+
   renderFrequent();
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
 })();
+
+// Smooth-scroll a header summary tile to its section (no-ops if the section
+// isn't in this report). Global so the inline onclick handlers can reach it.
+window.scrollToSection = function(id) {
+  var el = document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
 </script>
 <script>
 // Quick recommendations: hover the chip to reveal the panel; auto-hide when
