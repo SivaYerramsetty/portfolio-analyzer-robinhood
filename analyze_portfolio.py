@@ -3326,19 +3326,20 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
 # Missed-opportunity tracking
 # ---------------------------------------------------------------------------
 # A persistent ledger (recs_history.json) remembers the FIRST time each ticker
-# earned a buy-type verdict, with the price/allocation at that moment. Every run
-# we refresh the latest price/allocation for tickers we can still see, so the
-# report can show which recommendations we under-acted on while the stock ran up.
-# The ledger holds real allocations, so it is gitignored (kept out of the public
-# repo) and persisted across CI runs via the GitHub Actions cache instead — see
-# .github/workflows/portfolio.yml.
+# was seen (any verdict — holding or watchlist), with the price/allocation at
+# that moment. Every run we refresh the latest price/allocation for tickers we
+# can still see, so the report can show which names ran up while we under-held
+# them. The ledger holds real allocations, so it is gitignored (kept out of the
+# public repo) and persisted across CI runs via the GitHub Actions cache
+# instead — see .github/workflows/portfolio.yml.
 
 RECS_HISTORY_FILE = "recs_history.json"
-# Verdicts that count as "we told you to get in / get more": ADD on holdings,
-# BUY/WATCH on watchlist items.
+# Buy-type verdicts — purely for nicer wording in the "why it's a miss" reason
+# (a name first seen as ADD/BUY/WATCH reads as "Flagged ..."). Tracking is NOT
+# limited to these; every ticker we see gets a ledger entry.
 REC_VERDICT_LABELS = {"ADD", "BUY", "WATCH"}
 # A tracked ticker is a "missed opportunity" once it is up at least this much
-# since the first recommendation...
+# since it was first seen...
 MISSED_OPP_GAIN_PCT = 5.0
 # ...AND we still hold less than this share of the portfolio (0% = never added;
 # a small position counts too — we under-allocated relative to the conviction).
@@ -3404,8 +3405,9 @@ def update_recs_history(
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     run_date: Optional[str] = None,
 ) -> dict:
-    """Record first sightings of buy-type verdicts and refresh latest price/alloc
-    for already-tracked tickers. Mutates and returns `history`."""
+    """Record the first sighting of every ticker we see (any verdict) and refresh
+    latest price/alloc for already-tracked tickers. Mutates and returns
+    `history`."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     tickers = history.setdefault("tickers", {})
@@ -3413,11 +3415,8 @@ def update_recs_history(
 
     for ticker, cur in snapshot.items():
         entry = tickers.get(ticker)
-        is_rec = cur["verdict"] in REC_VERDICT_LABELS
         if entry is None:
-            # Only start tracking once a ticker actually earns a buy-type verdict.
-            if not is_rec:
-                continue
+            # Track every ticker from its first sighting, whatever the verdict.
             tickers[ticker] = {
                 "name": cur["name"],
                 "sector": cur["sector"],
@@ -3458,7 +3457,7 @@ def save_recs_history(history: dict, path: str = RECS_HISTORY_FILE) -> None:
 
 def compute_missed_opportunities(history: dict) -> list[dict]:
     """From the ledger, return tickers that ran up >= MISSED_OPP_GAIN_PCT since
-    the first recommendation while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
+    they were first seen while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
     Sorted by current gain (largest miss first)."""
     out: list[dict] = []
     for ticker, e in (history.get("tickers") or {}).items():
@@ -3474,16 +3473,24 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
             continue
         peak_price = e.get("peak_price") or last_price
         peak_gain_pct = (peak_price - first_price) / first_price * 100
-        verdict = e.get("first_verdict") or "BUY/ADD"
+        verdict = e.get("first_verdict")
         date_str = _fmt_short_date(e.get("first_date"))
         when = f" on {date_str}" if date_str else ""
+        # Lead-in: a buy-type first verdict reads as "Flagged BUY"; anything else
+        # (HOLD, WATCH-list pass, no verdict, etc.) is just "First seen".
+        if verdict in REC_VERDICT_LABELS:
+            lead = f"Flagged <strong>{verdict}</strong>{when}"
+        elif verdict:
+            lead = f"First seen{when} (verdict: {verdict})"
+        else:
+            lead = f"First seen{when}"
         if last_alloc <= 0:
             hold_part = "you never added it to the portfolio"
         else:
             hold_part = (f"you only hold {last_alloc:.1f}% of the portfolio "
-                         f"(under the {MISSED_OPP_ALLOC_THRESHOLD:g}% conviction bar)")
-        reason = (f"Flagged <strong>{verdict}</strong>{when} at "
-                  f"{_fmt_money(first_price)}; now {_fmt_pct(gain_pct, 0, True)} "
+                         f"(under the {MISSED_OPP_ALLOC_THRESHOLD:g}% bar)")
+        reason = (f"{lead} at {_fmt_money(first_price)}; now "
+                  f"{_fmt_pct(gain_pct, 0, True)} "
                   f"(${first_price:,.2f} → ${last_price:,.2f}), but {hold_part}.")
         if peak_gain_pct - gain_pct >= 5:
             reason += f" Was up as much as {_fmt_pct(peak_gain_pct, 0, True)} at its peak."
@@ -3512,7 +3519,8 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
     def _esc(s: str) -> str:
         return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
-    html = "<h2 style='margin-top:48px;'>🪟 Missed Opportunities</h2>\n"
+    html = ("<h2 id='missed-opps' style='margin-top:48px;'>"
+            "🪟 Missed Opportunities</h2>\n")
 
     # ----- Empty state -----
     if not missed:
@@ -3521,10 +3529,10 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
             'background:var(--bg-card);border:1px dashed var(--border-medium);'
             'padding:14px 16px;border-radius:6px;max-width:760px;">'
             f"No missed opportunities yet — tracking <strong>{tracked_count}</strong> "
-            f"recommendation{'' if tracked_count == 1 else 's'} since the analyzer "
-            f"started watching. A stock lands here once it climbs "
-            f"<strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> above its first-seen "
-            f"recommendation price while you still hold "
+            f"stock{'' if tracked_count == 1 else 's'} (every holding and watchlist "
+            f"name) since the analyzer started watching. A stock lands here once it "
+            f"climbs <strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> above its first-seen "
+            f"price while you still hold "
             f"<strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> of the portfolio "
             f"(never bought, or under-allocated). This fills in automatically on future "
             f"runs as prices move.</p>\n"
@@ -3535,21 +3543,21 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
     verdict_colors = {"ADD": "#27ae60", "BUY": "#27ae60", "WATCH": "#2980b9"}
     html += (
         '<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:18px;">'
-        f"Stocks that earned an <strong>Add / Buy / Watch</strong> verdict, climbed "
-        f"<strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> since that first recommendation, "
-        f"yet you still hold <strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> of "
-        f"the portfolio (never bought, or under-allocated). Sorted by gain you left on "
-        f"the table.</p>\n"
+        f"Stocks the analyzer has tracked (every holding and watchlist name) that "
+        f"climbed <strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> since they were first "
+        f"seen, yet you still hold <strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> "
+        f"of the portfolio (never bought, or under-allocated). Sorted by gain you left "
+        f"on the table.</p>\n"
     )
     html += "<div class='table-wrap'><table>\n<thead><tr>"
     html += (
         "<th>Ticker</th>"
         "<th>Name / Sector</th>"
-        "<th>First rec</th>"
+        "<th>First seen</th>"
         "<th class='num'>First price</th>"
         "<th class='num'>Current</th>"
-        "<th class='num'>Gain since rec</th>"
-        "<th class='num' title='Largest gain over first price seen since the recommendation.' style='cursor:help;'>Peak gain</th>"
+        "<th class='num'>Gain since</th>"
+        "<th class='num' title='Largest gain over the first-seen price.' style='cursor:help;'>Peak gain</th>"
         "<th class='num'>You hold</th>"
         "<th>Why it&#39;s a miss</th>"
         "</tr></thead><tbody>\n"
@@ -3759,6 +3767,22 @@ def generate_html_report(
                 '<div class="qr-wrap"><button class="qr-trigger" '
                 'style="cursor:default;">✅ No critical issues</button></div>'
             )
+
+    # Missed-opportunities header chip — jumps to the section on click. Shown
+    # whenever tracking is active (main portfolio flow), even at zero, so it's
+    # discoverable; highlighted amber when there's at least one miss.
+    missed_chip_html = ""
+    if missed_opportunities is not None:
+        _mc = len(missed_opportunities)
+        if _mc > 0:
+            _chip_style = ("text-decoration:none;background:var(--bg-chip-amber);"
+                           "color:var(--fg-chip-amber);border-color:var(--bg-alert-border);")
+        else:
+            _chip_style = "text-decoration:none;"
+        missed_chip_html = (
+            f'<a class="refresh-btn" href="#missed-opps" style="{_chip_style}" '
+            f'title="Jump to Missed Opportunities">🪟 Missed opps ({_mc})</a>'
+        )
 
     holdings_summary = ""
     if has_holdings:
@@ -4229,6 +4253,7 @@ def generate_html_report(
   </div>
   <div class="report-controls">
     {qr_chip_html}
+    {missed_chip_html}
     {refresh_button_html}
     <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
             title="Auto-reload this page every hour to pick up the latest published report">
@@ -5626,7 +5651,7 @@ def main():
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
         print(f"[history] Tracking {recs_tracked_count} "
-              f"recommended ticker(s); {len(missed_opportunities)} missed "
+              f"stock(s); {len(missed_opportunities)} missed "
               f"opportunit{'y' if len(missed_opportunities) == 1 else 'ies'}.")
     except Exception as e:
         print(f"[history] Skipped missed-opportunity tracking: {e}")
