@@ -1107,12 +1107,24 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
 # Verdict logic
 # ============================================================
 
+# A holding/watchlist name is flagged "earnings soon" (header stat + filter)
+# when its next report is within this many calendar days. Kept in sync with the
+# hardcoded threshold in the rowMatchesFilter() 'earnings-soon' case (plain-JS
+# string, can't interpolate Python there).
+EARNINGS_SOON_DAYS = 7
+
+
 @dataclass
 class Verdict:
     label: str       # SELL, TRIM, HOLD, ADD, BUY MORE
     color: str       # CSS color for HTML
     reason: str
     score: Optional[float] = None    # 0-100 numerical verdict score (v2 only)
+    # Data-coverage confidence (v2 only): `coverage` is the fraction of the
+    # Composite Score's weight that actually had data (0-1); `confidence` is the
+    # bucketed label (High/Medium/Low) shown on the verdict card.
+    coverage: Optional[float] = None
+    confidence: Optional[str] = None
 
 
 def _clip01(x: float) -> float:
@@ -1175,16 +1187,19 @@ def compute_composite_score(pa, info: dict) -> None:
     if g_components:
         pa.score_growth = round(sum(g_components) / len(g_components) * 100, 1)
 
-    # Value (20%): P/E, PEG, upside-to-target
+    # Value (20%): P/E, PEG — valuation *level* only.
+    # NOTE: upside-to-analyst-target is deliberately NOT folded in here. It's a
+    # forward / sell-side view that also interacts with trend ("analysts may be
+    # lagging"), so it lives in the verdict layer (compute_verdict_v2) instead.
+    # Keeping it out of the composite means valuation-vs-target is counted once
+    # (in the verdict) rather than once here and again there — see the
+    # no-double-counting note in compute_verdict_v2.
     v_components = []
     if pe is not None and pe > 0:
         # P/E 10 -> 100, P/E 30 -> 0, scaled
         v_components.append(_clip01((30 - pe) / 20))
     if peg is not None and peg > 0:
         v_components.append(_clip01((2 - peg) / 2))
-    if pa.upside_pct is not None:
-        # 0% upside -> 50, +30% -> 100, -20% -> 0
-        v_components.append(_clip01((pa.upside_pct + 20) / 50))
     if v_components:
         pa.score_value = round(sum(v_components) / len(v_components) * 100, 1)
 
@@ -1224,6 +1239,10 @@ def compute_composite_score(pa, info: dict) -> None:
             weight_total += w
     if weight_total > 0:
         pa.composite_score = round(weighted_sum / weight_total, 1)
+        # weight_total is the share of the (normalized-to-1.0) weighting that
+        # actually had data — i.e. how complete the fundamental picture is.
+        # Drives the verdict's confidence label / modifier dampening.
+        pa.composite_coverage = round(weight_total, 3)
 
 
 def apply_context_adjustments(pa) -> None:
@@ -1304,14 +1323,23 @@ def compute_verdict_v2(
     position_pct_portfolio: Optional[float] = None,
     is_holding: bool = True,
     news_signal: Optional[dict] = None,
+    coverage: Optional[float] = None,
 ) -> Verdict:
     """
     Evidence-weighted verdict logic.
 
-    Synthesizes ALL available signals into a single "verdict score" (0-100)
-    by starting from the Composite Score and applying small modifiers
-    for each of: trend, insider activity, sector momentum, 52-week position,
-    quality miss, valuation vs target. Final number maps to a verdict.
+    Synthesizes ALL available signals into a single "verdict score" (0-100).
+    The Composite Score is the fundamentals base (quality, growth, valuation
+    *level*, analyst quality, insider activity). On top of it we apply small
+    modifiers ONLY for signals the composite does NOT already contain:
+    trend, sector momentum, 52-week position, upside-to-analyst-target, recent
+    news, and portfolio concentration.
+
+    No double-counting: quality and insider already live in the composite (as
+    rich continuous sub-scores), so they are NOT re-applied as modifiers here.
+    Upside-to-target is the opposite case — it is deliberately kept OUT of the
+    composite and applied here instead, where it can interact with trend. Each
+    factor therefore influences the final score exactly once.
 
     Holdings (is_holding=True) use SELL/TRIM/HOLD/ADD vocabulary with
     "stay-the-course" bias — selling has tax friction so the bar is higher.
@@ -1334,21 +1362,17 @@ def compute_verdict_v2(
     # Score that we'll modify
     score = base
 
-    # ---- Quality filter check (only meaningful when filters are present) ----
+    # ---- Quality filter pass/fail count (NOT re-scored here) ----
+    # Quality already drives the Composite Score base (score_quality is 30% of
+    # it, built from the same ROE / margin / leverage / FCF inputs as these
+    # gates), so re-penalizing a quality miss here would double-count it. We
+    # still tally passed/failed because the 52-week-position logic below uses
+    # the count to distinguish a value entry from a falling knife.
     passed = None
     failed = 0
     if filters:
         passed = sum(1 for f in filters if f.passed)
         failed = len(filters) - passed
-        if failed >= 4:
-            score -= 15
-            contributors.append((f"Fails {failed}/9 quality filters", -15))
-        elif failed == 3:
-            score -= 8
-            contributors.append((f"Fails 3/9 quality filters", -8))
-        elif passed == 9:
-            score += 5
-            contributors.append(("Passes all 9 quality filters", +5))
 
     # ---- Trend (50d MA / 200d MA alignment) ----
     if trend == "uptrend":
@@ -1366,14 +1390,12 @@ def compute_verdict_v2(
                                  if pct_above_ma200 is not None else ""), -10))
     # sideways: no adjustment
 
-    # ---- Insider activity ----
-    if insider_signal == "supports_buy":
-        score += 8
-        contributors.append(("Insider buying (rare signal)", +8))
-    elif insider_signal == "caution":
-        score -= 8
-        contributors.append(("Insider selling meaningful for size", -8))
-    # "no_signal" / unset: no adjustment
+    # ---- Insider activity (NOT re-scored here) ----
+    # Insider buying/selling already feeds the Composite Score (score_insider is
+    # 15% of it, as a rich continuous 0-100 built from buy/sell dollar volume).
+    # The old coarse ±8 bucket here re-applied the same signal, so it's removed
+    # to avoid double-counting. (insider_signal stays in the signature for
+    # backward compatibility with callers.)
 
     # ---- Sector momentum ----
     if sector_label == "Hot":
@@ -1458,6 +1480,29 @@ def compute_verdict_v2(
         score += _nd
         contributors.append((_ndesc, _nd))
 
+    # ---- Confidence dampening (thin data coverage) ----
+    # When the Composite Score was built from only a few sub-scores, the context
+    # modifiers above can swing a poorly-supported base too far (e.g. push a
+    # 2-input composite to a strong BUY on momentum alone). Shrink the *net
+    # modifier* toward neutral in proportion to how complete the data is. The
+    # composite base itself is left untouched — only our confidence in the
+    # context tilt drops. `coverage` is the fraction of composite weight that
+    # had data (0-1); >=0.85 (essentially every sub-score) keeps full strength.
+    confidence = None
+    if coverage is not None:
+        if coverage >= 0.85:
+            confidence = "High"
+        else:
+            confidence = "Medium" if coverage >= 0.55 else "Low"
+            conf_factor = max(0.45, min(1.0, coverage / 0.85))
+            damp_delta = round((score - base) * (conf_factor - 1.0))  # toward base
+            if damp_delta != 0:
+                score += damp_delta
+                contributors.append(
+                    (f"{confidence} confidence: built from "
+                     f"{coverage * 100:.0f}% of inputs — signals dampened",
+                     damp_delta))
+
     # ---- Clamp to 0-100 ----
     score = max(0.0, min(100.0, score))
 
@@ -1515,7 +1560,8 @@ def compute_verdict_v2(
     breakdown_lines.append(f"= verdict score {score:.0f}")
     reason = headline + " | " + " | ".join(breakdown_lines)
 
-    return Verdict(label=label, color=color, reason=reason, score=round(score, 1))
+    return Verdict(label=label, color=color, reason=reason, score=round(score, 1),
+                   coverage=coverage, confidence=confidence)
 
 
 def _verdict_headline(label: str, score: float,
@@ -1833,6 +1879,13 @@ class PositionAnalysis:
     score_analyst: Optional[float] = None
     score_insider: Optional[float] = None
     composite_score: Optional[float] = None
+    # Fraction of the composite's weight (0-1) that had data behind it — a
+    # data-completeness measure used to express verdict confidence.
+    composite_coverage: Optional[float] = None
+    # Next earnings report (event-risk timing): ISO date + days from today.
+    # days_to_earnings is forward-only (None once a report is in the past).
+    next_earnings_date: Optional[str] = None
+    days_to_earnings: Optional[int] = None
     # Insider activity (raw data for display)
     insider_activity: Optional[dict] = None
     # Latest-news sentiment from Claude: {score, label, rationale, headlines, as_of}
@@ -1843,6 +1896,32 @@ class PositionAnalysis:
     # Holding period / tax
     position_opened: Optional[str] = None     # ISO date string or None
     tax: Optional[object] = None              # TaxAnalysis (set post-hoc)
+
+
+def _extract_next_earnings(info: dict) -> tuple[Optional[str], Optional[int]]:
+    """Best-effort *next* earnings date from yfinance `info` (no extra network
+    call — these timestamps already ride along with the info we fetched).
+
+    Returns (iso_date, days_from_today). Only forward-looking dates (today or
+    later) count as "next earnings"; a stale past timestamp (already reported)
+    yields (None, None) so it neither flags nor filters. Picks the soonest
+    future date across the available earnings-timestamp fields.
+    """
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    best = None
+    for key in ("earningsTimestampStart", "earningsTimestamp", "earningsTimestampEnd"):
+        ts = info.get(key)
+        if not ts:
+            continue
+        try:
+            d = datetime.fromtimestamp(int(ts), ZoneInfo("America/New_York")).date()
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        if d >= today and (best is None or d < best):
+            best = d
+    if best is None:
+        return None, None
+    return best.isoformat(), (best - today).days
 
 
 def analyze_position(
@@ -1897,6 +1976,9 @@ def analyze_position(
         _compute_growth_cached(tkr, info, ticker)
 
         pa.bucket = classify_position(ticker, info)
+        # Next-earnings timing (event risk) — drives the header "Earnings soon"
+        # stat/filter and the verdict-card footer note.
+        pa.next_earnings_date, pa.days_to_earnings = _extract_next_earnings(info)
         _regular = _safe_get(info, "regularMarketPrice") or _safe_get(info, "currentPrice")
         _post = _safe_get(info, "postMarketPrice")
         _pre = _safe_get(info, "preMarketPrice")
@@ -2212,6 +2294,7 @@ def analyze_position(
                 insider_signal=insider_signal,
                 is_holding=not is_watchlist,
                 news_signal=pa.news_sentiment,
+                coverage=pa.composite_coverage,
             )
 
     except Exception as e:
@@ -2560,49 +2643,129 @@ _VERDICT_ORDER = {
 }
 
 
-def _verdict_cell(verdict) -> str:
-    """Render the verdict pill + score; full reason shows on hover.
+def _score_strength_color(s: float) -> str:
+    """Shared strength color for the verdict score (inline number + card bar)."""
+    if s >= 70:
+        return "var(--pos-up)"
+    if s >= 50:
+        return "var(--fg-strong)"
+    if s >= 35:
+        return "#e67e22"
+    return "var(--pos-down)"
 
-    Layout: colored verdict pill (label) and the numeric score side-by-side.
-    Score is also stored in the parent <td> data-sort so the column sorts
-    by actual conviction strength rather than label alphabetically.
 
-    v2 verdict reasons use ' | ' to separate the headline from the
-    line-by-line factor breakdown (+5 hot sector, -10 downtrend, etc.).
-    We replace these with newlines for a readable multi-line tooltip.
+def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
+    """Render the verdict pill + 0-100 score with a styled hover-card breakdown.
+
+    Layout: a colored verdict pill (label) and the numeric score sit side by
+    side. Hovering the cell reveals a styled card that breaks the score down
+    factor by factor — the Composite Score base, then each +/- modifier (trend,
+    sector, upside, news, ...) — topped with a 0-100 strength bar. The card also
+    surfaces data-coverage confidence and, when known, the next-earnings date.
+    At-a-glance markers sit beside the score: an amber dot for thin-data (Low)
+    confidence and a calendar glyph when earnings are within a week.
+
+    v2 verdict reasons are structured as
+        headline | Composite Score N | +X · factor | -Y · factor | = verdict score N
+    which we parse into the card. Non-v2 verdicts (ETF/thematic — no numeric
+    score) fall back to the simple pill + native tooltip. The score also lives
+    in the parent <td> data-sort so the column sorts by conviction strength.
     """
     if not verdict:
         return "<span style='color:var(--fg-faint);'>—</span>"
     label = verdict.label or "—"
     color = verdict.color or "#7f8c8d"
     reason = verdict.reason or ""
-    # v2 reasons use ' | ' as line separator. Convert to actual newlines so
-    # the native browser tooltip shows them on separate lines.
-    reason_for_title = reason.replace(" | ", "\n")
-    reason_attr = (reason_for_title
-                   .replace("&", "&amp;")
-                   .replace("'", "&#39;")
-                   .replace('"', "&quot;"))
-    # Score: shown next to the pill, color-coded by strength
     score = getattr(verdict, "score", None)
-    score_html = ""
-    if score is not None:
-        if score >= 70:
-            score_color = "var(--pos-up)"
-        elif score >= 50:
-            score_color = "var(--fg-strong)"
-        elif score >= 35:
-            score_color = "#e67e22"
+
+    def _esc(s: object) -> str:
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
+
+    # --- Fallback: no numeric score or unstructured reason (ETF/thematic) ---
+    if score is None or " | " not in reason:
+        title = _esc(reason.replace(" | ", "\n"))
+        return (f"<span class='verdict' style='background:{color};cursor:help;' "
+                f"title='{title}'>{label}</span>")
+
+    sc = _score_strength_color(score)
+    parts = [p.strip() for p in reason.split(" | ")]
+    headline = parts[0] if parts else ""
+    # parts[1] = Composite Score base; middle = factor lines; last = "= verdict score N"
+    base_line = ""
+    factor_rows = []
+    for seg in parts[1:]:
+        if seg.startswith("= verdict score"):
+            continue
+        # Factor line "±N · desc" — split on the first middle-dot separator.
+        if " · " in seg and seg[:1] in "+-":
+            delta_str, _, desc = seg.partition(" · ")
+            negative = delta_str.strip().startswith("-")
+            cls = "vd-neg" if negative else "vd-pos"
+            disp = delta_str.strip().replace("-", "−")  # prettier minus
+            factor_rows.append(
+                f"<div class='vrow'><span class='vd {cls}'>{_esc(disp)}</span>"
+                f"<span class='vt'>{_esc(desc)}</span></div>"
+            )
+        elif not base_line:
+            base_line = seg
+
+    bar_pct = max(0.0, min(100.0, float(score)))
+    bar = (f"<div class='vbar'><div class='vbar-fill' "
+           f"style='width:{bar_pct:.0f}%;background:{sc};'></div></div>")
+    base_html = f"<div class='vcard-base'>{_esc(base_line)}</div>" if base_line else ""
+
+    # Confidence chip — how complete the data behind the score is. Only shown
+    # for Medium/Low (High is the unremarkable default), so a thin name reads
+    # honestly instead of looking as authoritative as a fully-covered one.
+    confidence = getattr(verdict, "confidence", None)
+    coverage = getattr(verdict, "coverage", None)
+    conf_html = ""
+    cell_marker = ""
+    if confidence in ("Medium", "Low"):
+        cov_txt = f" · {coverage * 100:.0f}% data coverage" if coverage is not None else ""
+        ccls = "vconf-low" if confidence == "Low" else "vconf-med"
+        conf_html = (f"<div class='vconf {ccls}'>{confidence} confidence{cov_txt}"
+                     f"{' — built from limited data' if confidence == 'Low' else ''}</div>")
+        if confidence == "Low":
+            cell_marker += "<span class='vmark vmark-conf' aria-hidden='true'>●</span>"
+
+    # Earnings footer + at-a-glance calendar marker (event-risk timing).
+    earn_html = ""
+    if days_to_earnings is not None and days_to_earnings >= 0:
+        if days_to_earnings == 0:
+            etxt = "Reports today"
+        elif days_to_earnings == 1:
+            etxt = "Reports tomorrow"
         else:
-            score_color = "var(--pos-down)"
-        score_html = (
-            f"<span style='margin-left:6px;font-weight:600;font-size:13px;"
-            f"color:{score_color};font-variant-numeric:tabular-nums;'>"
-            f"{score:.0f}</span>"
-        )
+            etxt = f"Reports in {days_to_earnings} days"
+        soon = days_to_earnings <= EARNINGS_SOON_DAYS
+        if days_to_earnings <= 30:
+            ecls = "vearn-soon" if soon else "vearn"
+            earn_html = (f"<div class='vearn-row {ecls}'>"
+                         f"<span class='vearn-ico'>📅</span>{etxt}</div>")
+        if soon:
+            cell_marker += "<span class='vmark vmark-earn' aria-hidden='true'>📅</span>"
+
+    card = (
+        f"<div class='vcard' role='tooltip'>"
+        f"<div class='vcard-head'>"
+        f"<span class='vcard-headline'>{_esc(headline)}</span>"
+        f"<span class='vcard-score' style='color:{sc};'>{score:.0f}</span></div>"
+        f"{bar}{conf_html}{base_html}"
+        f"<div class='vrows'>{''.join(factor_rows)}</div>"
+        f"{earn_html}"
+        f"</div>"
+    )
+    # No native title= (it duplicated, and lagged behind, the styled card on
+    # desktop). The full breakdown still reaches touch devices via data-tip,
+    # which the mobile tap-to-reveal sheet reads.
+    mobile_tip = _esc(reason.replace(" | ", "\n"))
     return (
-        f"<span class='verdict' style='background:{color};cursor:help;' "
-        f"title='{reason_attr}'>{label}</span>{score_html}"
+        f"<span class='vcell' data-tip='{mobile_tip}'>"
+        f"<span class='verdict' style='background:{color};'>{label}</span>"
+        f"<span class='vscore' style='color:{sc};'>{score:.0f}</span>"
+        f"{cell_marker}{card}</span>"
     )
 
 
@@ -2666,10 +2829,13 @@ def _tr_open(r) -> str:
             insider = "no_signal"
     # Whether tax analysis is populated (for "show tax-relevant" filter)
     has_tax = "1" if getattr(r, "tax", None) is not None else "0"
+    # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
+    earnings_days = "" if getattr(r, "days_to_earnings", None) is None else r.days_to_earnings
     # Combined search text — lowercased for case-insensitive contains() matching
     search_text = f"{r.ticker} {r.name} {r.sector or ''}".lower()
     return (
         f"<tr data-verdict='{verdict}' data-verdict-score='{verdict_score}' "
+        f"data-earnings-days='{earnings_days}' "
         f"data-quality='{quality}' "
         f"data-gain='{gain}' data-gain-pct='{gain_pct}' "
         f"data-day-pct='{day_pct}' "
@@ -3785,6 +3951,7 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
                 position_pct_portfolio=r.live_pct_portfolio,
                 is_holding=True,
                 news_signal=r.news_sentiment,   # reuse the score from analyze_position
+                coverage=r.composite_coverage,
             )
     return live_total
 
@@ -4191,13 +4358,15 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
     return html
 
 
-def _portfolio_insights(results: list[PositionAnalysis]) -> list[str]:
-    """Build prioritized, data-driven recommendations for the top banner.
+def _portfolio_insights(results: list[PositionAnalysis]) -> list[dict]:
+    """Build prioritized, data-driven recommendations for the header chip.
 
     Turns the per-position analysis into a few concise, actionable findings
     (exit/trim flags, concentration, high-conviction adds, stretched
-    valuations, weak fundamentals, insider selling). Returns HTML-safe
-    strings, most important first; empty list means nothing notable.
+    valuations, weak fundamentals, insider selling). Each item is a dict
+    {icon, label, detail, tone} where tone (danger/warn/good) drives the
+    colored icon chip in the panel. Most important first; empty list means
+    nothing notable.
     """
     held = [r for r in results if (r.shares or 0) > 0]
     if not held:
@@ -4212,49 +4381,54 @@ def _portfolio_insights(results: list[PositionAnalysis]) -> list[str]:
     def qpass(r):
         return sum(1 for f in r.filters if f.passed) if r.filters else None
 
-    out: list[str] = []
+    out: list[dict] = []
 
     sells = [r for r in held if r.verdict and r.verdict.label == "SELL"]
     if sells:
-        out.append(f"🚩 <strong>Review for exit:</strong> {names(sells)} — "
-                   f"scoring below the framework's keep threshold.")
+        out.append({"icon": "🚩", "label": "Review for exit", "tone": "danger",
+                    "detail": f"{names(sells)} — scoring below the framework's "
+                              f"keep threshold."})
 
     trims = [r for r in held if r.verdict and r.verdict.label == "TRIM"]
     if trims:
-        out.append(f"✂️ <strong>Trim candidates:</strong> {names(trims)}.")
+        out.append({"icon": "✂️", "label": "Trim candidates", "tone": "warn",
+                    "detail": names(trims) + "."})
 
     over = sorted((r for r in held if (r.live_pct_portfolio or 0) >= 15),
                   key=lambda r: r.live_pct_portfolio or 0, reverse=True)
     if over:
         parts = ", ".join(f"{r.ticker} ({r.live_pct_portfolio:.0f}%)"
                           for r in over[:3])
-        out.append(f"📊 <strong>Concentration:</strong> {parts} — sizeable "
-                   f"position(s); consider rebalancing.")
+        out.append({"icon": "📊", "label": "Concentration", "tone": "warn",
+                    "detail": f"{parts} — sizeable position(s); consider "
+                              f"rebalancing."})
 
     adds = [r for r in held if r.verdict and r.verdict.label == "ADD"]
     if adds:
-        out.append(f"➕ <strong>High-conviction adds:</strong> {names(adds)}.")
+        out.append({"icon": "➕", "label": "High-conviction adds", "tone": "good",
+                    "detail": names(adds) + "."})
 
     stretched = sorted((r for r in held
                         if r.upside_pct is not None and r.upside_pct <= -15),
                        key=lambda r: r.upside_pct)
     if stretched:
-        out.append(f"🎯 <strong>Above analyst target:</strong> {names(stretched)} "
-                   f"— limited upside to consensus.")
+        out.append({"icon": "🎯", "label": "Above analyst target", "tone": "warn",
+                    "detail": f"{names(stretched)} — limited upside to consensus."})
 
     weak = [r for r in held
             if qpass(r) is not None and qpass(r) <= 4
             and (not r.verdict or r.verdict.label not in ("SELL", "TRIM"))]
     if weak:
         parts = ", ".join(f"{r.ticker} ({qpass(r)}/9)" for r in weak[:3])
-        out.append(f"🔻 <strong>Weak fundamentals:</strong> {parts} — "
-                   f"watch quality trend.")
+        out.append({"icon": "🔻", "label": "Weak fundamentals", "tone": "danger",
+                    "detail": f"{parts} — watch quality trend."})
 
     caution = [r for r in held
                if (r.insider_activity or {}).get("net_signal") == "Selling"]
     if caution:
-        out.append(f"👀 <strong>Insider selling:</strong> {names(caution)} — "
-                   f"discretionary sales worth a look.")
+        out.append({"icon": "👀", "label": "Insider selling", "tone": "warn",
+                    "detail": f"{names(caution)} — discretionary sales worth "
+                              f"a look."})
 
     return out
 
@@ -4375,12 +4549,24 @@ def generate_html_report(
     if has_holdings:
         _insights = _portfolio_insights(results)
         if _insights:
-            _items = "".join(f"<li>{s}</li>" for s in _insights)
+            _rows = "".join(
+                f'<div class="qr-item qr-{it["tone"]}">'
+                f'<span class="qr-ico">{it["icon"]}</span>'
+                f'<span class="qr-text">'
+                f'<span class="qr-label">{it["label"]}</span>'
+                f'<span class="qr-detail">{it["detail"]}</span>'
+                f'</span></div>'
+                for it in _insights
+            )
             qr_chip_html = (
                 '<div class="qr-wrap" id="qrWrap">'
-                f'<button class="qr-trigger" id="qrTrigger">💡 Quick '
-                f'recommendations ({len(_insights)})</button>'
-                f'<div class="qr-panel" id="qrPanel"><ul>{_items}</ul></div>'
+                f'<button class="qr-trigger" id="qrTrigger">'
+                f'<span class="qr-bulb">💡</span>Quick recommendations'
+                f'<span class="qr-count">{len(_insights)}</span></button>'
+                f'<div class="qr-panel" id="qrPanel">'
+                f'<div class="qr-panel-head">Quick recommendations</div>'
+                f'<div class="qr-list">{_rows}</div>'
+                f'</div>'
                 "</div>"
             )
         else:
@@ -4401,6 +4587,36 @@ def generate_html_report(
             f'<a class="stat clickable" href="#missed-opps" '
             f'onclick="scrollToSection(\'missed-opps\');return false;">'
             f'<strong{_num_style}>{_mc}</strong>Missed opportunities</a>'
+        )
+
+    # Earnings-soon stat — sits right after Missed opportunities. Counts every
+    # rendered name (holdings + de-duped watchlist) reporting within
+    # EARNINGS_SOON_DAYS, so the count matches what the click-through filter
+    # reveals. Clicking filters the tables to just those (event-risk heads-up
+    # before adding/trimming). Shown only when at least one name qualifies, so
+    # it stays out of the way off-season.
+    def _earns_soon(r) -> bool:
+        d = getattr(r, "days_to_earnings", None)
+        return d is not None and 0 <= d <= EARNINGS_SOON_DAYS
+
+    earnings_stat_html = ""
+    _ec = sum(1 for r in results if _earns_soon(r))
+    if watchlists:
+        _held = {r.ticker for r in results}
+        _seen: set[str] = set()
+        for _items in watchlists.values():
+            for r in _items:
+                if r.ticker in _held or r.ticker in _seen:
+                    continue
+                _seen.add(r.ticker)
+                if _earns_soon(r):
+                    _ec += 1
+    if _ec:
+        earnings_stat_html = (
+            f'<a class="stat clickable" href="#" '
+            f'onclick="applyHeaderFilter(\'earnings-soon\');return false;">'
+            f'<strong style="color:var(--fg-chip-amber);">{_ec}</strong>'
+            f'Earnings within {EARNINGS_SOON_DAYS}d</a>'
         )
 
     holdings_summary = ""
@@ -4671,6 +4887,64 @@ def generate_html_report(
   .verdict {{ padding: 4px 10px; border-radius: 12px; color: white;
               font-weight: 600; font-size: 11px; letter-spacing: 0.4px;
               display: inline-block; }}
+
+  /* Verdict cell: pill + score with a styled hover-card breakdown that
+     replaces the old plain title= tooltip. The card escapes the table on
+     desktop (.table-wrap is overflow:visible >=901px); on narrow screens it
+     would clip, so a short native title= stays as the fallback there. */
+  .vcell {{ position: relative; display: inline-flex; align-items: center;
+            gap: 6px; cursor: help; }}
+  .vscore {{ font-weight: 600; font-size: 13px;
+             font-variant-numeric: tabular-nums; }}
+  /* position:fixed + JS-computed top/left (see the verdict-card script) so the
+     card opens into whatever space is available around the cell and never
+     spills past the viewport — no horizontal scrollbar, no clipping. Falls
+     back to the short native title= tooltip if JS is unavailable. */
+  .vcard {{ display: none; position: fixed; z-index: 40;
+            width: 300px; max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px); overflow-y: auto;
+            background: var(--bg-card); color: var(--fg-body);
+            border: 1px solid var(--border-medium); border-radius: 10px;
+            box-shadow: var(--shadow-sticky); padding: 12px 14px;
+            text-align: left; font-size: 12px; line-height: 1.45;
+            white-space: normal; cursor: default; }}
+  .vcard.show {{ display: block; }}
+  .vcard-head {{ display: flex; align-items: baseline;
+                 justify-content: space-between; gap: 10px; margin-bottom: 8px; }}
+  .vcard-headline {{ font-weight: 600; color: var(--fg-strong); font-size: 12px; }}
+  .vcard-score {{ font-weight: 700; font-size: 20px; letter-spacing: -0.5px;
+                  font-variant-numeric: tabular-nums; flex: none; }}
+  .vbar {{ height: 6px; border-radius: 3px; background: var(--bg-chip-neutral);
+           overflow: hidden; margin-bottom: 10px; }}
+  .vbar-fill {{ height: 100%; border-radius: 3px; }}
+  .vcard-base {{ color: var(--fg-muted); font-size: 11px; font-weight: 600;
+                 text-transform: uppercase; letter-spacing: 0.3px;
+                 padding-bottom: 6px; margin-bottom: 6px;
+                 border-bottom: 1px dashed var(--border-medium); }}
+  .vrows {{ display: flex; flex-direction: column; gap: 5px; }}
+  .vrow {{ display: flex; align-items: flex-start; gap: 8px; }}
+  .vd {{ flex: none; min-width: 26px; text-align: right; font-weight: 700;
+         font-variant-numeric: tabular-nums; font-size: 12px; }}
+  .vd-pos {{ color: var(--pos-up); }}
+  .vd-neg {{ color: var(--pos-down); }}
+  .vt {{ color: var(--fg-body); }}
+  /* Confidence chip inside the verdict card (Medium/Low data coverage). */
+  .vconf {{ font-size: 11px; font-weight: 600; padding: 4px 8px;
+            border-radius: 6px; margin-bottom: 8px; line-height: 1.35; }}
+  .vconf-med {{ background: var(--bg-chip-neutral); color: var(--fg-chip-neutral); }}
+  .vconf-low {{ background: var(--bg-chip-amber); color: var(--fg-chip-amber); }}
+  /* Next-earnings footer inside the verdict card. */
+  .vearn-row {{ display: flex; align-items: center; gap: 6px;
+                margin-top: 10px; padding-top: 8px;
+                border-top: 1px dashed var(--border-medium);
+                font-size: 11px; font-weight: 600; }}
+  .vearn {{ color: var(--fg-muted); }}
+  .vearn-soon {{ color: var(--fg-chip-amber); }}
+  .vearn-ico {{ font-size: 12px; }}
+  /* At-a-glance markers beside the score (low-confidence dot, earnings glyph). */
+  .vmark {{ font-size: 10px; cursor: help; line-height: 1; }}
+  .vmark-conf {{ color: #e67e22; }}
+  .vmark-earn {{ font-size: 11px; filter: grayscale(0.1); }}
   .ticker {{ font-weight: 700; font-family: "SF Mono", SFMono-Regular,
              Consolas, "Liberation Mono", monospace;
              color: var(--fg-strong); letter-spacing: -0.2px; }}
@@ -4704,18 +4978,41 @@ def generate_html_report(
   .qr-trigger:hover {{ background: var(--bg-card-hover); color: var(--fg-body); }}
   .qr-wrap.open .qr-trigger {{ background: var(--bg-card-hover);
                                color: var(--fg-body); }}
-  .qr-panel {{ display: none; position: absolute; top: calc(100% + 6px);
+  .qr-bulb {{ font-size: 13px; }}
+  /* Count badge in the trigger. */
+  .qr-count {{ display: inline-flex; align-items: center; justify-content: center;
+               min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+               background: var(--bg-chip-amber); color: var(--fg-chip-amber);
+               font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }}
+  .qr-panel {{ display: none; position: absolute; top: calc(100% + 8px);
                right: 0; left: auto; z-index: 30;
-               min-width: 340px; max-width: min(560px, 92vw);
+               width: 384px; max-width: 92vw;
                background: var(--bg-card); color: var(--fg-body);
-               border: 1px solid var(--border-medium); border-radius: 8px;
-               box-shadow: var(--shadow-card);
-               padding: 12px 16px 12px; text-align: left; }}
+               border: 1px solid var(--border-medium); border-radius: 12px;
+               box-shadow: var(--shadow-sticky);
+               padding: 6px; text-align: left; }}
   .qr-wrap.open .qr-panel {{ display: block; }}
-  .qr-panel ul {{ margin: 0; padding-left: 18px;
-                  font-size: 12.5px; line-height: 1.55; color: var(--fg-body); }}
-  .qr-panel li {{ margin-bottom: 5px; }}
-  .qr-panel li:last-child {{ margin-bottom: 0; }}
+  .qr-panel-head {{ font-size: 10px; font-weight: 700; text-transform: uppercase;
+                    letter-spacing: 0.6px; color: var(--fg-faint);
+                    padding: 8px 10px 7px; }}
+  .qr-list {{ display: flex; flex-direction: column; gap: 1px; }}
+  .qr-item {{ display: flex; gap: 11px; align-items: flex-start;
+              padding: 9px 10px; border-radius: 9px;
+              transition: background 0.15s; }}
+  .qr-item:hover {{ background: var(--bg-card-hover); }}
+  .qr-item + .qr-item {{ position: relative; }}
+  .qr-ico {{ flex: none; width: 27px; height: 27px; border-radius: 50%;
+             display: flex; align-items: center; justify-content: center;
+             font-size: 13px; line-height: 1; margin-top: 1px; }}
+  .qr-text {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; }}
+  .qr-label {{ font-size: 12.5px; font-weight: 700; color: var(--fg-strong);
+               letter-spacing: -0.1px; }}
+  .qr-detail {{ font-size: 12px; line-height: 1.45; color: var(--fg-muted); }}
+  /* tone → colored icon chip (matches the report's chip palette) */
+  .qr-danger .qr-ico {{ background: var(--bg-chip-red); }}
+  .qr-warn .qr-ico {{ background: var(--bg-chip-amber); }}
+  .qr-good .qr-ico {{ background: var(--bg-chip-green); }}
+  .qr-info .qr-ico {{ background: var(--bg-chip-blue); }}
 
   /* ---------- Filter bar ----------
      Note: filter bar is intentionally NOT sticky. We tried scroll-direction
@@ -4851,7 +5148,8 @@ def generate_html_report(
     /* Chip can sit anywhere once the controls wrap, so anchor the panel to
        the viewport (full-width sheet) instead of the chip to avoid clipping. */
     .qr-panel {{ position: fixed; top: auto; bottom: 12px;
-                 left: 10px; right: 10px; min-width: 0; max-width: none; }}
+                 left: 10px; right: 10px; width: auto; min-width: 0;
+                 max-width: none; }}
   }}
 
   /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
@@ -4951,6 +5249,7 @@ def generate_html_report(
   <div class="summary-row">{holdings_summary}
     {watchlist_stat_html}
     {missed_stat_html}
+    {earnings_stat_html}
   </div>
 </div>
 
@@ -5074,6 +5373,10 @@ def generate_html_report(
       <button class="filter-pill" data-filter="recent-buy">Recent (&lt;30d)</button>
     </div>
     <div class="filter-group">
+      <span class="filter-group-label">Earnings</span>
+      <button class="filter-pill" data-filter="earnings-soon">📅 Reports within 7d</button>
+    </div>
+    <div class="filter-group">
       <span class="filter-group-label">Tax</span>
       <button class="filter-pill" data-filter="has-tax-flag">Has tax detail</button>
       <button class="filter-pill" data-filter="tax-loss-candidate">Loss-harvest candidate</button>
@@ -5119,7 +5422,7 @@ def generate_html_report(
                      - r.rating_breakdown.get("sell", 0)) / t
                 )
             rating_html = _rating_bar(r.rating_breakdown, r.recommendation, r.num_analysts)
-            verdict_html = _verdict_cell(r.verdict)
+            verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
             html += _tr_open(r)
             html += _td(_ticker_cell(r), r.ticker, "ticker")
             html += _td(_name_sector_cell(r), r.name)
@@ -5205,7 +5508,7 @@ def generate_html_report(
                 rating_html = _rating_bar(
                     r.rating_breakdown, r.recommendation, r.num_analysts
                 )
-                verdict_html = _verdict_cell(r.verdict)
+                verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
                 quality_cell = (
                     f"{_filter_dots(r.filters)} "
                     f"<span style='color:var(--fg-muted);font-size:11px'>{passed}/9</span>"
@@ -5270,7 +5573,7 @@ def generate_html_report(
                      - r.rating_breakdown.get("sell", 0)) / t
                 )
             rating_html = _rating_bar(r.rating_breakdown, r.recommendation, r.num_analysts)
-            verdict_html = _verdict_cell(r.verdict)
+            verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
             html += _tr_open(r)
             html += _td(_ticker_cell(r), r.ticker, "ticker")
             html += _td(r.name, r.name)
@@ -5516,6 +5819,7 @@ Verdicts are framework outputs, not investment advice.
     var recommendation = row.getAttribute('data-recommendation') || '';
     var hasTax = row.getAttribute('data-has-tax') || '0';
     var bucket = row.getAttribute('data-bucket') || '';
+    var earningsDays = num(row.getAttribute('data-earnings-days'));
 
     switch (filter) {
       // ------------- Essentials (top row) -------------
@@ -5621,6 +5925,11 @@ Verdicts are framework outputs, not investment advice.
       case 'short-term':      return !isNaN(daysHeld) && daysHeld <= 365;
       case 'approaching-lt':  return !isNaN(daysHeld) && daysHeld >= 275 && daysHeld <= 365;
       case 'recent-buy':      return !isNaN(daysHeld) && daysHeld < 30;
+
+      // ------------- Earnings -------------
+      // "Soon" = reports within 7 days (forward-only). Keep this threshold in
+      // sync with EARNINGS_SOON_DAYS in the Python side.
+      case 'earnings-soon':      return !isNaN(earningsDays) && earningsDays >= 0 && earningsDays <= 7;
 
       // ------------- Tax -------------
       case 'has-tax-flag':       return hasTax === '1';
@@ -5796,10 +6105,12 @@ Verdicts are framework outputs, not investment advice.
 
   function setCombo(keys) {
     activeFilters.clear();
+    // Activate every requested key directly — not just ones with a matching
+    // pill — so header-stat filters (e.g. 'earnings-soon') still work even if
+    // no pill is rendered for them.
+    keys.forEach(function(k) { if (k) activeFilters.add(k); });
     pills.forEach(function(p) {
-      var on = keys.indexOf(p.getAttribute('data-filter')) >= 0;
-      p.classList.toggle('active', on);
-      if (on) activeFilters.add(p.getAttribute('data-filter'));
+      p.classList.toggle('active', keys.indexOf(p.getAttribute('data-filter')) >= 0);
     });
     applyFilters();
     renderFreqActive();
@@ -5961,9 +6272,12 @@ window.scrollToSection = function(id) {
   document.addEventListener('click', function(e) {
     if (sheet.contains(e.target) || backdrop.contains(e.target)) return;
     if (e.target.closest(SKIP)) return;
-    var el = e.target.closest('[title]');
+    // [data-tip] carries tooltip text for elements that intentionally have no
+    // native title= (e.g. the verdict cell, whose desktop tooltip is the
+    // styled hover card).
+    var el = e.target.closest('[title],[data-tip]');
     if (!el) return;
-    var text = el.getAttribute('title');
+    var text = el.getAttribute('title') || el.getAttribute('data-tip');
     if (!text || !text.trim()) return;
     e.preventDefault();
     openTip(text, columnLabel(el.closest('td')));
@@ -5974,6 +6288,68 @@ window.scrollToSection = function(id) {
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') closeTip();
   });
+})();
+</script>
+<script>
+// Verdict hover card placement. The card is position:fixed; we compute its
+// top/left from the cell's viewport rect so it opens into whatever space is
+// available (left or right, above or below) and is always clamped inside the
+// viewport — so it never spills past the right edge (which previously forced a
+// horizontal scrollbar) or gets clipped on small screens. Hover-capable
+// devices only; touch devices fall back to the short native title= tooltip.
+(function() {
+  if (!window.matchMedia || !window.matchMedia('(hover: hover)').matches) return;
+  var GAP = 8, M = 8;                 // gap from the cell, margin from viewport edge
+  var curCell = null, curCard = null;
+
+  function hide() {
+    if (curCard) curCard.classList.remove('show');
+    curCard = null; curCell = null;
+  }
+
+  function place(cell) {
+    var card = cell.querySelector('.vcard');
+    if (!card) return;
+    if (curCard && curCard !== card) curCard.classList.remove('show');
+    curCell = cell; curCard = card;
+    card.classList.add('show');               // show first so offsetW/H are real
+    var c = cell.getBoundingClientRect();
+    var w = card.offsetWidth, h = card.offsetHeight;
+    var vw = document.documentElement.clientWidth;
+    var vh = document.documentElement.clientHeight;
+    // Horizontal: left-align to the cell; if that overflows the right edge,
+    // right-align to the cell; then clamp into [M, vw - w - M].
+    var left = c.left;
+    if (left + w > vw - M) left = c.right - w;
+    left = Math.max(M, Math.min(left, vw - w - M));
+    // Vertical: prefer below; if it overflows the bottom, open above; clamp.
+    var top = c.bottom + GAP;
+    if (top + h > vh - M) {
+      var above = c.top - GAP - h;
+      top = above >= M ? above : Math.max(M, vh - h - M);
+    }
+    card.style.left = Math.round(left) + 'px';
+    card.style.top = Math.round(top) + 'px';
+  }
+
+  document.addEventListener('mouseover', function(e) {
+    var cell = e.target.closest ? e.target.closest('.vcell') : null;
+    if (cell && cell !== curCell) place(cell);
+  });
+  document.addEventListener('mouseout', function(e) {
+    if (!curCell) return;
+    var cell = e.target.closest ? e.target.closest('.vcell') : null;
+    if (cell !== curCell) return;             // not leaving the active cell
+    var to = e.relatedTarget;
+    if (!to || (!curCell.contains(to) && !curCard.contains(to))) hide();
+  });
+  // Page scroll detaches a fixed card from its cell — hide it. But ignore
+  // scrolling *inside* the card itself (a tall card scrolls internally).
+  window.addEventListener('scroll', function(e) {
+    if (curCard && (e.target === curCard || curCard.contains(e.target))) return;
+    hide();
+  }, { capture: true, passive: true });
+  window.addEventListener('resize', hide);
 })();
 </script>
 </body></html>
