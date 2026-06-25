@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   /* ---------- Theme tokens (light by default) ---------- */
   :root {
@@ -109,7 +110,29 @@
           transition: background 0.2s, color 0.2s; }
 
   /* ---------- Headers ---------- */
-  h1 { font-size: 28px; margin: 0 0 6px; font-weight: 600;
+  /* Compact report header: title + meta on the left, controls (refresh,
+     theme toggle) on the right, all in one wrapping flex row. */
+  .report-header { display: flex; justify-content: space-between;
+                    align-items: center; gap: 16px; flex-wrap: wrap;
+                    margin: 0 0 12px; }
+  .report-header .sub { margin: 3px 0 0; }
+  .report-controls { display: flex; align-items: center; gap: 8px; }
+  .refresh-btn { height: 34px; padding: 0 14px; border-radius: 17px;
+                  border: 1px solid var(--border-medium);
+                  background: var(--bg-card); color: var(--fg-body);
+                  cursor: pointer; font-size: 12px; font-weight: 600;
+                  display: flex; align-items: center; gap: 6px;
+                  box-shadow: var(--shadow-card);
+                  transition: transform 0.15s, background 0.2s; }
+  .refresh-btn:hover { transform: scale(1.04); background: var(--bg-card-hover); }
+  .refresh-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+  .auto-toggle.active { background: var(--bg-chip-green);
+                         color: var(--fg-chip-green);
+                         border-color: var(--pos-up); }
+  .refresh-status { font-size: 12px; color: var(--fg-muted);
+                     text-align: right; margin: -6px 0 10px; }
+  .refresh-status:empty { display: none; }
+  h1 { font-size: 24px; margin: 0; font-weight: 600;
         letter-spacing: -0.3px; color: var(--fg-strong); }
   h2 { font-size: 19px; margin: 36px 0 12px; font-weight: 600;
         color: var(--fg-strong);
@@ -128,8 +151,8 @@
 
   /* ---------- Summary card ---------- */
   .summary-card { background: var(--bg-summary); border: 1px solid var(--border-medium);
-                   border-radius: 10px; padding: 20px 24px;
-                   margin-bottom: 24px;
+                   border-radius: 10px; padding: 14px 20px;
+                   margin-bottom: 16px;
                    box-shadow: var(--shadow-card); }
   .summary-row { display: flex; gap: 36px; flex-wrap: wrap; }
   .stat { font-size: 12px; color: var(--fg-muted);
@@ -155,6 +178,23 @@
   thead th:hover { background: var(--bg-table-header-hover); color: var(--fg-strong); }
   thead th.sort-asc::after { content: " ▲"; font-size: 9px; opacity: 0.7; }
   thead th.sort-desc::after { content: " ▼"; font-size: 9px; opacity: 0.7; }
+  /* Sticky column headers (desktop): pin the thead just below the sticky h2
+     while scrolling a long table. Needs overflow:visible on .table-wrap —
+     any overflow other than visible would trap the sticky cells inside the
+     wrapper instead of pinning to the viewport — so this is desktop-only;
+     narrow screens keep overflow-x:auto for horizontal table scrolling.
+     --h2-pin-h is measured by JS at load (h2 height varies with theme/font).
+     The inset box-shadow replaces the th border-bottom while pinned:
+     border-collapse drops cell borders from stuck cells in Chrome. */
+  @media (min-width: 901px) {
+    .table-wrap { overflow-x: visible; }
+    thead th { position: sticky;
+                top: var(--h2-pin-h, 49px);
+                z-index: 10;   /* below the h2 (15), above row content */
+                box-shadow: inset 0 -2px 0 var(--border-medium); }
+    thead th:first-child { border-top-left-radius: 9px; }
+    thead th:last-child { border-top-right-radius: 9px; }
+  }
   td { padding: 9px 8px; border-bottom: 1px solid var(--border-soft);
         vertical-align: middle; color: var(--fg-body); }
   tbody tr:nth-child(even) td { background: var(--bg-row-even); }
@@ -242,15 +282,13 @@
                     font-variant-numeric: tabular-nums;
                     white-space: nowrap; }
 
-  /* ---------- Theme toggle button (floating in top-right) ---------- */
-  .theme-toggle { position: fixed; top: 20px; right: 20px;
-                   width: 38px; height: 38px;
+  /* ---------- Theme toggle button (in the header controls cluster) ---------- */
+  .theme-toggle { width: 34px; height: 34px; flex: 0 0 auto;
                    border-radius: 50%; border: 1px solid var(--border-medium);
                    background: var(--bg-card); color: var(--fg-body);
-                   cursor: pointer; font-size: 18px;
+                   cursor: pointer; font-size: 16px;
                    display: flex; align-items: center; justify-content: center;
                    box-shadow: var(--shadow-card);
-                   z-index: 100;
                    transition: transform 0.15s, background 0.2s; }
   .theme-toggle:hover { transform: scale(1.08); background: var(--bg-card-hover); }
 
@@ -308,8 +346,7 @@
     .filter-group-label { min-width: auto; }
     table { font-size: 12px; }
     thead th, td { padding: 8px 6px; }
-    .theme-toggle { top: 12px; right: 12px;
-                     width: 34px; height: 34px; font-size: 16px; }
+    .refresh-status { text-align: left; margin-top: 0; }
   }
 </style>
 </head>
@@ -327,11 +364,127 @@
     } catch (e) {}
   })();
 </script>
-<button class="theme-toggle" id="themeToggle"
-        title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+<div class="report-header">
+  <div>
+    <h1>Stock Analysis</h1>
+    <div class="sub">Last updated 0m ago · June 16, 2026 · 12:10 PM EST · yfinance only</div>
+  </div>
+  <div class="report-controls">
+    <button id="ghRefreshBtn" class="refresh-btn" onclick="ghTriggerRefresh()" title="Trigger the GitHub Actions workflow to regenerate this report">&#10227; Refresh data</button>
+    <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
+            title="Auto-reload this page every hour to pick up the latest published report">
+      &#9201; Auto</button>
+    <button class="theme-toggle" id="themeToggle"
+            title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+  </div>
+</div>
 
-<h1>Stock Analysis</h1>
-<div class="sub">Live data as of June 04, 2026 · 02:44 PM · yfinance only</div>
+<div id="ghRefreshStatus" class="refresh-status"></div>
+<script>
+(function() {
+  var REPO = "SivaYerramsetty/portfolio-analyzer-robinhood";
+  var API = "https://api.github.com/repos/" + REPO;
+  var WORKFLOW = "portfolio.yml";   // file name under .github/workflows/
+  var REF = "main";
+  var TOKEN_KEY = "gh-dispatch-token";
+  var pollTimer = null, startedAt = null;
+
+  function setStatus(msg, isError) {
+    var el = document.getElementById("ghRefreshStatus");
+    el.textContent = msg;
+    el.style.color = isError ? "#c0392b" : "var(--fg-muted)";
+  }
+  function headers(tok) {
+    return {"Authorization": "Bearer " + tok,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"};
+  }
+  function getToken(forcePrompt) {
+    var tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok || forcePrompt) {
+      tok = prompt(
+        "Paste a GitHub fine-grained personal access token to trigger the refresh.\n\n" +
+        "Create one at github.com -> Settings -> Developer settings -> " +
+        "Fine-grained tokens:\n" +
+        "  - Repository access: only " + REPO + "\n" +
+        "  - Permissions: Actions = Read and write\n\n" +
+        "It is stored only in this browser (localStorage), never on any server.");
+      if (tok) localStorage.setItem(TOKEN_KEY, tok.trim());
+    }
+    return tok ? tok.trim() : null;
+  }
+  // Hooks for the hourly auto-refresh toggle: check for a stored token
+  // without prompting, and ensure one exists (prompting once) at enable time.
+  window.ghHasToken = function() { return !!localStorage.getItem(TOKEN_KEY); };
+  window.ghEnsureToken = function() { return getToken(false); };
+  function elapsedStr() {
+    var s = Math.floor((Date.now() - startedAt) / 1000);
+    return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+
+  window.ghTriggerRefresh = async function() {
+    var tok = getToken(false);
+    if (!tok) return;
+    var btn = document.getElementById("ghRefreshBtn");
+    btn.disabled = true;
+    setStatus("Triggering workflow\u2026");
+    try {
+      var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
+        method: "POST", headers: headers(tok),
+        body: JSON.stringify({ref: REF})
+      });
+      if (r.status === 204) {
+        startedAt = Date.now();
+        setStatus("Workflow queued \u2014 a fresh report usually takes a few minutes\u2026");
+        pollTimer = setInterval(pollRun, 12000);
+      } else if (r.status === 401 || r.status === 403) {
+        localStorage.removeItem(TOKEN_KEY);
+        setStatus("Token rejected (HTTP " + r.status + ") \u2014 click Refresh again to re-enter it.", true);
+        btn.disabled = false;
+      } else {
+        var body = await r.text();
+        setStatus("Dispatch failed: HTTP " + r.status + " " + body.slice(0, 120), true);
+        btn.disabled = false;
+      }
+    } catch (e) {
+      setStatus("Network error: " + e, true);
+      btn.disabled = false;
+    }
+  };
+
+  async function pollRun() {
+    var tok = getToken(false);
+    if (!tok) return;
+    try {
+      var r = await fetch(API + "/actions/runs?event=workflow_dispatch&per_page=1",
+                          {headers: headers(tok)});
+      if (!r.ok) return;
+      var data = await r.json();
+      var run = (data.workflow_runs || [])[0];
+      // Ignore runs from before this click (clock skew margin of 90s)
+      if (!run || new Date(run.created_at).getTime() < startedAt - 90000) {
+        setStatus("Waiting for run to appear\u2026 " + elapsedStr());
+        return;
+      }
+      if (run.status !== "completed") {
+        setStatus("Run " + run.status.replace("_", " ") + "\u2026 " + elapsedStr());
+        return;
+      }
+      clearInterval(pollTimer);
+      if (run.conclusion === "success") {
+        setStatus("\u2713 Done in " + elapsedStr() +
+                  " \u2014 reloading the fresh report in ~20s (Pages deploy lag)\u2026");
+        setTimeout(function() { location.reload(); }, 20000);
+      } else {
+        setStatus("Run finished: " + run.conclusion +
+                  " \u2014 see the repo's Actions tab for logs.", true);
+        document.getElementById("ghRefreshBtn").disabled = false;
+      }
+    } catch (e) { /* transient polling error — try again next tick */ }
+  }
+})();
+</script>
+
 
 <div class="summary-card">
   <div class="summary-row">
@@ -353,40 +506,106 @@
   </div>
   <div class="filter-more" id="filterMore">
     <div class="filter-group">
+      <span class="filter-group-label">Verdict</span>
+      <button class="filter-pill" data-filter="verdict-add">ADD only</button>
+      <button class="filter-pill" data-filter="verdict-hold">HOLD only</button>
+      <button class="filter-pill" data-filter="verdict-trim">TRIM only</button>
+      <button class="filter-pill" data-filter="verdict-sell">SELL only</button>
+      <button class="filter-pill" data-filter="verdict-buy">BUY (watchlist) only</button>
+      <button class="filter-pill" data-filter="verdict-watch">WATCH only</button>
+      <button class="filter-pill" data-filter="verdict-score-high">Verdict score 75+</button>
+      <button class="filter-pill" data-filter="verdict-score-low">Verdict score &lt;40</button>
+    </div>
+    <div class="filter-group">
       <span class="filter-group-label">Quality</span>
       <button class="filter-pill" data-filter="high-score">Composite 70+</button>
+      <button class="filter-pill" data-filter="mid-score">Composite 50–70</button>
+      <button class="filter-pill" data-filter="weak-score">Composite &lt;40</button>
       <button class="filter-pill" data-filter="passes-9">Passes 9/9 filters</button>
+      <button class="filter-pill" data-filter="passes-8">Passes 8+ filters</button>
+      <button class="filter-pill" data-filter="quality-6">Quality 6 (borderline)</button>
       <button class="filter-pill" data-filter="low-quality">Quality &lt;5</button>
     </div>
     <div class="filter-group">
-      <span class="filter-group-label">Sector</span>
+      <span class="filter-group-label">Sector momentum</span>
       <button class="filter-pill" data-filter="cool-sector">❄️ Cool sector</button>
+      <button class="filter-pill" data-filter="neutral-sector">Neutral sector</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">By sector</span>
+      <button class="filter-pill" data-filter="sector-technology">Technology</button>
+      <button class="filter-pill" data-filter="sector-healthcare">Healthcare</button>
+      <button class="filter-pill" data-filter="sector-financial">Financials</button>
+      <button class="filter-pill" data-filter="sector-comm">Communication</button>
+      <button class="filter-pill" data-filter="sector-consumer-cyclical">Consumer Cyclical</button>
+      <button class="filter-pill" data-filter="sector-consumer-defensive">Consumer Defensive</button>
+      <button class="filter-pill" data-filter="sector-energy">Energy</button>
+      <button class="filter-pill" data-filter="sector-industrials">Industrials</button>
+      <button class="filter-pill" data-filter="sector-utilities">Utilities</button>
+      <button class="filter-pill" data-filter="sector-real-estate">Real Estate</button>
+      <button class="filter-pill" data-filter="sector-basic-materials">Basic Materials</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Trend</span>
       <button class="filter-pill" data-filter="uptrend">↑ Uptrend</button>
+      <button class="filter-pill" data-filter="sideways">→ Sideways</button>
       <button class="filter-pill" data-filter="downtrend">↓ Downtrend</button>
       <button class="filter-pill" data-filter="far-above-ma">Far above 200d MA (+25%)</button>
+      <button class="filter-pill" data-filter="far-below-ma">Far below 200d MA (-15%)</button>
+      <button class="filter-pill" data-filter="near-200d-ma">Near 200d MA (±5%)</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Price action</span>
       <button class="filter-pill" data-filter="winners">Winners</button>
       <button class="filter-pill" data-filter="big-winners">Big winners (+25%)</button>
+      <button class="filter-pill" data-filter="huge-winners">Huge winners (+100%)</button>
       <button class="filter-pill" data-filter="losers">Losers</button>
       <button class="filter-pill" data-filter="beaten-down">Beaten down (-15%)</button>
+      <button class="filter-pill" data-filter="deep-losers">Deep losers (-30%)</button>
       <button class="filter-pill" data-filter="near-low">Near 52w low</button>
+      <button class="filter-pill" data-filter="mid-range">Mid-range (40–70%)</button>
       <button class="filter-pill" data-filter="near-high">Near 52w high</button>
       <button class="filter-pill" data-filter="big-upside">Upside &gt;20%</button>
+      <button class="filter-pill" data-filter="massive-upside">Upside &gt;40%</button>
       <button class="filter-pill" data-filter="overvalued">Above target</button>
+      <button class="filter-pill" data-filter="very-overvalued">Above target by 15%+</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Analyst rating</span>
+      <button class="filter-pill" data-filter="analyst-strong-buy">Strong Buy</button>
+      <button class="filter-pill" data-filter="analyst-buy">Buy rated</button>
+      <button class="filter-pill" data-filter="analyst-hold">Hold rated</button>
+      <button class="filter-pill" data-filter="analyst-sell">Sell rated</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Insider activity</span>
       <button class="filter-pill" data-filter="insider-caution">⚠ Insider caution</button>
+      <button class="filter-pill" data-filter="insider-no-signal">No signal</button>
+      <button class="filter-pill" data-filter="has-insider-data">Any insider data</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Position size</span>
-      <button class="filter-pill" data-filter="large-position">Large position (&gt;10%)</button>
-      <button class="filter-pill" data-filter="small-position">Small position (&lt;2%)</button>
+      <button class="filter-pill" data-filter="very-large-position">Very large (&gt;20%)</button>
+      <button class="filter-pill" data-filter="large-position">Large (&gt;10%)</button>
+      <button class="filter-pill" data-filter="mid-position">Mid (2–10%)</button>
+      <button class="filter-pill" data-filter="small-position">Small (&lt;2%)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Holding period</span>
+      <button class="filter-pill" data-filter="long-term">Long-term (&gt;1yr)</button>
+      <button class="filter-pill" data-filter="short-term">Short-term (≤1yr)</button>
+      <button class="filter-pill" data-filter="approaching-lt">Approaching LT (within 90d)</button>
+      <button class="filter-pill" data-filter="recent-buy">Recent (&lt;30d)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Tax</span>
+      <button class="filter-pill" data-filter="has-tax-flag">Has tax detail</button>
+      <button class="filter-pill" data-filter="tax-loss-candidate">Loss-harvest candidate</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Type</span>
+      <button class="filter-pill" data-filter="compounder-only">Compounders</button>
+      <button class="filter-pill" data-filter="thematic-only">Thematic/ETFs</button>
     </div>
   </div>
 </div>
@@ -395,20 +614,19 @@
 <h3 style='margin-top:24px;color:#34495e;'>📋 Stock Lookup (1)</h3>
 <div class='table-wrap'><table>
 <thead><tr><th>Ticker</th><th>Name / Sector</th><th class='num'>Position</th><th class='num'>Cost / Gain</th><th class='num'>Price → Target</th><th>Range / Trend</th><th>Quality (9)</th><th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th><th>Analyst Ratings</th><th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th><th>Verdict <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>(score)</span></th></tr></thead><tbody>
-<tr data-verdict='PASS' data-quality='3' data-gain='' data-gain-pct='' data-upside='-27.620245482841643' data-bucket='compounder' data-sector='Hot' data-pos52='93.1' data-score='44.2' data-insider='no_signal' data-trend='uptrend' data-ma-pct='189.6' data-port-pct='' data-search='mu mu technology'><td class='ticker' data-sort='MU'><span class='ticker' style='cursor:help;' title='Micron Technology, Inc. designs, develops, manufactures, and sells memory and storage products in the United States, Taiwan, Japan, Mainland China, Hong Kong, Europe, and internationally.'>MU</span></td><td data-sort='MU'><div style='font-weight:500;cursor:help;' title='Micron Technology, Inc. designs, develops, manufactures, and sells memory and storage products in the United States, Taiwan, Japan, Mainland China, Hong Kong, Europe, and internationally.'>MU</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +32.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='-1'><span style='color:var(--fg-faint);'>—</span></td><td class='num' data-sort='-1000000000000.0'><span style='color:var(--fg-faint);'>—</span></td><td class='num' data-sort='-27.620245482841643'><div><strong>$1,021.66</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $739.48</span></div><div style='font-size:10px;margin-top:1px;' class='pos-down'>-27.6% upside</div></td><td data-sort='93.1'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:93%;top:-3px;width:3px;height:12px;background:#e67e22;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>93% · near high</span></div><div style='margin-top:3px;'><span title="Price $1021.66 · 50d $595.71 · 200d $352.78" style='display:inline-block;background:#d4edda;color:#1e7e34;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↑ Up</span> <span style='color:var(--fg-muted);'>+190%</span></div></td><td data-sort='3'><span title="Revenue growth >=10%: 6.7% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="EPS growth >=10%: -0.6% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="P/E < 30: 48.3% (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="PEG < 2: 0.4% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 1.4% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Op margin >= 15%: -1.1% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.1% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 2.9% ($B (2/3 yrs +)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Quick ratio > 1.0: 2.2% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>3/9</span></td><td class='num' data-sort='44.2'><span title='Composite Score: 44
+<tr data-verdict='PASS' data-verdict-score='38.8' data-quality='5' data-gain='' data-gain-pct='' data-upside='-20.20151338174801' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='89.0' data-score='40.8' data-insider='no_signal' data-has-insider='1' data-trend='uptrend' data-ma-pct='169.3' data-port-pct='' data-days-held='' data-recommendation='strong_buy' data-has-tax='0' data-search='mrvl mrvl technology'><td class='ticker' data-sort='MRVL'><span class='ticker' style='cursor:help;' title='Marvell Technology, Inc., together with its subsidiaries, provides data infrastructure semiconductor solutions and spanning the data center core to network edge in the United States, Argentina, China, India, Israel, Japan, Singapore, South Korea, Taiwan, Vietnam, and internati...'>MRVL</span></td><td data-sort='MRVL'><div style='font-weight:500;cursor:help;' title='Marvell Technology, Inc., together with its subsidiaries, provides data infrastructure semiconductor solutions and spanning the data center core to network edge in the United States, Argentina, China, India, Israel, Japan, Singapore, South Korea, Taiwan, Vietnam, and internati...'>MRVL</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +27.1% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='-1'><span style='color:var(--fg-faint);'>—</span></td><td class='num' data-sort='-1000000000000.0'><span style='color:var(--fg-faint);'>—</span></td><td class='num' data-sort='-20.20151338174801'><div><strong>$295.37</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $235.70</span></div><div style='font-size:10px;margin-top:1px;' class='pos-down'>-20.2% upside</div></td><td data-sort='89.0'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:89%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>89%</span></div><div style='margin-top:3px;'><span title="Price $295.37 · 50d $187.03 · 200d $109.69" style='display:inline-block;background:#d4edda;color:#1e7e34;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↑ Up</span> <span style='color:var(--fg-muted);'>+169%</span></div></td><td data-sort='5'><span title="Revenue growth >=10%: 11.4% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: -80.4% (1yr YoY) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="P/E < 30: 101.8% (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="PEG < 2: 1.7% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 1.9% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Op margin >= 15%: 0.7% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.3% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 2.3% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 2.5% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>5/9</span></td><td class='num' data-sort='40.8'><span title='Composite Score: 41
 
-Quality  59
-Growth   11
-Value    27
+Quality  58
+Growth   19
+Value    4
 Analyst  77
-Insider  48' style='font-weight:700;color:#e67e22;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>44</span></td><td data-sort='0.8636363636363636'><div style="display:flex;height:10px;border-radius:3px;overflow:hidden;min-width:90px;margin-bottom:2px;"><div style="width:88.6%;background:#27ae60;"></div><div style="width:9.1%;background:#f39c12;"></div><div style="width:2.3%;background:#c0392b;"></div></div><div style="font-size:10px;color:#7f8c8d;">39 Buy · 4 Hold · 1 Sell<span style="color:#bdc3c7;"> · yahoo</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 9 open-market sell(s) | 12 total Form 4 filings | $14.6M discretionary selling | $77.9M via 10b5-1 plan (5 filings) - preset, low signal | $425k tax-withhold (mechanical) | 1 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$14.6M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='38.2'><span class='verdict' style='background:#c0392b;cursor:help;' title='Weak: Fails 6/9 quality filters, Near 52w high (93%)
-Composite Score 44
--15 · Fails 6/9 quality filters
-+12 · Uptrend (+190% vs 200d)
+Insider  48' style='font-weight:700;color:#e67e22;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>41</span></td><td data-sort='0.8409090909090909'><div style="display:flex;height:10px;border-radius:3px;overflow:hidden;min-width:90px;margin-bottom:2px;"><div style="width:86.4%;background:#27ae60;"></div><div style="width:11.4%;background:#f39c12;"></div><div style="width:2.3%;background:#c0392b;"></div></div><div style="font-size:10px;color:#7f8c8d;">38 Buy · 5 Hold · 1 Sell<span style="color:#bdc3c7;"> · yahoo</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 13 open-market sell(s) | 25 total Form 4 filings | $4.0M discretionary selling | $28.0M via 10b5-1 plan (10 filings) - preset, low signal | $119.0M tax-withhold (mechanical) | 13 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$4.0M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='38.8'><span class='verdict' style='background:#c0392b;cursor:help;' title='Weak: Fails 4/9 quality filters, Price 20% above target (analysts may be lagging)
+Composite Score 41
+-15 · Fails 4/9 quality filters
++12 · Uptrend (+169% vs 200d)
 +5 · Hot sector momentum
--4 · Near 52w high (93%)
--4 · Price 28% above target (analysts may be lagging)
-= verdict score 38'>PASS</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:#e67e22;font-variant-numeric:tabular-nums;'>38</span></td></tr>
+-4 · Price 20% above target (analysts may be lagging)
+= verdict score 39'>PASS</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:#e67e22;font-variant-numeric:tabular-nums;'>39</span></td></tr>
 </tbody></table></div>
 
 <p style="color:#95a5a6;font-size:11px;margin-top:30px;">
@@ -418,6 +636,107 @@ Click any column header to sort. Click again to reverse.
 Verdicts are framework outputs, not investment advice.
 </p>
 <script>
+// Measure the sticky h2 height so pinned table headers (thead) sit exactly
+// beneath it (CSS uses top: var(--h2-pin-h)). Re-measured on resize because
+// the h2 height changes with viewport font scaling.
+(function() {
+  function setPinOffset() {
+    var h2 = document.querySelector('h2');
+    if (h2) {
+      // -1px overlap avoids a hairline gap between h2 and pinned thead
+      document.documentElement.style.setProperty(
+        '--h2-pin-h', (h2.offsetHeight - 1) + 'px');
+    }
+  }
+  setPinOffset();
+  window.addEventListener('resize', setPinOffset);
+  window.addEventListener('load', setPinOffset);
+})();
+// Hourly auto-refresh toggle: when enabled (persisted in localStorage), every
+// hour it triggers the GitHub Actions workflow (same flow as the manual
+// Refresh button: dispatch -> poll -> reload when the new report deploys).
+// Fallbacks: no stored token or no refresh widget -> plain page reload; a
+// refresh already in progress -> skip this cycle (its success path reloads).
+// The reload keeps the password session (sessionStorage) and re-arms the
+// timer. A 30s interval checking a deadline (rather than one long setTimeout)
+// survives background-tab throttling and laptop sleep.
+(function() {
+  var KEY = 'auto-reload-hourly';
+  var PERIOD_MS = 3600000;
+  var btn = document.getElementById('autoReloadToggle');
+  if (!btn) return;
+  var timer = null;
+
+  function canDispatch() {
+    var rb = document.getElementById('ghRefreshBtn');
+    return typeof window.ghTriggerRefresh === 'function' && rb &&
+           typeof window.ghHasToken === 'function' && window.ghHasToken();
+  }
+  function label() {
+    if (!btn.classList.contains('active')) {
+      btn.innerHTML = '&#9201; Auto';
+      btn.title = 'Every hour: trigger the GitHub workflow to regenerate the '
+                + 'report, then reload this page when it deploys. (Without a '
+                + 'saved token it only reloads the page.)';
+      return;
+    }
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    var mins = Math.max(1, Math.round((nextAt - Date.now()) / 60000));
+    btn.innerHTML = '&#9201; Auto &middot; ' + mins + 'm';
+    btn.title = 'Auto-refresh is ON — in ~' + mins + ' min: '
+              + (canDispatch()
+                 ? 'trigger the workflow and reload when the new report deploys.'
+                 : 'reload the page (no saved token, so the workflow is not triggered).')
+              + ' Click to turn off.';
+  }
+  function fire() {
+    // Re-arm first so a failed run is retried next hour, not every 30s.
+    btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+    var rb = document.getElementById('ghRefreshBtn');
+    if (rb && rb.disabled) {
+      label();   // a refresh is already running — it reloads the page itself
+      return;
+    }
+    if (canDispatch()) {
+      window.ghTriggerRefresh();
+    } else {
+      location.reload();
+    }
+    label();
+  }
+  function check() {
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    if (nextAt && Date.now() >= nextAt) { fire(); return; }
+    label();
+  }
+  function setState(on, save, interactive) {
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (save) { try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {} }
+    if (timer) { clearInterval(timer); timer = null; }
+    if (on) {
+      // Ask for the token now (once) so the unattended hourly trigger can
+      // work later — prompting at 3am when the timer fires would be useless.
+      if (interactive && typeof window.ghEnsureToken === 'function'
+          && !((window.ghHasToken && window.ghHasToken()))) {
+        window.ghEnsureToken();
+      }
+      btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+      timer = setInterval(check, 30000);
+      document.addEventListener('visibilitychange', check);
+    } else {
+      delete btn.dataset.nextAt;
+      document.removeEventListener('visibilitychange', check);
+    }
+    label();
+  }
+  btn.addEventListener('click', function() {
+    setState(!btn.classList.contains('active'), true, true);
+  });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  setState(saved === '1', false, false);
+})();
 (function() {
   function sortableValue(td) {
     var s = td.getAttribute('data-sort');
@@ -501,61 +820,133 @@ Verdicts are framework outputs, not investment advice.
 
   function rowMatchesFilter(row, filter) {
     var verdict = row.getAttribute('data-verdict') || '';
+    var verdictScore = num(row.getAttribute('data-verdict-score'));
     var quality = num(row.getAttribute('data-quality'));
     var gain = num(row.getAttribute('data-gain'));
     var gainPct = num(row.getAttribute('data-gain-pct'));
     var upside = num(row.getAttribute('data-upside'));
     var pos52 = num(row.getAttribute('data-pos52'));
     var score = num(row.getAttribute('data-score'));
-    var sector = row.getAttribute('data-sector') || '';
+    // Two sector attributes: the raw GICS name (Technology, Healthcare...)
+    // and the momentum label (Hot/Cool/Neutral). Both used by different filters.
+    var sectorRaw = (row.getAttribute('data-sector') || '').toLowerCase();
+    var sectorMom = row.getAttribute('data-sector-mom') || '';
     var insider = row.getAttribute('data-insider') || '';
+    var hasInsider = row.getAttribute('data-has-insider') || '';
     var trend = row.getAttribute('data-trend') || '';
     var maPct = num(row.getAttribute('data-ma-pct'));
     var portPct = num(row.getAttribute('data-port-pct'));
+    var daysHeld = num(row.getAttribute('data-days-held'));
+    var recommendation = row.getAttribute('data-recommendation') || '';
+    var hasTax = row.getAttribute('data-has-tax') || '0';
+    var bucket = row.getAttribute('data-bucket') || '';
 
     switch (filter) {
-      // Essentials (top row)
+      // ------------- Essentials (top row) -------------
       case 'action':          return verdict === 'SELL' || verdict === 'TRIM';
       case 'buy':             return verdict === 'BUY'  || verdict === 'ADD';
       case 'high-quality':    return !isNaN(quality) && quality >= 7;
-      case 'hot-sector':      return sector === 'Hot';
+      case 'hot-sector':      return sectorMom === 'Hot';
       case 'insider-buy':     return insider === 'supports_buy';
 
-      // Quality
+      // ------------- Verdict-specific -------------
+      case 'verdict-add':     return verdict === 'ADD';
+      case 'verdict-hold':    return verdict === 'HOLD';
+      case 'verdict-trim':    return verdict === 'TRIM';
+      case 'verdict-sell':    return verdict === 'SELL';
+      case 'verdict-buy':     return verdict === 'BUY';
+      case 'verdict-watch':   return verdict === 'WATCH';
+      case 'verdict-score-high': return !isNaN(verdictScore) && verdictScore >= 75;
+      case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
+
+      // ------------- Quality / Composite -------------
       case 'high-score':      return !isNaN(score) && score >= 70;
+      case 'mid-score':       return !isNaN(score) && score >= 50 && score < 70;
+      case 'weak-score':      return !isNaN(score) && score < 40;
       case 'passes-9':        return !isNaN(quality) && quality === 9;
+      case 'passes-8':        return !isNaN(quality) && quality >= 8;
+      case 'quality-6':       return !isNaN(quality) && quality === 6;
       case 'low-quality':     return !isNaN(quality) && quality < 5;
 
-      // Sector
-      case 'cool-sector':     return sector === 'Cool';
+      // ------------- Sector momentum -------------
+      case 'cool-sector':     return sectorMom === 'Cool';
+      case 'neutral-sector':  return sectorMom === 'Neutral';
 
-      // Trend
+      // ------------- By sector (case-insensitive substring match) -------------
+      case 'sector-technology':         return sectorRaw.indexOf('technolog') !== -1;
+      case 'sector-healthcare':         return sectorRaw.indexOf('healthcare') !== -1;
+      case 'sector-financial':          return sectorRaw.indexOf('financ') !== -1;
+      case 'sector-comm':               return sectorRaw.indexOf('communication') !== -1;
+      case 'sector-consumer-cyclical':  return sectorRaw.indexOf('consumer cyclical') !== -1
+                                            || sectorRaw.indexOf('discretionary') !== -1;
+      case 'sector-consumer-defensive': return sectorRaw.indexOf('consumer defensive') !== -1
+                                            || sectorRaw.indexOf('staples') !== -1;
+      case 'sector-energy':             return sectorRaw.indexOf('energy') !== -1;
+      case 'sector-industrials':        return sectorRaw.indexOf('industrial') !== -1;
+      case 'sector-utilities':          return sectorRaw.indexOf('utilit') !== -1;
+      case 'sector-real-estate':        return sectorRaw.indexOf('real estate') !== -1;
+      case 'sector-basic-materials':    return sectorRaw.indexOf('basic material') !== -1
+                                            || sectorRaw.indexOf('materials') !== -1;
+
+      // ------------- Trend -------------
       case 'uptrend':         return trend === 'uptrend';
+      case 'sideways':        return trend === 'sideways';
       case 'downtrend':       return trend === 'downtrend';
       case 'far-above-ma':    return !isNaN(maPct) && maPct >= 25;
+      case 'far-below-ma':    return !isNaN(maPct) && maPct <= -15;
+      case 'near-200d-ma':    return !isNaN(maPct) && Math.abs(maPct) <= 5;
 
-      // Price action
+      // ------------- Price action -------------
       case 'winners':
         if (!isNaN(gain))   return gain > 0;
         if (!isNaN(upside)) return upside > 0;
         return false;
       case 'big-winners':     return !isNaN(gainPct) && gainPct >= 25;
+      case 'huge-winners':    return !isNaN(gainPct) && gainPct >= 100;
       case 'losers':
         if (!isNaN(gain))   return gain < 0;
         if (!isNaN(upside)) return upside < 0;
         return false;
       case 'beaten-down':     return !isNaN(gainPct) && gainPct <= -15;
+      case 'deep-losers':     return !isNaN(gainPct) && gainPct <= -30;
       case 'near-low':        return !isNaN(pos52) && pos52 <= 25;
+      case 'mid-range':       return !isNaN(pos52) && pos52 >= 40 && pos52 <= 70;
       case 'near-high':       return !isNaN(pos52) && pos52 >= 90;
       case 'big-upside':      return !isNaN(upside) && upside >= 20;
+      case 'massive-upside':  return !isNaN(upside) && upside >= 40;
       case 'overvalued':      return !isNaN(upside) && upside < 0;
+      case 'very-overvalued': return !isNaN(upside) && upside <= -15;
 
-      // Insider
-      case 'insider-caution': return insider === 'caution';
+      // ------------- Analyst rating -------------
+      case 'analyst-strong-buy': return recommendation === 'strong_buy';
+      case 'analyst-buy':        return recommendation === 'buy';
+      case 'analyst-hold':       return recommendation === 'hold';
+      case 'analyst-sell':       return recommendation === 'sell' || recommendation === 'strong_sell';
 
-      // Position size
-      case 'large-position':  return !isNaN(portPct) && portPct >= 10;
-      case 'small-position':  return !isNaN(portPct) && portPct > 0 && portPct < 2;
+      // ------------- Insider -------------
+      case 'insider-caution':   return insider === 'caution';
+      case 'insider-no-signal': return insider === 'no_signal';
+      case 'has-insider-data':  return hasInsider === '1';
+
+      // ------------- Position size -------------
+      case 'very-large-position': return !isNaN(portPct) && portPct >= 20;
+      case 'large-position':      return !isNaN(portPct) && portPct >= 10;
+      case 'mid-position':        return !isNaN(portPct) && portPct >= 2 && portPct < 10;
+      case 'small-position':      return !isNaN(portPct) && portPct > 0 && portPct < 2;
+
+      // ------------- Holding period -------------
+      case 'long-term':       return !isNaN(daysHeld) && daysHeld > 365;
+      case 'short-term':      return !isNaN(daysHeld) && daysHeld <= 365;
+      case 'approaching-lt':  return !isNaN(daysHeld) && daysHeld >= 275 && daysHeld <= 365;
+      case 'recent-buy':      return !isNaN(daysHeld) && daysHeld < 30;
+
+      // ------------- Tax -------------
+      case 'has-tax-flag':       return hasTax === '1';
+      case 'tax-loss-candidate': return !isNaN(gainPct) && gainPct <= -5;
+
+      // ------------- Type -------------
+      case 'compounder-only': return bucket === 'compounder';
+      case 'thematic-only':   return bucket === 'thematic' || bucket === 'etf';
 
       default: return true;
     }

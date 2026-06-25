@@ -147,7 +147,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -162,6 +162,14 @@ except ImportError:
 
 # Finnhub free tier: 60 calls/min. Get a free key at https://finnhub.io
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+# --- News-sentiment (Claude) config -----------------------------------------
+# When ANTHROPIC_API_KEY is set, each ticker's recent headlines are scored by
+# Claude and the result nudges the verdict (bounded; see _NEWS_* below). Unset
+# the key to disable entirely (no calls, no cost). NEWS_MODEL defaults to the
+# most capable model; set NEWS_MODEL=claude-haiku-4-5 to cut cost/latency ~5x.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+NEWS_MODEL = os.environ.get("NEWS_MODEL", "claude-opus-4-8").strip() or "claude-opus-4-8"
 
 
 # ============================================================
@@ -318,6 +326,273 @@ def fetch_finnhub_price_target(ticker: str) -> Optional[dict]:
         return r.json()
     except Exception:
         return None
+
+
+# ============================================================
+# News sentiment — bounded nudge to the verdict score
+# ============================================================
+# Recent headlines per ticker (Finnhub free company-news, yfinance fallback) are
+# scored into one bullish/bearish number, cached on disk (default 6h TTL), then
+# mapped to a small bounded modifier in compute_verdict_v2 (see
+# _news_signal_modifier). Scoring is FREE by default via a headline lexicon; if
+# ANTHROPIC_API_KEY is set it upgrades to Claude for sharper reads. The cache
+# lives in .cache/ (gitignored; carried across CI runs) so warm runs re-fetch
+# nothing. Set NEWS_SIGNAL=0 to disable entirely.
+
+_NEWS_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "news_sentiment.json"
+_news_cache_lock = threading.Lock()
+_news_cache: Optional[dict] = None
+_news_cache_dirty = False
+_news_hits = 0
+_news_misses = 0
+_anthropic_client_singleton = None
+
+_NEWS_SENTIMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number"},
+        "label": {"type": "string", "enum": ["bullish", "neutral", "bearish"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["score", "label", "rationale"],
+    "additionalProperties": False,
+}
+
+
+def _news_cache_ttl_hours() -> float:
+    try:
+        return float(os.environ.get("NEWS_CACHE_TTL_HOURS", "6"))
+    except ValueError:
+        return 6.0
+
+
+def _load_news_cache() -> dict:
+    global _news_cache
+    if _news_cache is None:
+        try:
+            data = json.loads(_NEWS_CACHE_PATH.read_text())
+            _news_cache = data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            _news_cache = {}
+    return _news_cache
+
+
+def _flush_news_cache() -> None:
+    global _news_cache_dirty
+    with _news_cache_lock:
+        if not _news_cache_dirty or _news_cache is None:
+            return
+        try:
+            _NEWS_CACHE_PATH.parent.mkdir(exist_ok=True)
+            _NEWS_CACHE_PATH.write_text(json.dumps(_news_cache))
+            _news_cache_dirty = False
+        except OSError:
+            pass
+
+
+def _anthropic_client():
+    """Lazily construct (and memoize) the Anthropic client. Returns None when the
+    SDK isn't installed or no key is configured."""
+    global _anthropic_client_singleton
+    if not ANTHROPIC_API_KEY:
+        return None
+    if _anthropic_client_singleton is None:
+        try:
+            import anthropic
+            _anthropic_client_singleton = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        except Exception as e:
+            print(f"[news] Anthropic SDK unavailable: {e}")
+            _anthropic_client_singleton = False   # sentinel: tried and failed
+    return _anthropic_client_singleton or None
+
+
+def fetch_recent_headlines(ticker: str, max_items: int = 8) -> list[str]:
+    """Recent company headlines (last ~7 days), newest first. Finnhub
+    company-news (free endpoint) preferred; yfinance .news as fallback."""
+    out: list[str] = []
+    if FINNHUB_API_KEY and requests:
+        try:
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            frm = (today - timedelta(days=7)).isoformat()
+            r = requests.get(
+                "https://finnhub.io/api/v1/company-news",
+                params={"symbol": ticker, "from": frm, "to": today.isoformat(),
+                        "token": FINNHUB_API_KEY},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                arts = sorted(r.json() or [],
+                              key=lambda a: a.get("datetime", 0), reverse=True)
+                for a in arts[:max_items]:
+                    h = (a.get("headline") or "").strip()
+                    if h:
+                        src = (a.get("source") or "").strip()
+                        out.append(h + (f" — {src}" if src else ""))
+        except Exception:
+            pass
+    if not out:
+        try:
+            for a in (getattr(yf.Ticker(ticker), "news", None) or [])[:max_items]:
+                if not isinstance(a, dict):
+                    continue
+                title = (a.get("title")
+                         or (a.get("content") or {}).get("title") or "").strip()
+                if title:
+                    out.append(title)
+        except Exception:
+            pass
+    return out[:max_items]
+
+
+def _call_claude_sentiment(client, ticker, name, headlines) -> Optional[dict]:
+    label = f"{name} ({ticker})" if name else ticker
+    bullets = "\n".join(f"- {h}" for h in headlines)
+    system = (
+        "You are an equity news analyst. Read a stock's recent headlines and "
+        "judge the net sentiment for its forward price over the next few weeks. "
+        "Weigh material catalysts (earnings, guidance, M&A, regulatory, "
+        "litigation, products) far more than routine coverage; ignore generic "
+        "market commentary; be skeptical of hype."
+    )
+    prompt = (
+        f"Stock: {label}\n\nRecent headlines (newest first):\n{bullets}\n\n"
+        "Return JSON with: score (number from -1.0 very bearish to +1.0 very "
+        "bullish, 0 if neutral/no clear signal), label (bullish | neutral | "
+        "bearish), and rationale (one concise sentence, max ~20 words, citing "
+        "the key driver)."
+    )
+    try:
+        resp = client.with_options(timeout=20.0).messages.create(
+            model=NEWS_MODEL,
+            max_tokens=400,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema",
+                                       "schema": _NEWS_SENTIMENT_SCHEMA}},
+        )
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        data = json.loads(text)
+        score = max(-1.0, min(1.0, float(data.get("score", 0) or 0)))
+        return {
+            "score": score,
+            "label": str(data.get("label", "neutral")),
+            "rationale": str(data.get("rationale", "")).strip(),
+            "headlines": headlines[:5],
+            "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+        }
+    except Exception as e:
+        print(f"[news] {ticker}: scoring failed ({type(e).__name__}: {e})")
+        return None
+
+
+# Free, dependency-free fallback: a compact finance sentiment lexicon. Words are
+# chosen to be clearly directional (avoiding ambiguous terms like "high"/"cut"
+# that flip meaning by context), so the score only moves on one-sided headlines.
+_NEWS_POS = {
+    "beat", "beats", "surge", "surges", "soar", "soars", "jump", "jumps",
+    "rally", "rallies", "upgrade", "upgrades", "upgraded", "raise", "raised",
+    "raises", "record", "strong", "growth", "outperform", "outperforms", "tops",
+    "gain", "gains", "bullish", "approval", "approved", "wins", "expand",
+    "expands", "expansion", "profit", "profits", "breakthrough", "surpass",
+    "surpasses", "accelerate", "accelerates", "milestone", "rebound", "rebounds",
+    "boost", "boosts", "buyback", "upbeat", "momentum", "optimistic",
+}
+_NEWS_NEG = {
+    "miss", "misses", "missed", "plunge", "plunges", "plummet", "plummets",
+    "slump", "slumps", "downgrade", "downgrades", "downgraded", "slash",
+    "slashes", "lawsuit", "sued", "probe", "investigation", "recall", "recalls",
+    "warns", "warning", "weak", "weakness", "decline", "declines", "loss",
+    "losses", "layoff", "layoffs", "bearish", "halt", "halts", "fraud",
+    "bankruptcy", "sinks", "tumble", "tumbles", "slowdown", "downturn",
+    "default", "delist", "scandal", "fears", "disappoint", "disappoints",
+    "underperform", "selloff", "crash", "crashes",
+}
+
+
+def _lexicon_sentiment(headlines: list[str]) -> Optional[dict]:
+    """Free fallback scorer: net directional-word balance across recent
+    headlines, in the same shape as the Claude scorer. Stays in the neutral band
+    (no nudge) unless there are at least a couple of clear signal words."""
+    import re as _re
+    pos = neg = 0
+    for h in headlines:
+        for tok in _re.findall(r"[a-z][a-z'-]+", h.lower()):
+            if tok in _NEWS_POS:
+                pos += 1
+            elif tok in _NEWS_NEG:
+                neg += 1
+    total = pos + neg
+    score = (pos - neg) / total if total >= 2 else 0.0   # thin signal -> neutral
+    label = "bullish" if score >= 0.2 else "bearish" if score <= -0.2 else "neutral"
+    return {
+        "score": round(score, 2),
+        "label": label,
+        "rationale": (f"{pos} positive vs {neg} negative signal words across "
+                      f"{len(headlines)} recent headlines"),
+        "headlines": headlines[:5],
+        "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+        "method": "lexicon",
+    }
+
+
+def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[dict]:
+    """Score a ticker's recent news, cached on disk (TTL). Uses Claude when
+    ANTHROPIC_API_KEY is set, otherwise a FREE headline lexicon — both return
+    {score, label, rationale, headlines, as_of}. Returns None when disabled
+    (NEWS_SIGNAL=0) or there's no news. Never raises; disk write is batched by
+    _flush_news_cache()."""
+    global _news_cache_dirty, _news_hits, _news_misses
+    if os.environ.get("NEWS_SIGNAL", "1") == "0":
+        return None
+    ttl = _news_cache_ttl_hours()
+    if ttl > 0:
+        with _news_cache_lock:
+            entry = _load_news_cache().get(ticker)
+        if entry and (time.time() - entry.get("ts", 0)) < ttl * 3600:
+            with _news_cache_lock:
+                _news_hits += 1
+            return entry.get("sentiment")
+
+    headlines = fetch_recent_headlines(ticker)
+    result = None
+    if headlines:
+        client = _anthropic_client()       # paid, higher quality — only if keyed
+        if client is not None:
+            result = _call_claude_sentiment(client, ticker, name, headlines)
+        if result is None:                 # no key, or LLM failed -> free lexicon
+            result = _lexicon_sentiment(headlines)
+
+    if ttl > 0:
+        with _news_cache_lock:
+            _load_news_cache()[ticker] = {"ts": time.time(), "sentiment": result}
+            _news_cache_dirty = True
+            _news_misses += 1
+    return result
+
+
+def _news_signal_modifier(news: Optional[dict]):
+    """Map a news-sentiment dict to (delta, description) for the verdict, or None
+    for a neutral/absent signal. Bounded to ±6 so news nudges but never dominates
+    fundamentals (same magnitude band as the insider/sector signals)."""
+    if not news:
+        return None
+    score = news.get("score")
+    if score is None:
+        return None
+    if score >= 0.5:
+        delta = 6
+    elif score >= 0.2:
+        delta = 3
+    elif score <= -0.5:
+        delta = -6
+    elif score <= -0.2:
+        delta = -3
+    else:
+        return None   # neutral band — no nudge
+    rationale = (news.get("rationale") or "").strip()
+    lbl = news.get("label") or ("positive" if delta > 0 else "negative")
+    desc = f"Recent news {lbl}" + (f": {rationale}" if rationale else "")
+    return (delta, desc)
 
 
 # ============================================================
@@ -566,6 +841,26 @@ _fund_cache: Optional[dict] = None
 _fund_cache_dirty = False          # True once a miss adds/updates an entry
 _fund_hits = 0
 _fund_misses = 0
+
+# After-hours price override (ticker -> Robinhood extended-hours last price).
+# main() populates this in --source robinhood mode when the regular session is
+# closed; analyze_position() then prefers it over the yfinance price so the
+# report shows broker-accurate after-hours values. Empty in all other modes.
+_RH_EXTENDED_PRICES: dict[str, float] = {}
+
+
+def _us_market_open_now() -> bool:
+    """True during the regular US equity session (Mon-Fri 9:30-16:00 ET).
+
+    Holidays aren't modeled — on a holiday this returns True and we simply skip
+    the after-hours override (the report shows the last regular close), which is
+    harmless. Used to decide whether to pull extended-hours prices.
+    """
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:          # Sat/Sun
+        return False
+    mins = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
 
 
 def _fundamentals_ttl_hours() -> float:
@@ -1008,6 +1303,7 @@ def compute_verdict_v2(
     insider_signal: Optional[str] = None,
     position_pct_portfolio: Optional[float] = None,
     is_holding: bool = True,
+    news_signal: Optional[dict] = None,
 ) -> Verdict:
     """
     Evidence-weighted verdict logic.
@@ -1154,6 +1450,13 @@ def compute_verdict_v2(
                 (f"Sizeable position ({position_pct_portfolio:.0f}% of portfolio)", -2)
             )
             # No flag — 10-15% doesn't trigger the ADD ceiling, just a small nudge
+
+    # ---- Latest-news sentiment (bounded ±6 nudge) ----
+    _news_mod = _news_signal_modifier(news_signal)
+    if _news_mod:
+        _nd, _ndesc = _news_mod
+        score += _nd
+        contributors.append((_ndesc, _nd))
 
     # ---- Clamp to 0-100 ----
     score = max(0.0, min(100.0, score))
@@ -1525,6 +1828,8 @@ class PositionAnalysis:
     composite_score: Optional[float] = None
     # Insider activity (raw data for display)
     insider_activity: Optional[dict] = None
+    # Latest-news sentiment from Claude: {score, label, rationale, headlines, as_of}
+    news_sentiment: Optional[dict] = None
     # Output
     verdict: Optional[Verdict] = None
     error: Optional[str] = None
@@ -1598,6 +1903,16 @@ def analyze_position(
             pa.current_price = _pre
         else:
             pa.current_price = _regular
+
+        # Broker-accurate after-hours override: when the regular session is
+        # closed, prefer Robinhood's extended-hours last trade (populated by
+        # main() only in --source robinhood mode while the market is closed).
+        # Bounded vs the yfinance regular price (±30%) to reject bad ticks; if
+        # yfinance has no price, trust the broker value outright.
+        _rh_px = _RH_EXTENDED_PRICES.get(ticker)
+        if _rh_px and _rh_px > 0 and (
+                _regular is None or _sane_extended(_rh_px, _regular)):
+            pa.current_price = _rh_px
 
         # Compute LIVE market value from live price × shares
         if pa.current_price is not None:
@@ -1860,6 +2175,10 @@ def analyze_position(
                 else:
                     insider_signal = "no_signal"
             sector_label = (pa.sector_momentum or {}).get("label")
+            # Latest-news sentiment: Claude when ANTHROPIC_API_KEY is set, else
+            # a free headline lexicon (no key/cost). Cached on disk so warm runs
+            # re-fetch nothing. Disable entirely with NEWS_SIGNAL=0.
+            pa.news_sentiment = score_news_sentiment(ticker, pa.name)
             pa.verdict = compute_verdict_v2(
                 composite_score=pa.composite_score,
                 filters=pa.filters,
@@ -1872,6 +2191,7 @@ def analyze_position(
                 sector_label=sector_label,
                 insider_signal=insider_signal,
                 is_holding=not is_watchlist,
+                news_signal=pa.news_sentiment,
             )
 
     except Exception as e:
@@ -1997,6 +2317,13 @@ def analyze_positions_parallel(
     if _fund_hits or _fund_misses:
         print(f"[fundamentals-cache] {_fund_hits} hit / {_fund_misses} miss "
               f"(skipped {_fund_hits} statement-fetch pairs)")
+    # Same for the news-sentiment cache (headlines fetched + scored on misses;
+    # scoring is Claude when keyed, else the free lexicon).
+    _flush_news_cache()
+    if _news_hits or _news_misses:
+        _mode = "Claude" if ANTHROPIC_API_KEY else "lexicon (free)"
+        print(f"[news-cache] {_news_hits} hit / {_news_misses} miss "
+              f"({_news_misses} scored via {_mode} this batch)")
 
     return results  # type: ignore[return-value]
 
@@ -2434,22 +2761,47 @@ def _ticker_cell(r) -> str:
     return f"<span class='ticker'>{r.ticker}</span>"
 
 
+def _news_chip(r) -> str:
+    """Compact news-sentiment badge (📰) — only for clear bullish/bearish reads;
+    neutral is omitted to avoid clutter. Rationale shows on hover."""
+    ns = getattr(r, "news_sentiment", None)
+    if not ns:
+        return ""
+    label = (ns.get("label") or "").lower()
+    if label == "bullish":
+        bg, fg = "var(--bg-chip-green)", "var(--fg-chip-green)"
+    elif label == "bearish":
+        bg, fg = "var(--bg-chip-red)", "var(--fg-chip-red)"
+    else:
+        return ""
+    rationale = ((ns.get("rationale") or "")
+                 .replace("&", "&amp;").replace("'", "&#39;").replace('"', "&quot;"))
+    asof = ns.get("as_of", "")
+    title = (f"{rationale} (news as of {asof})" if rationale
+             else f"News sentiment as of {asof}")
+    return (f"<span title=\"{title}\" style='font-size:9px;font-weight:600;"
+            f"background:{bg};color:{fg};padding:1px 5px;border-radius:6px;"
+            f"margin-left:5px;cursor:help;'>📰 {label}</span>")
+
+
 def _name_sector_cell(r) -> str:
     """Combined Name + Sector — name primary, sector momentum badge below.
 
     The full business summary appears as a tooltip on hover of the name.
     """
     name = r.name or "—"
+    news_chip = _news_chip(r)
     # Build the name with optional business-summary tooltip
     if r.business_summary:
         summary = (r.business_summary
                    .replace("&", "&amp;")
                    .replace("'", "&#39;")
                    .replace('"', "&quot;"))
-        name_html = (f"<div style='font-weight:500;cursor:help;' "
-                     f"title='{summary}'>{name}</div>")
+        name_html = (f"<div style='font-weight:500;'>"
+                     f"<span style='cursor:help;' title='{summary}'>{name}</span>"
+                     f"{news_chip}</div>")
     else:
-        name_html = f"<div style='font-weight:500'>{name}</div>"
+        name_html = f"<div style='font-weight:500'>{name}{news_chip}</div>"
 
     sm = r.sector_momentum or {}
     label = sm.get("label", "")
@@ -3412,6 +3764,7 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
                 insider_signal=insider_signal,
                 position_pct_portfolio=r.live_pct_portfolio,
                 is_holding=True,
+                news_signal=r.news_sentiment,   # reuse the score from analyze_position
             )
     return live_total
 
@@ -3460,13 +3813,73 @@ def load_recs_history(path: str = RECS_HISTORY_FILE) -> dict:
     return {"version": 1, "tickers": {}}
 
 
+def _verdict_why_not_buy(verdict) -> str:
+    """From a Verdict's transparent breakdown (the ' | '-joined reason text),
+    return a short plain-text phrase naming the factors that kept the score
+    below the BUY/ADD bar — i.e. the negative contributors, biggest impact
+    first. The breakdown lines look like "-8 · Price 30% above target"; we keep
+    the description after the dot. Returns '' when there are no drags (e.g. an
+    already buy-type verdict) or no reason text. This is what answers "why we
+    didn't buy" in the Missed Opportunities table."""
+    reason = getattr(verdict, "reason", None) if verdict else None
+    if not reason:
+        return ""
+    drags: list[str] = []
+    for part in reason.split("|"):
+        part = part.strip()
+        if part.startswith("-") and "·" in part:          # a negative factor line
+            desc = part.split("·", 1)[1].strip()
+            if desc:
+                # Lowercase the leading word so it reads inline:
+                # "held back by price above target".
+                drags.append(desc[0].lower() + desc[1:])
+    return "; ".join(drags[:3])
+
+
+def _pick_catalyst_headline(ticker: str, name: Optional[str],
+                            headlines: Optional[list]) -> str:
+    """Choose the headline most likely to be the run-up catalyst: the first one
+    that names the ticker or the company, else the first headline. Concrete
+    headlines matter most on the free-lexicon path, whose rationale is only a
+    word-count summary."""
+    if not headlines:
+        return ""
+    import re as _re
+    name_words = [w for w in _re.split(r"\W+", name or "") if len(w) >= 4]
+    for h in headlines:
+        up = h.upper()
+        if ticker and ticker.upper() in up:
+            return h.strip()
+        if any(w.upper() in up for w in name_words[:2]):
+            return h.strip()
+    return headlines[0].strip()
+
+
+def _rec_diagnostic(r: PositionAnalysis) -> dict:
+    """Compact 'why not a buy' diagnostic stored alongside each ledger snapshot:
+    the verdict's drag factors and the latest-news catalyst (when news scoring
+    is enabled). Lets the Missed Opportunities table explain why the analyzer
+    didn't flag a BUY/ADD and what news drove the run-up — without re-deriving
+    anything at render time."""
+    news = None
+    ns = getattr(r, "news_sentiment", None)
+    if ns and (ns.get("rationale") or ns.get("label") or ns.get("headlines")):
+        news = {
+            "label": (ns.get("label") or "").strip(),
+            "rationale": (ns.get("rationale") or "").strip(),
+            "headline": _pick_catalyst_headline(r.ticker, r.name, ns.get("headlines")),
+        }
+    return {"why": _verdict_why_not_buy(r.verdict), "news": news}
+
+
 def _current_rec_snapshot(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]],
 ) -> dict[str, dict]:
-    """Build {ticker: {price, alloc, verdict, name, sector}} for everything we
-    can see this run. Holdings win over watchlist entries (real allocation).
-    `alloc` is % of portfolio (0 for non-held watchlist names)."""
+    """Build {ticker: {price, alloc, verdict, name, sector, why, news}} for
+    everything we can see this run. Holdings win over watchlist entries (real
+    allocation). `alloc` is % of portfolio (0 for non-held watchlist names).
+    `why`/`news` capture why it wasn't a BUY (verdict drags + news catalyst)."""
     snapshot: dict[str, dict] = {}
     # Watchlist first, so holdings overwrite with the real allocation.
     for items in (watchlists or {}).values():
@@ -3479,6 +3892,7 @@ def _current_rec_snapshot(
                 "verdict": (r.verdict.label if r.verdict else None),
                 "name": r.name,
                 "sector": r.sector,
+                **_rec_diagnostic(r),
             }
     for r in results:
         if r.current_price is None:
@@ -3489,6 +3903,7 @@ def _current_rec_snapshot(
             "verdict": (r.verdict.label if r.verdict else None),
             "name": r.name,
             "sector": r.sector,
+            **_rec_diagnostic(r),
         }
     return snapshot
 
@@ -3518,10 +3933,14 @@ def update_recs_history(
                 "first_price": cur["price"],
                 "first_verdict": cur["verdict"],
                 "first_alloc": cur["alloc"],
+                "first_why": cur.get("why", ""),
+                "first_news": cur.get("news"),
                 "last_date": run_date,
                 "last_price": cur["price"],
                 "last_verdict": cur["verdict"],
                 "last_alloc": cur["alloc"],
+                "last_why": cur.get("why", ""),
+                "last_news": cur.get("news"),
                 "peak_price": cur["price"],
                 "peak_date": run_date,
             }
@@ -3533,6 +3952,16 @@ def update_recs_history(
         entry["last_price"] = cur["price"]
         entry["last_verdict"] = cur["verdict"]
         entry["last_alloc"] = cur["alloc"]
+        entry["last_why"] = cur.get("why", "")
+        entry["last_news"] = cur.get("news")
+        # Backfill the first-sight diagnostics for entries created before this
+        # field existed — but only while the verdict is unchanged, so the current
+        # reasoning still represents the original sighting (don't misattribute a
+        # later ADD's reasoning to an original HOLD).
+        if not entry.get("first_why") and entry.get("first_verdict") == cur["verdict"]:
+            entry["first_why"] = cur.get("why", "")
+        if entry.get("first_news") is None and entry.get("first_verdict") == cur["verdict"]:
+            entry["first_news"] = cur.get("news")
         if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
             entry["peak_price"] = cur["price"]
             entry["peak_date"] = run_date
@@ -3553,6 +3982,10 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
     """From the ledger, return tickers that ran up >= MISSED_OPP_GAIN_PCT since
     they were first seen while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
     Sorted by current gain (largest miss first)."""
+    def _esc_txt(s: object) -> str:
+        return (str(s).replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+
     out: list[dict] = []
     for ticker, e in (history.get("tickers") or {}).items():
         first_price = e.get("first_price")
@@ -3588,6 +4021,57 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
                   f"(${first_price:,.2f} → ${last_price:,.2f}), but {hold_part}.")
         if peak_gain_pct - gain_pct >= 5:
             reason += f" Was up as much as {_fmt_pct(peak_gain_pct, 0, True)} at its peak."
+
+        # --- Why it wasn't a BUY/ADD (the core of the column). The analyzer's
+        #     verdict breakdown already names the factors that held the score
+        #     below the buy bar; surface them, distinguishing the original
+        #     sighting ("initially") from now. ---
+        BUY_TYPES = {"ADD", "BUY", "BUY MORE"}
+        last_verdict = e.get("last_verdict")
+        first_why = (e.get("first_why") or "").strip()
+        last_why = (e.get("last_why") or "").strip()
+        if last_verdict in BUY_TYPES:
+            # The analyzer rates it a buy NOW — so the miss is that it only
+            # turned bullish after the move while we stayed under-allocated.
+            extra = ("<strong>Why we under-acted:</strong> the analyzer rates it "
+                     f"<strong>{_esc_txt(last_verdict)}</strong> only now — it turned "
+                     f"bullish after the run-up")
+            if verdict and verdict not in BUY_TYPES:
+                lim = f" held back by {_esc_txt(first_why)}" if first_why else ""
+                extra += (f"; at first sight it was <strong>{_esc_txt(verdict)}</strong>"
+                          f"{(',' + lim) if lim else ''}")
+            extra += ", so you stayed under-allocated as it climbed."
+        else:
+            drag = last_why or first_why
+            extra = ("<strong>Why it wasn't a buy:</strong> rated "
+                     f"<strong>{_esc_txt(last_verdict or '—')}</strong>")
+            extra += (f" — held back by {_esc_txt(drag)}" if drag
+                      else " — no single strong buy signal scored high enough")
+            if verdict and last_verdict and verdict != last_verdict:
+                extra += f" (was <strong>{_esc_txt(verdict)}</strong> at first sight)"
+            extra += "."
+        reason += "<br>" + extra
+
+        # --- News catalyst (the "check the news and compile" part). Pulled from
+        #     the ledger's stored sentiment, refreshed each run by
+        #     score_news_sentiment (Claude when keyed, else a free lexicon). The
+        #     lexicon's rationale is a bland word-count, so fall back to the most
+        #     relevant headline as the concrete catalyst in that case. ---
+        news = e.get("last_news") or e.get("first_news")
+        if news and (news.get("rationale") or news.get("label") or news.get("headline")):
+            lbl = _esc_txt((news.get("label") or "").strip())
+            rat = (news.get("rationale") or "").strip()
+            hl = (news.get("headline") or "").strip()
+            if "signal words" in rat.lower() or not rat:
+                body = f"&ldquo;{_esc_txt(hl)}&rdquo;" if hl else _esc_txt(rat)
+            else:
+                body = _esc_txt(rat)
+                if hl and hl.lower() not in rat.lower():
+                    body += f" &mdash; &ldquo;{_esc_txt(hl)}&rdquo;"
+            if body:
+                head = f"📰 News{(' ' + lbl) if lbl else ''}:"
+                reason += f"<br><strong>{head}</strong> {body}"
+
         out.append({
             "ticker": ticker,
             "name": e.get("name") or ticker,
@@ -5742,6 +6226,25 @@ def main():
                 for r in rows:
                     w.writerow(r)
             print(f"[robinhood] Saved positions snapshot to {args.save_positions}")
+
+        # After-hours prices: when the regular session is closed, override the
+        # report's live prices with Robinhood's broker-accurate extended-hours
+        # last trade (holdings + watchlist). Skipped while the market is open,
+        # or when RH_EXTENDED_HOURS=0. analyze_position() reads _RH_EXTENDED_PRICES.
+        if (os.environ.get("RH_EXTENDED_HOURS", "1") != "0"
+                and not _us_market_open_now()):
+            try:
+                _wl_ticks = [it["ticker"]
+                             for items in (watchlist_lookup or {}).values()
+                             for it in items]
+                _all_ticks = list({r["ticker"] for r in rows} | set(_wl_ticks))
+                _px = rhs.fetch_latest_prices(_all_ticks)
+                if _px:
+                    _RH_EXTENDED_PRICES.update(_px)
+                    print(f"[robinhood] Market closed — using extended-hours "
+                          f"prices for {len(_px)}/{len(_all_ticks)} tickers.")
+            except Exception as e:
+                print(f"[robinhood] Extended-hours price fetch skipped: {e}")
     else:
         if not args.positions_csv:
             print("ERROR: provide a positions CSV (or use --source robinhood).",

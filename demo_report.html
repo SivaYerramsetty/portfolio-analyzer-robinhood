@@ -1,0 +1,1508 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* ---------- Theme tokens (light by default) ---------- */
+  :root {
+    --bg-page: #fafbfc;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f0f3f7;
+    --bg-table-header: #f3f5f7;
+    --bg-table-header-hover: #e8ebef;
+    --bg-row-even: #fafbfc;
+    --bg-row-hover: #eef2f7;
+    --bg-pill: #ffffff;
+    --bg-pill-hover: #f0f3f7;
+    --bg-pill-active: #2c3e50;
+    --bg-input: #ffffff;
+    --bg-summary: #ffffff;
+    --bg-alert: #fffbeb;
+    --bg-alert-border: #fde68a;
+    --bg-chip-neutral: #ecf0f1;
+    --bg-chip-green: #d4edda;
+    --bg-chip-red: #f8d7da;
+    --bg-chip-amber: #fff3cd;
+    --bg-chip-blue: #e7f1ff;
+    --bg-chip-yellow: #fff8e1;
+
+    --fg-strong: #1a2533;
+    --fg-body: #2c3e50;
+    --fg-muted: #7f8c8d;
+    --fg-faint: #95a5a6;
+    --fg-table-header: #34495e;
+    --fg-pill: #34495e;
+    --fg-pill-active: #ffffff;
+    --fg-alert: #7d5d00;
+    --fg-chip-green: #1e7e34;
+    --fg-chip-red: #a02622;
+    --fg-chip-amber: #7d6608;
+    --fg-chip-blue: #1c4d8c;
+    --fg-chip-neutral: #7f8c8d;
+
+    --border-soft: #f1f3f5;
+    --border-medium: #e1e4e8;
+    --border-strong: #d0d7de;
+
+    --pos-up: #1e7e34;
+    --pos-down: #a02622;
+    --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.04);
+    --shadow-sticky: 0 2px 6px rgba(15, 23, 42, 0.06);
+  }
+
+  /* ---------- Dark theme overrides ---------- */
+  [data-theme="dark"] {
+    --bg-page: #0f1419;
+    --bg-card: #1a2028;
+    --bg-card-hover: #232a35;
+    --bg-table-header: #232a35;
+    --bg-table-header-hover: #2d3540;
+    --bg-row-even: #161c24;
+    --bg-row-hover: #232a35;
+    --bg-pill: #1a2028;
+    --bg-pill-hover: #2d3540;
+    --bg-pill-active: #4a90e2;
+    --bg-input: #1a2028;
+    --bg-summary: #1a2028;
+    --bg-alert: #2d2517;
+    --bg-alert-border: #6b5a20;
+    /* Chips in dark mode — muted backgrounds, brighter text */
+    --bg-chip-neutral: #2d3540;
+    --bg-chip-green: #143324;
+    --bg-chip-red: #3d1a1a;
+    --bg-chip-amber: #3a2d10;
+    --bg-chip-blue: #1a2c44;
+    --bg-chip-yellow: #3d3010;
+
+    --fg-strong: #e8eaed;
+    --fg-body: #cbd5e0;
+    --fg-muted: #8b95a3;
+    --fg-faint: #6b7280;
+    --fg-table-header: #cbd5e0;
+    --fg-pill: #cbd5e0;
+    --fg-pill-active: #ffffff;
+    --fg-alert: #f0c97a;
+    --fg-chip-green: #4ade80;
+    --fg-chip-red: #f87171;
+    --fg-chip-amber: #fbbf24;
+    --fg-chip-blue: #60a5fa;
+    --fg-chip-neutral: #9ca3af;
+
+    --border-soft: #232a35;
+    --border-medium: #2d3540;
+    --border-strong: #3a4250;
+
+    --pos-up: #4ade80;
+    --pos-down: #f87171;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.5);
+  }
+
+  /* ---------- Foundation ---------- */
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+          color: var(--fg-body); background: var(--bg-page);
+          max-width: 1500px; margin: 0 auto;
+          padding: 32px 28px 48px;
+          line-height: 1.5; font-size: 14px;
+          transition: background 0.2s, color 0.2s; }
+
+  /* ---------- Headers ---------- */
+  /* Compact report header: title + meta on the left, controls (refresh,
+     theme toggle) on the right, all in one wrapping flex row. */
+  .report-header { display: flex; justify-content: space-between;
+                    align-items: center; gap: 16px; flex-wrap: wrap;
+                    margin: 0 0 12px; }
+  .report-header .sub { margin: 3px 0 0; }
+  .report-controls { display: flex; align-items: center; gap: 8px; }
+  .refresh-btn { height: 34px; padding: 0 14px; border-radius: 17px;
+                  border: 1px solid var(--border-medium);
+                  background: var(--bg-card); color: var(--fg-body);
+                  cursor: pointer; font-size: 12px; font-weight: 600;
+                  display: flex; align-items: center; gap: 6px;
+                  box-shadow: var(--shadow-card);
+                  transition: transform 0.15s, background 0.2s; }
+  .refresh-btn:hover { transform: scale(1.04); background: var(--bg-card-hover); }
+  .refresh-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+  .auto-toggle.active { background: var(--bg-chip-green);
+                         color: var(--fg-chip-green);
+                         border-color: var(--pos-up); }
+  .refresh-status { font-size: 12px; color: var(--fg-muted);
+                     text-align: right; margin: -6px 0 10px; }
+  .refresh-status:empty { display: none; }
+  h1 { font-size: 24px; margin: 0; font-weight: 600;
+        letter-spacing: -0.3px; color: var(--fg-strong); }
+  h2 { font-size: 19px; margin: 36px 0 12px; font-weight: 600;
+        color: var(--fg-strong);
+        background: var(--bg-page);
+        padding: 12px 4px 10px;
+        border-bottom: 2px solid var(--border-medium);
+        position: sticky;
+        top: 0;
+        z-index: 15;
+        /* Subtle drop-shadow under the pinned header so it visually separates
+           from the content scrolling underneath. */
+        box-shadow: 0 2px 4px var(--bg-page); }
+  h3 { font-size: 15px; margin: 24px 0 10px; font-weight: 600;
+        color: var(--fg-table-header); }
+  .sub { color: var(--fg-muted); font-size: 13px; margin-bottom: 28px; }
+
+  /* ---------- Summary card ---------- */
+  .summary-card { background: var(--bg-summary); border: 1px solid var(--border-medium);
+                   border-radius: 10px; padding: 14px 20px;
+                   margin-bottom: 16px;
+                   box-shadow: var(--shadow-card); }
+  /* Stats laid out to fit on a single row on desktop; gap + sizes tuned so
+     six stats stay one line, while flex-wrap still lets them stack on narrow
+     screens. justify-content spreads them across the card width. */
+  .summary-row { display: flex; gap: 14px 26px; flex-wrap: wrap;
+                  justify-content: space-between; }
+  .stat { font-size: 11px; color: var(--fg-muted);
+           text-transform: uppercase; letter-spacing: 0.3px;
+           font-weight: 600; white-space: nowrap; }
+  .stat strong { font-size: 19px; display: block;
+                  color: var(--fg-strong); margin-top: 3px;
+                  font-weight: 700; letter-spacing: -0.3px;
+                  text-transform: none; }
+
+  /* ---------- Tables ---------- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border-medium);
+                 border-radius: 10px; background: var(--bg-card);
+                 margin-bottom: 28px;
+                 box-shadow: var(--shadow-card); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { background: var(--bg-table-header); color: var(--fg-table-header);
+              padding: 10px 8px; text-align: left;
+              font-weight: 600; font-size: 11px;
+              border-bottom: 2px solid var(--border-medium);
+              cursor: pointer; user-select: none;
+              text-transform: uppercase; letter-spacing: 0.3px; }
+  thead th:hover { background: var(--bg-table-header-hover); color: var(--fg-strong); }
+  thead th.sort-asc::after { content: " ▲"; font-size: 9px; opacity: 0.7; }
+  thead th.sort-desc::after { content: " ▼"; font-size: 9px; opacity: 0.7; }
+  /* Sticky column headers (desktop): pin the thead just below the sticky h2
+     while scrolling a long table. Needs overflow:visible on .table-wrap —
+     any overflow other than visible would trap the sticky cells inside the
+     wrapper instead of pinning to the viewport — so this is desktop-only;
+     narrow screens keep overflow-x:auto for horizontal table scrolling.
+     --h2-pin-h is measured by JS at load (h2 height varies with theme/font).
+     The inset box-shadow replaces the th border-bottom while pinned:
+     border-collapse drops cell borders from stuck cells in Chrome. */
+  @media (min-width: 901px) {
+    .table-wrap { overflow-x: visible; }
+    thead th { position: sticky;
+                top: var(--h2-pin-h, 49px);
+                z-index: 10;   /* below the h2 (15), above row content */
+                box-shadow: inset 0 -2px 0 var(--border-medium); }
+    thead th:first-child { border-top-left-radius: 9px; }
+    thead th:last-child { border-top-right-radius: 9px; }
+  }
+  td { padding: 9px 8px; border-bottom: 1px solid var(--border-soft);
+        vertical-align: middle; color: var(--fg-body); }
+  tbody tr:nth-child(even) td { background: var(--bg-row-even); }
+  tbody tr:hover td { background: var(--bg-row-hover); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* ---------- Cell styles ---------- */
+  .verdict { padding: 4px 10px; border-radius: 12px; color: white;
+              font-weight: 600; font-size: 11px; letter-spacing: 0.4px;
+              display: inline-block; }
+  .ticker { font-weight: 700; font-family: "SF Mono", SFMono-Regular,
+             Consolas, "Liberation Mono", monospace;
+             color: var(--fg-strong); letter-spacing: -0.2px; }
+  .reason { color: var(--fg-muted); font-size: 11px;
+             line-height: 1.4; margin-top: 2px; }
+  .num { text-align: right;
+          font-variant-numeric: tabular-nums; }
+  .pos-up { color: var(--pos-up); font-weight: 600; }
+  .pos-down { color: var(--pos-down); font-weight: 600; }
+
+  /* ---------- Alerts ---------- */
+  .alert { background: var(--bg-alert); border: 1px solid var(--bg-alert-border);
+            border-left: 4px solid #f39c12;
+            padding: 12px 16px; margin-bottom: 18px;
+            font-size: 13px; border-radius: 6px;
+            color: var(--fg-alert); }
+
+  /* Quick recommendations — subtle, hover-revealed chip in the header
+     controls (beside Refresh). Hovering opens a floating panel with the full
+     list; auto-hides on scroll / mouse-leave (JS). Sized to sit in the
+     34px control row; panel is right-anchored so it stays on screen. */
+  .qr-wrap { position: relative; display: inline-flex; align-items: center; }
+  .qr-trigger { height: 34px; padding: 0 13px; box-sizing: border-box;
+                 display: flex; align-items: center; gap: 5px;
+                 background: var(--bg-card); color: var(--fg-muted);
+                 border: 1px solid var(--border-medium); border-radius: 17px;
+                 font-size: 12px; font-weight: 600;
+                 cursor: default; user-select: none; white-space: nowrap;
+                 box-shadow: var(--shadow-card);
+                 transition: background 0.2s, color 0.2s; }
+  .qr-trigger:hover { background: var(--bg-card-hover); color: var(--fg-body); }
+  .qr-wrap.open .qr-trigger { background: var(--bg-card-hover);
+                               color: var(--fg-body); }
+  .qr-panel { display: none; position: absolute; top: calc(100% + 6px);
+               right: 0; left: auto; z-index: 30;
+               min-width: 340px; max-width: min(560px, 92vw);
+               background: var(--bg-card); color: var(--fg-body);
+               border: 1px solid var(--border-medium); border-radius: 8px;
+               box-shadow: var(--shadow-card);
+               padding: 12px 16px 12px; text-align: left; }
+  .qr-wrap.open .qr-panel { display: block; }
+  .qr-panel ul { margin: 0; padding-left: 18px;
+                  font-size: 12.5px; line-height: 1.55; color: var(--fg-body); }
+  .qr-panel li { margin-bottom: 5px; }
+  .qr-panel li:last-child { margin-bottom: 0; }
+
+  /* ---------- Filter bar ----------
+     Note: filter bar is intentionally NOT sticky. We tried scroll-direction
+     toggling (sticky-on-scroll-up) but the attribute-conditional sticky rules
+     don't reliably work in Safari. The simpler, working behavior: h2 section
+     headers are always sticky (so you know which section you're reading);
+     filters live at the top of the page and you scroll back up to use them. */
+  .filter-bar { background: var(--bg-card); border: 1px solid var(--border-medium);
+                 border-radius: 10px;
+                 padding: 10px 14px; margin-bottom: 18px;
+                 box-shadow: var(--shadow-card); }
+  .filter-bar-top { display: flex; align-items: center; gap: 8px;
+                     flex-wrap: wrap; }
+  .filter-bar input[type="text"] { padding: 6px 10px;
+                                    border: 1px solid var(--border-strong);
+                                    border-radius: 6px; font-size: 13px;
+                                    min-width: 240px; outline: none;
+                                    background: var(--bg-input);
+                                    color: var(--fg-body);
+                                    transition: border-color 0.15s; }
+  .filter-bar input[type="text"]:focus { border-color: var(--fg-table-header);
+                                          box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.15); }
+  .filter-pill { background: var(--bg-pill); border: 1px solid var(--border-strong);
+                  border-radius: 14px; padding: 3px 11px;
+                  font-size: 12px; cursor: pointer; color: var(--fg-pill);
+                  transition: all 0.15s; user-select: none;
+                  font-weight: 500; white-space: nowrap; }
+  .filter-pill:hover { background: var(--bg-pill-hover); border-color: var(--fg-faint); }
+  .filter-pill.active { background: var(--bg-pill-active); color: var(--fg-pill-active);
+                         border-color: var(--bg-pill-active);
+                         box-shadow: 0 1px 3px rgba(15, 23, 42, 0.15); }
+  .clear-pill { color: var(--fg-faint); font-size: 11px;
+                 background: var(--bg-page); }
+  .clear-pill:hover { background: var(--bg-chip-red); color: var(--fg-chip-red);
+                       border-color: var(--fg-chip-red); }
+  /* Frequent-combo pills live in #freqFilters; display:contents lets the
+     buttons flow directly in the filter-bar-top flex row. The ★ marks them
+     as your saved/most-used combos vs. the regular pills in More filters. */
+  #freqFilters { display: contents; }
+  .freq-pill::before { content: "★ "; color: var(--accent, #e6a817);
+                        font-size: 10px; }
+  .more-toggle { background: var(--bg-table-header); color: var(--fg-pill);
+                  border: 1px solid var(--border-strong);
+                  border-radius: 14px; padding: 3px 11px;
+                  font-size: 12px; cursor: pointer;
+                  font-weight: 500; user-select: none;
+                  transition: all 0.15s; }
+  .more-toggle:hover { background: var(--bg-table-header-hover); }
+  .more-toggle.expanded { background: var(--bg-pill-active); color: var(--fg-pill-active);
+                           border-color: var(--bg-pill-active); }
+  .filter-more { display: none; margin-top: 10px;
+                  padding-top: 10px;
+                  border-top: 1px solid var(--border-soft); }
+  .filter-more.show { display: block; }
+  .filter-group { display: flex; align-items: center;
+                   gap: 6px; flex-wrap: wrap;
+                   margin-bottom: 6px; }
+  .filter-group:last-child { margin-bottom: 0; }
+  .filter-group-label { font-size: 10px; color: var(--fg-faint);
+                         font-weight: 700;
+                         text-transform: uppercase; letter-spacing: 0.6px;
+                         min-width: 110px; }
+  .filter-status { font-size: 12px; color: var(--fg-muted);
+                    margin-left: auto;
+                    font-variant-numeric: tabular-nums;
+                    white-space: nowrap; }
+
+  /* ---------- Theme toggle button (in the header controls cluster) ---------- */
+  .theme-toggle { width: 34px; height: 34px; flex: 0 0 auto;
+                   border-radius: 50%; border: 1px solid var(--border-medium);
+                   background: var(--bg-card); color: var(--fg-body);
+                   cursor: pointer; font-size: 16px;
+                   display: flex; align-items: center; justify-content: center;
+                   box-shadow: var(--shadow-card);
+                   transition: transform 0.15s, background 0.2s; }
+  .theme-toggle:hover { transform: scale(1.08); background: var(--bg-card-hover); }
+
+  /* ---------- Inline-chip overrides (dark mode) ---------- */
+  /* Cell renderers use inline styles with hardcoded chip colors. We override
+     them in dark mode using attribute selectors so they remain readable. */
+  [data-theme="dark"] span[style*="background:#d4edda"],
+  [data-theme="dark"] span[style*="background: #d4edda"] {
+    background: var(--bg-chip-green) !important; color: var(--fg-chip-green) !important;
+  }
+  [data-theme="dark"] span[style*="background:#f8d7da"],
+  [data-theme="dark"] span[style*="background: #f8d7da"] {
+    background: var(--bg-chip-red) !important; color: var(--fg-chip-red) !important;
+  }
+  [data-theme="dark"] span[style*="background:#fff3cd"],
+  [data-theme="dark"] span[style*="background: #fff3cd"] {
+    background: var(--bg-chip-amber) !important; color: var(--fg-chip-amber) !important;
+  }
+  [data-theme="dark"] span[style*="background:#fff8e1"],
+  [data-theme="dark"] span[style*="background: #fff8e1"] {
+    background: var(--bg-chip-yellow) !important; color: var(--fg-chip-amber) !important;
+  }
+  [data-theme="dark"] span[style*="background:#ecf0f1"],
+  [data-theme="dark"] span[style*="background: #ecf0f1"] {
+    background: var(--bg-chip-neutral) !important; color: var(--fg-chip-neutral) !important;
+  }
+  [data-theme="dark"] span[style*="background:#e7f1ff"],
+  [data-theme="dark"] span[style*="background: #e7f1ff"] {
+    background: var(--bg-chip-blue) !important; color: var(--fg-chip-blue) !important;
+  }
+  /* Fade out muted-grey ticker links so they don't disappear into the dark bg */
+  [data-theme="dark"] div[style*="color:#7f8c8d"],
+  [data-theme="dark"] div[style*="color: #7f8c8d"] {
+    color: var(--fg-muted) !important;
+  }
+  [data-theme="dark"] div[style*="color:#bdc3c7"],
+  [data-theme="dark"] div[style*="color: #bdc3c7"] {
+    color: var(--fg-faint) !important;
+  }
+  /* Filter dots — make the inactive ones visible in dark */
+  [data-theme="dark"] span[style*="background:#bdc3c7"] {
+    background: #4a5568 !important;
+  }
+  /* Range-bar background */
+  [data-theme="dark"] div[style*="background:#ecf0f1"] {
+    background: var(--bg-chip-neutral) !important;
+  }
+
+  /* ---------- Responsive ---------- */
+  @media (max-width: 900px) {
+    body { padding: 18px 12px 32px; font-size: 13px; }
+    h1 { font-size: 22px; }
+    h2 { font-size: 17px; }
+    .filter-bar input[type="text"] { min-width: 160px; }
+    .filter-group-label { min-width: auto; }
+    table { font-size: 12px; }
+    thead th, td { padding: 8px 6px; }
+    .refresh-status { text-align: left; margin-top: 0; }
+    /* Chip can sit anywhere once the controls wrap, so anchor the panel to
+       the viewport (full-width sheet) instead of the chip to avoid clipping. */
+    .qr-panel { position: fixed; top: auto; bottom: 12px;
+                 left: 10px; right: 10px; min-width: 0; max-width: none; }
+  }
+
+  /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
+     Touch devices can't hover, so the title="" tooltips on cells (quality
+     dots, score breakdown, verdict reason, insider detail, cost/gain) are
+     invisible. On touch-primary devices a tap reveals that text here.
+     The elements are only created/shown by JS in touch mode, so these
+     rules are inert on desktop. */
+  .m-tip-backdrop { position: fixed; inset: 0; z-index: 199;
+                     background: rgba(0, 0, 0, 0.35); opacity: 0;
+                     pointer-events: none; transition: opacity 0.2s; }
+  .m-tip-backdrop.show { opacity: 1; pointer-events: auto; }
+  .m-tip { position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+            background: var(--bg-card); color: var(--fg-body);
+            border-top: 1px solid var(--border-medium);
+            border-radius: 14px 14px 0 0;
+            box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.28);
+            padding: 18px 20px calc(16px + env(safe-area-inset-bottom, 0px));
+            transform: translateY(110%);
+            transition: transform 0.24s ease;
+            max-height: 64vh; overflow-y: auto;
+            -webkit-overflow-scrolling: touch; }
+  .m-tip.show { transform: translateY(0); }
+  .m-tip-label { font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
+                  text-transform: uppercase; color: var(--fg-muted);
+                  margin-bottom: 8px; }
+  .m-tip-body { font-size: 14px; line-height: 1.5; white-space: pre-wrap;
+                 word-break: break-word; }
+  .m-tip-close { margin-top: 16px; width: 100%; padding: 11px;
+                  border: 1px solid var(--border-medium); border-radius: 8px;
+                  background: var(--bg-page); color: var(--fg-body);
+                  font-size: 14px; font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+<script>
+  // Apply saved theme BEFORE first paint to avoid a white flash on dark-mode loads.
+  (function() {
+    try {
+      var saved = localStorage.getItem('portfolio-theme');
+      if (saved === 'dark' || saved === 'light') {
+        document.documentElement.setAttribute('data-theme', saved);
+      } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    } catch (e) {}
+  })();
+</script>
+<div class="report-header">
+  <div>
+    <h1>Portfolio Analysis</h1>
+    <div class="sub">Last updated 0m ago · June 22, 2026 · 10:58 AM EST · yfinance only</div>
+  </div>
+  <div class="report-controls">
+    <div class="qr-wrap" id="qrWrap"><button class="qr-trigger" id="qrTrigger">💡 Quick recommendations (5)</button><div class="qr-panel" id="qrPanel"><ul><li>🚩 <strong>Review for exit:</strong> PFE — scoring below the framework's keep threshold.</li><li>✂️ <strong>Trim candidates:</strong> AAPL, COST.</li><li>📊 <strong>Concentration:</strong> AMD (20%), GOOGL (17%), AAPL (16%) — sizeable position(s); consider rebalancing.</li><li>➕ <strong>High-conviction adds:</strong> AVGO.</li><li>👀 <strong>Insider selling:</strong> AAPL, NVDA, MSFT, GOOGL +2 more — discretionary sales worth a look.</li></ul></div></div>
+    <button id="ghRefreshBtn" class="refresh-btn" onclick="ghTriggerRefresh()" title="Trigger the GitHub Actions workflow to regenerate this report">&#10227; Refresh data</button>
+    <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
+            title="Auto-reload this page every hour to pick up the latest published report">
+      &#9201; Auto</button>
+    <button class="theme-toggle" id="themeToggle"
+            title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+  </div>
+</div>
+
+<div id="ghRefreshStatus" class="refresh-status"></div>
+<script>
+(function() {
+  var REPO = "SivaYerramsetty/portfolio-analyzer-robinhood";
+  var API = "https://api.github.com/repos/" + REPO;
+  var WORKFLOW = "portfolio.yml";   // file name under .github/workflows/
+  var REF = "main";
+  var TOKEN_KEY = "gh-dispatch-token";
+  var pollTimer = null, startedAt = null;
+
+  function setStatus(msg, isError) {
+    var el = document.getElementById("ghRefreshStatus");
+    el.textContent = msg;
+    el.style.color = isError ? "#c0392b" : "var(--fg-muted)";
+  }
+  function headers(tok) {
+    return {"Authorization": "Bearer " + tok,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"};
+  }
+  function getToken(forcePrompt) {
+    var tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok || forcePrompt) {
+      tok = prompt(
+        "Paste a GitHub fine-grained personal access token to trigger the refresh.\n\n" +
+        "Create one at github.com -> Settings -> Developer settings -> " +
+        "Fine-grained tokens:\n" +
+        "  - Repository access: only " + REPO + "\n" +
+        "  - Permissions: Actions = Read and write\n\n" +
+        "It is stored only in this browser (localStorage), never on any server.");
+      if (tok) localStorage.setItem(TOKEN_KEY, tok.trim());
+    }
+    return tok ? tok.trim() : null;
+  }
+  // Hooks for the hourly auto-refresh toggle: check for a stored token
+  // without prompting, and ensure one exists (prompting once) at enable time.
+  window.ghHasToken = function() { return !!localStorage.getItem(TOKEN_KEY); };
+  window.ghEnsureToken = function() { return getToken(false); };
+  function elapsedStr() {
+    var s = Math.floor((Date.now() - startedAt) / 1000);
+    return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+
+  window.ghTriggerRefresh = async function() {
+    var tok = getToken(false);
+    if (!tok) return;
+    var btn = document.getElementById("ghRefreshBtn");
+    btn.disabled = true;
+    setStatus("Triggering workflow\u2026");
+    try {
+      var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
+        method: "POST", headers: headers(tok),
+        body: JSON.stringify({ref: REF})
+      });
+      if (r.status === 204) {
+        startedAt = Date.now();
+        setStatus("Workflow queued \u2014 a fresh report usually takes a few minutes\u2026");
+        pollTimer = setInterval(pollRun, 12000);
+      } else if (r.status === 401 || r.status === 403) {
+        localStorage.removeItem(TOKEN_KEY);
+        setStatus("Token rejected (HTTP " + r.status + ") \u2014 click Refresh again to re-enter it.", true);
+        btn.disabled = false;
+      } else {
+        var body = await r.text();
+        setStatus("Dispatch failed: HTTP " + r.status + " " + body.slice(0, 120), true);
+        btn.disabled = false;
+      }
+    } catch (e) {
+      setStatus("Network error: " + e, true);
+      btn.disabled = false;
+    }
+  };
+
+  async function pollRun() {
+    var tok = getToken(false);
+    if (!tok) return;
+    try {
+      var r = await fetch(API + "/actions/runs?event=workflow_dispatch&per_page=1",
+                          {headers: headers(tok)});
+      if (!r.ok) return;
+      var data = await r.json();
+      var run = (data.workflow_runs || [])[0];
+      // Ignore runs from before this click (clock skew margin of 90s)
+      if (!run || new Date(run.created_at).getTime() < startedAt - 90000) {
+        setStatus("Waiting for run to appear\u2026 " + elapsedStr());
+        return;
+      }
+      if (run.status !== "completed") {
+        setStatus("Run " + run.status.replace("_", " ") + "\u2026 " + elapsedStr());
+        return;
+      }
+      clearInterval(pollTimer);
+      if (run.conclusion === "success") {
+        setStatus("\u2713 Done in " + elapsedStr() +
+                  " \u2014 reloading the fresh report in ~20s (Pages deploy lag)\u2026");
+        setTimeout(function() { location.reload(); }, 20000);
+      } else {
+        setStatus("Run finished: " + run.conclusion +
+                  " \u2014 see the repo's Actions tab for logs.", true);
+        document.getElementById("ghRefreshBtn").disabled = false;
+      }
+    } catch (e) { /* transient polling error — try again next tick */ }
+  }
+})();
+</script>
+
+
+<div class="summary-card">
+  <div class="summary-row">
+    <div class="stat"><strong>$164,469.71</strong>Portfolio value (live)</div>
+    <div class="stat"><strong style="color:var(--pos-down);">$-2,281.59 (-1.37%)</strong>Today's change</div>
+    <div class="stat"><strong>10</strong>Compounder positions</div>
+    <div class="stat"><strong>0</strong>Thematic / ETF positions</div>
+    <div class="stat"><strong>3</strong>Sell / Trim flags</div>
+    <div class="stat"><strong>1</strong>Add candidates</div>
+    
+  </div>
+</div>
+
+<div class="filter-bar">
+  <div class="filter-bar-top">
+    <input type="text" id="searchInput" placeholder="🔍 Search ticker or name…" autocomplete="off">
+    <!-- Your most-used filter combos, populated from localStorage by JS
+         (persists across regenerated reports — same Pages origin). Seeds
+         with the Quick-picks defaults below until usage history builds up. -->
+    <span id="freqFilters"></span>
+    <button class="more-toggle" id="moreToggle">More filters ▾</button>
+    <button class="filter-pill clear-pill" id="clearFilters">✕ Clear</button>
+    <span class="filter-status" id="filterStatus"></span>
+  </div>
+  <div class="filter-more" id="filterMore">
+    <div class="filter-group">
+      <span class="filter-group-label">Quick picks</span>
+      <button class="filter-pill" data-filter="buy">Buy signals</button>
+      <button class="filter-pill" data-filter="action">Action (SELL/TRIM)</button>
+      <button class="filter-pill" data-filter="high-quality">Quality 7+</button>
+      <button class="filter-pill" data-filter="hot-sector">🔥 Hot</button>
+      <button class="filter-pill" data-filter="insider-buy">✓ Insider buying</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Verdict</span>
+      <button class="filter-pill" data-filter="verdict-add">ADD only</button>
+      <button class="filter-pill" data-filter="verdict-hold">HOLD only</button>
+      <button class="filter-pill" data-filter="verdict-trim">TRIM only</button>
+      <button class="filter-pill" data-filter="verdict-sell">SELL only</button>
+      <button class="filter-pill" data-filter="verdict-buy">BUY (watchlist) only</button>
+      <button class="filter-pill" data-filter="verdict-watch">WATCH only</button>
+      <button class="filter-pill" data-filter="verdict-score-high">Verdict score 75+</button>
+      <button class="filter-pill" data-filter="verdict-score-low">Verdict score &lt;40</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Quality</span>
+      <button class="filter-pill" data-filter="high-score">Composite 70+</button>
+      <button class="filter-pill" data-filter="mid-score">Composite 50–70</button>
+      <button class="filter-pill" data-filter="weak-score">Composite &lt;40</button>
+      <button class="filter-pill" data-filter="passes-9">Passes 9/9 filters</button>
+      <button class="filter-pill" data-filter="passes-8">Passes 8+ filters</button>
+      <button class="filter-pill" data-filter="quality-6">Quality 6 (borderline)</button>
+      <button class="filter-pill" data-filter="low-quality">Quality &lt;5</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Sector momentum</span>
+      <button class="filter-pill" data-filter="cool-sector">❄️ Cool sector</button>
+      <button class="filter-pill" data-filter="neutral-sector">Neutral sector</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">By sector</span>
+      <button class="filter-pill" data-filter="sector-technology">Technology</button>
+      <button class="filter-pill" data-filter="sector-healthcare">Healthcare</button>
+      <button class="filter-pill" data-filter="sector-financial">Financials</button>
+      <button class="filter-pill" data-filter="sector-comm">Communication</button>
+      <button class="filter-pill" data-filter="sector-consumer-cyclical">Consumer Cyclical</button>
+      <button class="filter-pill" data-filter="sector-consumer-defensive">Consumer Defensive</button>
+      <button class="filter-pill" data-filter="sector-energy">Energy</button>
+      <button class="filter-pill" data-filter="sector-industrials">Industrials</button>
+      <button class="filter-pill" data-filter="sector-utilities">Utilities</button>
+      <button class="filter-pill" data-filter="sector-real-estate">Real Estate</button>
+      <button class="filter-pill" data-filter="sector-basic-materials">Basic Materials</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Trend</span>
+      <button class="filter-pill" data-filter="uptrend">↑ Uptrend</button>
+      <button class="filter-pill" data-filter="sideways">→ Sideways</button>
+      <button class="filter-pill" data-filter="downtrend">↓ Downtrend</button>
+      <button class="filter-pill" data-filter="far-above-ma">Far above 200d MA (+25%)</button>
+      <button class="filter-pill" data-filter="far-below-ma">Far below 200d MA (-15%)</button>
+      <button class="filter-pill" data-filter="near-200d-ma">Near 200d MA (±5%)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Price action</span>
+      <button class="filter-pill" data-filter="winners">Winners</button>
+      <button class="filter-pill" data-filter="big-winners">Big winners (+25%)</button>
+      <button class="filter-pill" data-filter="huge-winners">Huge winners (+100%)</button>
+      <button class="filter-pill" data-filter="losers">Losers</button>
+      <button class="filter-pill" data-filter="beaten-down">Beaten down (-15%)</button>
+      <button class="filter-pill" data-filter="deep-losers">Deep losers (-30%)</button>
+      <button class="filter-pill" data-filter="near-low">Near 52w low</button>
+      <button class="filter-pill" data-filter="mid-range">Mid-range (40–70%)</button>
+      <button class="filter-pill" data-filter="near-high">Near 52w high</button>
+      <button class="filter-pill" data-filter="big-upside">Upside &gt;20%</button>
+      <button class="filter-pill" data-filter="massive-upside">Upside &gt;40%</button>
+      <button class="filter-pill" data-filter="overvalued">Above target</button>
+      <button class="filter-pill" data-filter="very-overvalued">Above target by 15%+</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Today</span>
+      <button class="filter-pill" data-filter="up-today">▲ Up today</button>
+      <button class="filter-pill" data-filter="down-today">▼ Down today</button>
+      <button class="filter-pill" data-filter="big-up-today">▲ Movers (+3%)</button>
+      <button class="filter-pill" data-filter="big-down-today">▼ Movers (-3%)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Analyst rating</span>
+      <button class="filter-pill" data-filter="analyst-strong-buy">Strong Buy</button>
+      <button class="filter-pill" data-filter="analyst-buy">Buy rated</button>
+      <button class="filter-pill" data-filter="analyst-hold">Hold rated</button>
+      <button class="filter-pill" data-filter="analyst-sell">Sell rated</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Insider activity</span>
+      <button class="filter-pill" data-filter="insider-caution">⚠ Insider caution</button>
+      <button class="filter-pill" data-filter="insider-no-signal">No signal</button>
+      <button class="filter-pill" data-filter="has-insider-data">Any insider data</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Position size</span>
+      <button class="filter-pill" data-filter="very-large-position">Very large (&gt;20%)</button>
+      <button class="filter-pill" data-filter="large-position">Large (&gt;10%)</button>
+      <button class="filter-pill" data-filter="mid-position">Mid (2–10%)</button>
+      <button class="filter-pill" data-filter="small-position">Small (&lt;2%)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Holding period</span>
+      <button class="filter-pill" data-filter="long-term">Long-term (&gt;1yr)</button>
+      <button class="filter-pill" data-filter="short-term">Short-term (≤1yr)</button>
+      <button class="filter-pill" data-filter="approaching-lt">Approaching LT (within 90d)</button>
+      <button class="filter-pill" data-filter="recent-buy">Recent (&lt;30d)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Tax</span>
+      <button class="filter-pill" data-filter="has-tax-flag">Has tax detail</button>
+      <button class="filter-pill" data-filter="tax-loss-candidate">Loss-harvest candidate</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Type</span>
+      <button class="filter-pill" data-filter="compounder-only">Compounders</button>
+      <button class="filter-pill" data-filter="thematic-only">Thematic/ETFs</button>
+    </div>
+  </div>
+</div>
+<h2>Quality Compounders</h2>
+<div class='table-wrap'><table>
+<thead><tr><th>Ticker</th><th>Name / Sector</th><th class='num'>Position</th><th class='num'>Cost / Gain</th><th class='num'>Price → Target</th><th class='num'>Today</th><th>Range / Trend</th><th>Quality (9)</th><th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th><th>Analyst Ratings</th><th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th><th>Verdict <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>(score)</span></th></tr></thead><tbody>
+<tr data-verdict='HOLD' data-verdict-score='96.4' data-quality='9' data-gain='13695.0' data-gain-pct='120.13157894736841' data-day-pct='-0.7427986140775547' data-upside='42.944267782426785' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='71.0' data-score='84.4' data-insider='no_signal' data-has-insider='1' data-trend='sideways' data-ma-pct='10.1' data-port-pct='15.258128685215045' data-days-held='357' data-recommendation='strong_buy' data-has-tax='0' data-search='nvda nvidia technology'><td class='ticker' data-sort='NVDA'><span class='ticker' style='cursor:help;' title='NVIDIA Corporation operates as a data center scale AI infrastructure company in the United States, Taiwan, China, Hong Kong, Europe, and internationally. It operates through Compute &amp; Networking, and Graphics segments.'>NVDA</span></td><td data-sort='NVIDIA'><div style='font-weight:500;cursor:help;' title='NVIDIA Corporation operates as a data center scale AI infrastructure company in the United States, Taiwan, China, Hong Kong, Europe, and internationally. It operates through Compute &amp; Networking, and Graphics segments.'>NVIDIA</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +28.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='25095.0'><div>$25,095.00</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>15.26%</div></td><td class='num' data-sort='13695.0'><div>$95.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$13,695.00 (+120.1%)</div></td><td class='num' data-sort='42.944267782426785'><div><strong>$209.12</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $298.93</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+42.9% upside</div></td><td class='num' data-sort='-0.7427986140775547'><div class='pos-down' style='font-weight:600;'>-0.74%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-187.80</div></td><td data-sort='71.0'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:71%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>71%</span></div><div style='margin-top:3px;'><span title="Price $209.12 · 50d $209.31 · 200d $189.90" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>→ Sideways</span> <span style='color:var(--fg-muted);'>+10%</span></div></td><td data-sort='9'><span title="Revenue growth >=10%: 100.0% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 201.8% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 32.0 trailing / 16.4 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 0.6% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 79.2% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 59.0% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.1% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 46.3% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 2.1% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>9/9</span></td><td class='num' data-sort='84.4'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 84
+
+Quality  99
+Growth   100
+Value    78
+Analyst  79
+Insider  48' style='font-weight:700;color:var(--pos-up);font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>84</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 99'>Q</span><span style='color:var(--pos-up);' title='Growth: 100'>G</span><span style='color:var(--pos-up);' title='Value: 78'>V</span><span style='color:var(--pos-up);' title='Analyst: 79'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.9354838709677419'><div title="59 Buy · 2 Hold · 1 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:95.2%;background:#27ae60;"></div><div style="width:3.2%;background:#f39c12;"></div><div style="width:1.6%;background:#c0392b;"></div></div><div title="59 Buy · 2 Hold · 1 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">59</span>·<span style="color:#f39c12;">2</span>·<span style="color:#c0392b;">1</span><span style="color:var(--fg-faint);"> 62</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 4 open-market sell(s) | 6 total Form 4 filings | $262.9M discretionary selling | $134k via 10b5-1 plan (1 filings) - preset, low signal | 3 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$262.9M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='96.4'><span class='verdict' style='background:#2c3e50;cursor:help;' title='Hold: Strong upside to target (+43%), but Already overweight (15% of portfolio)
+Composite Score 84
++6 · Strong upside to target (+43%)
++5 · Passes all 9 quality filters
++5 · Hot sector momentum
+-4 · Already overweight (15% of portfolio)
+= verdict score 96'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-up);font-variant-numeric:tabular-nums;'>96</span></td></tr>
+<tr data-verdict='ADD' data-verdict-score='92.6' data-quality='9' data-gain='-7240.04' data-gain-pct='-69.61576923076923' data-day-pct='-3.975935577974961' data-upside='32.619400245572734' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='59.8' data-score='76.6' data-insider='no_signal' data-has-insider='1' data-trend='sideways' data-ma-pct='9.7' data-port-pct='1.9213021048070187' data-days-held='158' data-recommendation='strong_buy' data-has-tax='0' data-search='avgo broadcom technology'><td class='ticker' data-sort='AVGO'><span class='ticker' style='cursor:help;' title='Broadcom Inc. designs, develops, and supplies various semiconductor devices and infrastructure software solutions internationally. The company operates in two segments: Semiconductor Solutions and Infrastructure Software.'>AVGO</span></td><td data-sort='Broadcom'><div style='font-weight:500;cursor:help;' title='Broadcom Inc. designs, develops, and supplies various semiconductor devices and infrastructure software solutions internationally. The company operates in two segments: Semiconductor Solutions and Infrastructure Software.'>Broadcom</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +28.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='3159.96'><div>$3,159.96</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>1.92%</div></td><td class='num' data-sort='-7240.04'><div>$1,300.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-down'>$-7,240.04 (-69.6%)</div></td><td class='num' data-sort='32.619400245572734'><div><strong>$395.00</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $523.84</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+32.6% upside</div></td><td class='num' data-sort='-3.975935577974961'><div class='pos-down' style='font-weight:600;'>-3.98%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-130.84</div></td><td data-sort='59.8'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:60%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>60%</span></div><div style='margin-top:3px;'><span title="Price $395.00 · 50d $411.67 · 200d $359.95" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>→ Sideways</span> <span style='color:var(--fg-muted);'>+10%</span></div></td><td data-sort='9'><span title="Revenue growth >=10%: 24.4% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 26.2% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 65.7 trailing / 20.4 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 0.7% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 32.0% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 38.6% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.7% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 27.2% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 1.9% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>9/9</span></td><td class='num' data-sort='76.6'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 77
+
+Quality  89
+Growth   84
+Value    70
+Analyst  78
+Insider  48' style='font-weight:700;color:var(--pos-up);font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>77</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 89'>Q</span><span style='color:var(--pos-up);' title='Growth: 84'>G</span><span style='color:var(--pos-up);' title='Value: 70'>V</span><span style='color:var(--pos-up);' title='Analyst: 78'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.9166666666666666'><div title="44 Buy · 4 Hold · 0 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:91.7%;background:#27ae60;"></div><div style="width:8.3%;background:#f39c12;"></div></div><div title="44 Buy · 4 Hold · 0 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">44</span>·<span style="color:#f39c12;">4</span>·<span style="color:#c0392b;">0</span><span style="color:var(--fg-faint);"> 48</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 1 open-market buy(s), 6 open-market sell(s) | 17 total Form 4 filings | $374k bought (P-code, discretionary) | $20.6M discretionary selling | $250.0M via 10b5-1 plan (1 filings) - preset, low signal | $47k tax-withhold (mechanical) | 9 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$20.6M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='92.6'><span class='verdict' style='background:#27ae60;cursor:help;' title='Strong upside to target (+33%), Passes all 9 quality filters
+Composite Score 77
++6 · Strong upside to target (+33%)
++5 · Passes all 9 quality filters
++5 · Hot sector momentum
+= verdict score 93'>ADD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-up);font-variant-numeric:tabular-nums;'>93</span></td></tr>
+<tr data-verdict='HOLD' data-verdict-score='76.6' data-quality='9' data-gain='6556.0' data-gain-pct='87.41333333333333' data-day-pct='-2.5951942067149436' data-upside='47.1468234206033' data-bucket='compounder' data-sector-mom='Cool' data-sector='Communication Services' data-pos52='15.2' data-score='74.6' data-insider='no_signal' data-has-insider='1' data-trend='downtrend' data-ma-pct='-14.2' data-port-pct='8.54625450485685' data-days-held='872' data-recommendation='strong_buy' data-has-tax='0' data-search='meta meta platforms communication services'><td class='ticker' data-sort='META'><span class='ticker' style='cursor:help;' title='Meta Platforms, Inc. engages in the development of products that enable people to connect and share with friends and family through mobile devices, personal computers, virtual reality (VR) headsets, and AI glasses in the United States, Canada, Europe, Asia-Pacific, and interna...'>META</span></td><td data-sort='Meta Platforms'><div style='font-weight:500;cursor:help;' title='Meta Platforms, Inc. engages in the development of products that enable people to connect and share with friends and family through mobile devices, personal computers, virtual reality (VR) headsets, and AI glasses in the United States, Canada, Europe, Asia-Pacific, and interna...'>Meta Platforms</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Communication Services <span title="XLC: -7.5% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#2980b9;padding:1px 5px;border-radius:6px;margin-left:3px;'>❄️ Cool</span></div></td><td class='num' data-sort='14056.0'><div>$14,056.00</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>8.55%</div></td><td class='num' data-sort='6556.0'><div>$300.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$6,556.00 (+87.4%)</div></td><td class='num' data-sort='47.1468234206033'><div><strong>$562.24</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $827.32</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+47.1% upside</div></td><td class='num' data-sort='-2.5951942067149436'><div class='pos-down' style='font-weight:600;'>-2.60%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-374.50</div></td><td data-sort='15.2'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:15%;top:-3px;width:3px;height:12px;background:#2980b9;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>15% · near low</span></div><div style='margin-top:3px;'><span title="Price $562.24 · 50d $621.90 · 200d $654.92" style='display:inline-block;background:#f8d7da;color:#a02622;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↓ Down</span> <span style='color:var(--fg-muted);'>-14%</span></div></td><td data-sort='9'><span title="Revenue growth >=10%: 19.9% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 37.6% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 20.5 trailing / 15.5 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 0.8% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 29.2% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 39.4% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.4% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 25.6% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 2.1% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>9/9</span></td><td class='num' data-sort='74.6'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 75
+
+Quality  79
+Growth   83
+Value    77
+Analyst  78
+Insider  48' style='font-weight:700;color:var(--pos-up);font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>75</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 79'>Q</span><span style='color:var(--pos-up);' title='Growth: 83'>G</span><span style='color:var(--pos-up);' title='Value: 77'>V</span><span style='color:var(--pos-up);' title='Analyst: 78'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.90625'><div title="58 Buy · 6 Hold · 0 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:90.6%;background:#27ae60;"></div><div style="width:9.4%;background:#f39c12;"></div></div><div title="58 Buy · 6 Hold · 0 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">58</span>·<span style="color:#f39c12;">6</span>·<span style="color:#c0392b;">0</span><span style="color:var(--fg-faint);"> 64</span></div></td><td data-sort='48'><span title="Underlying signal: Scheduled selling | 0 open-market buy(s), 15 open-market sell(s) | 52 total Form 4 filings | $24.4M via 10b5-1 plan (15 filings) - preset, low signal | $17.1M tax-withhold (mechanical) | 19 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$24.4M preset 10b5-1 plan<br><span style='color:#bdc3c7;'>scheduled trades</span></div></td><td data-sort='76.6'><span class='verdict' style='background:#2c3e50;cursor:help;' title='Hold: Strong upside to target (+47%), but Downtrend (-14% vs 200d)
+Composite Score 75
+-10 · Downtrend (-14% vs 200d)
++6 · Strong upside to target (+47%)
++5 · Passes all 9 quality filters
++5 · Near 52w low (15%) with intact fundamentals
+-4 · Cool sector momentum
+= verdict score 77'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-up);font-variant-numeric:tabular-nums;'>77</span></td></tr>
+<tr data-verdict='HOLD' data-verdict-score='73.9' data-quality='9' data-gain='18010.0' data-gain-pct='187.60416666666666' data-day-pct='-6.223677145884847' data-upside='25.413844259326325' data-bucket='compounder' data-sector-mom='Cool' data-sector='Communication Services' data-pos52='74.3' data-score='70.9' data-insider='no_signal' data-has-insider='1' data-trend='sideways' data-ma-pct='10.9' data-port-pct='16.787285634540243' data-days-held='1148' data-recommendation='strong_buy' data-has-tax='0' data-search='googl alphabet communication services'><td class='ticker' data-sort='GOOGL'><span class='ticker' style='cursor:help;' title='Alphabet Inc. offers various products and platforms in the United States, Europe, the Middle East, Africa, the Asia-Pacific, Canada, and Latin America. It operates through Google Services, Google Cloud, and Other Bets segments.'>GOOGL</span></td><td data-sort='Alphabet'><div style='font-weight:500;cursor:help;' title='Alphabet Inc. offers various products and platforms in the United States, Europe, the Middle East, Africa, the Asia-Pacific, Canada, and Latin America. It operates through Google Services, Google Cloud, and Other Bets segments.'>Alphabet</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Communication Services <span title="XLC: -7.5% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#2980b9;padding:1px 5px;border-radius:6px;margin-left:3px;'>❄️ Cool</span></div></td><td class='num' data-sort='27610.0'><div>$27,610.00</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>16.79%</div></td><td class='num' data-sort='18010.0'><div>$120.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$18,010.00 (+187.6%)</div></td><td class='num' data-sort='25.413844259326325'><div><strong>$345.12</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $432.83</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+25.4% upside</div></td><td class='num' data-sort='-6.223677145884847'><div class='pos-down' style='font-weight:600;'>-6.22%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-1,832.40</div></td><td data-sort='74.3'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:74%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>74%</span></div><div style='margin-top:3px;'><span title="Price $345.12 · 50d $367.37 · 200d $311.10" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>→ Sideways</span> <span style='color:var(--fg-muted);'>+11%</span></div></td><td data-sort='9'><span title="Revenue growth >=10%: 12.5% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 30.1% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 26.3 trailing / 23.8 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 1.4% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 29.6% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 30.5% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.2% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 27.9% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 1.7% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>9/9</span></td><td class='num' data-sort='70.9'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 71
+
+Quality  93
+Growth   71
+Value    50
+Analyst  78
+Insider  48' style='font-weight:700;color:var(--pos-up);font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>71</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 93'>Q</span><span style='color:var(--pos-up);' title='Growth: 71'>G</span><span style='color:#e67e22;' title='Value: 50'>V</span><span style='color:var(--pos-up);' title='Analyst: 78'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.8888888888888888'><div title="56 Buy · 7 Hold · 0 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:88.9%;background:#27ae60;"></div><div style="width:11.1%;background:#f39c12;"></div></div><div title="56 Buy · 7 Hold · 0 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">56</span>·<span style="color:#f39c12;">7</span>·<span style="color:#c0392b;">0</span><span style="color:var(--fg-faint);"> 63</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 9 open-market sell(s) | 43 total Form 4 filings | $3.5M discretionary selling | $3.9M via 10b5-1 plan (8 filings) - preset, low signal | $18.2M tax-withhold (mechanical) | 37 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$3.5M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='73.9'><span class='verdict' style='background:#2c3e50;cursor:help;' title='Hold: Strong upside to target (+25%), but Cool sector momentum
+Composite Score 71
++6 · Strong upside to target (+25%)
++5 · Passes all 9 quality filters
+-4 · Cool sector momentum
+-4 · Already overweight (17% of portfolio)
+= verdict score 74'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-up);font-variant-numeric:tabular-nums;'>74</span></td></tr>
+<tr data-verdict='HOLD' data-verdict-score='69.7' data-quality='9' data-gain='6134.0' data-gain-pct='49.071999999999996' data-day-pct='-1.7712179757511861' data-upside='50.635298379306626' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='8.2' data-score='60.7' data-insider='no_signal' data-has-insider='1' data-trend='downtrend' data-ma-pct='-17.4' data-port-pct='11.329745762912816' data-days-held='1254' data-recommendation='strong_buy' data-has-tax='0' data-search='msft microsoft technology'><td class='ticker' data-sort='MSFT'><span class='ticker' style='cursor:help;' title='Microsoft Corporation develops and supports software, services, devices, and solutions worldwide. The Productivity and Business Processes segment offers Microsoft 365 commercial, enterprise mobility + security, windows commercial, power BI, exchange, sharepoint, Microsoft team...'>MSFT</span></td><td data-sort='Microsoft'><div style='font-weight:500;cursor:help;' title='Microsoft Corporation develops and supports software, services, devices, and solutions worldwide. The Productivity and Business Processes segment offers Microsoft 365 commercial, enterprise mobility + security, windows commercial, power BI, exchange, sharepoint, Microsoft team...'>Microsoft</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +28.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='18634.0'><div>$18,634.00</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>11.33%</div></td><td class='num' data-sort='6134.0'><div>$250.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$6,134.00 (+49.1%)</div></td><td class='num' data-sort='50.635298379306626'><div><strong>$372.68</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $561.39</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+50.6% upside</div></td><td class='num' data-sort='-1.7712179757511861'><div class='pos-down' style='font-weight:600;'>-1.77%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-336.00</div></td><td data-sort='8.2'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:8%;top:-3px;width:3px;height:12px;background:#2980b9;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>8% · near low</span></div><div style='margin-top:3px;'><span title="Price $372.68 · 50d $412.98 · 200d $451.35" style='display:inline-block;background:#f8d7da;color:#a02622;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↓ Down</span> <span style='color:var(--fg-muted);'>-17%</span></div></td><td data-sort='9'><span title="Revenue growth >=10%: 12.4% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 11.9% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 22.2 trailing / 19.3 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 1.2% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 32.5% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 44.0% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.3% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 37.0% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 1.1% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>9/9</span></td><td class='num' data-sort='60.7'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 61
+
+Quality  68
+Growth   40
+Value    65
+Analyst  79
+Insider  48' style='font-weight:700;color:#7d9b3a;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>61</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 68'>Q</span><span style='color:#e67e22;' title='Growth: 40'>G</span><span style='color:var(--pos-up);' title='Value: 65'>V</span><span style='color:var(--pos-up);' title='Analyst: 79'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.9464285714285714'><div title="53 Buy · 3 Hold · 0 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:94.6%;background:#27ae60;"></div><div style="width:5.4%;background:#f39c12;"></div></div><div title="53 Buy · 3 Hold · 0 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">53</span>·<span style="color:#f39c12;">3</span>·<span style="color:#c0392b;">0</span><span style="color:var(--fg-faint);"> 56</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 4 open-market sell(s) | 31 total Form 4 filings | $10.5M discretionary selling | $968k tax-withhold (mechanical) | 4 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$10.5M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='69.7'><span class='verdict' style='background:#2c3e50;cursor:help;' title='Hold: Strong upside to target (+51%), but Downtrend (-17% vs 200d)
+Composite Score 61
+-10 · Downtrend (-17% vs 200d)
++6 · Strong upside to target (+51%)
++5 · Passes all 9 quality filters
++5 · Hot sector momentum
++5 · Near 52w low (8%) with intact fundamentals
+-2 · Sizeable position (11% of portfolio)
+= verdict score 70'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--fg-strong);font-variant-numeric:tabular-nums;'>70</span></td></tr>
+<tr data-verdict='HOLD' data-verdict-score='54.9' data-quality='7' data-gain='-3679.5499999999997' data-gain-pct='-55.33157894736842' data-day-pct='-0.1764219007292402' data-upside='21.461340874278296' data-bucket='compounder' data-sector-mom='Cool' data-sector='Financial Services' data-pos52='9.7' data-score='57.9' data-insider='no_signal' data-has-insider='1' data-trend='downtrend' data-ma-pct='-22.7' data-port-pct='1.8060772406055803' data-days-held='1329' data-recommendation='hold' data-has-tax='0' data-search='pypl paypal financial services'><td class='ticker' data-sort='PYPL'><span class='ticker' style='cursor:help;' title='PayPal Holdings, Inc. operates a technology platform that enables digital payments for merchants and consumers worldwide. The company operates a two-sided network at scale that connects merchants and consumers that enables its customers to connect, transact, and send and recei...'>PYPL</span></td><td data-sort='PayPal'><div style='font-weight:500;cursor:help;' title='PayPal Holdings, Inc. operates a technology platform that enables digital payments for merchants and consumers worldwide. The company operates a two-sided network at scale that connects merchants and consumers that enables its customers to connect, transact, and send and recei...'>PayPal</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Financial Services <span title="XLF: +2.3% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#2980b9;padding:1px 5px;border-radius:6px;margin-left:3px;'>❄️ Cool</span></div></td><td class='num' data-sort='2970.4500000000003'><div>$2,970.45</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>1.81%</div></td><td class='num' data-sort='-3679.5499999999997'><div>$95.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-down'>$-3,679.55 (-55.3%)</div></td><td class='num' data-sort='21.461340874278296'><div><strong>$42.44</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $51.54</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+21.5% upside</div></td><td class='num' data-sort='-0.1764219007292402'><div class='pos-down' style='font-weight:600;'>-0.18%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-5.25</div></td><td data-sort='9.7'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:10%;top:-3px;width:3px;height:12px;background:#2980b9;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>10% · near low</span></div><div style='margin-top:3px;'><span title="Price $42.44 · 50d $45.86 · 200d $54.87" style='display:inline-block;background:#f8d7da;color:#a02622;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↓ Down</span> <span style='color:var(--fg-muted);'>-23%</span></div></td><td data-sort='7'><span title="Revenue growth >=10%: 6.4% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="EPS growth >=10%: 29.3% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 8.0 trailing / 7.4 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 0.8% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 22.1% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 18.0% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.6% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 4.1% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 0.2% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>7/9</span></td><td class='num' data-sort='57.9'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 58
+
+Quality  43
+Growth   60
+Value    82
+Analyst  62
+Insider  50' style='font-weight:700;color:#7d9b3a;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>58</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:#e67e22;' title='Quality: 43'>Q</span><span style='color:#e67e22;' title='Growth: 60'>G</span><span style='color:var(--pos-up);' title='Value: 82'>V</span><span style='color:var(--pos-up);' title='Analyst: 62'>A</span><span style='color:#e67e22;' title='Insider: 50'>I</span></span></div></td><td data-sort='0.09302325581395349'><div title="8 Buy · 31 Hold · 4 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:18.6%;background:#27ae60;"></div><div style="width:72.1%;background:#f39c12;"></div><div style="width:9.3%;background:#c0392b;"></div></div><div title="8 Buy · 31 Hold · 4 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">8</span>·<span style="color:#f39c12;">31</span>·<span style="color:#c0392b;">4</span><span style="color:var(--fg-faint);"> 43</span></div></td><td data-sort='50'><span title="Underlying signal: Scheduled selling | 1 open-market buy(s), 4 open-market sell(s) | 30 total Form 4 filings | $255k bought (P-code, discretionary) | $810k via 10b5-1 plan (4 filings) - preset, low signal | $1.4M tax-withhold (mechanical) | 22 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$810k preset 10b5-1 plan<br><span style='color:#bdc3c7;'>scheduled trades</span></div></td><td data-sort='54.9'><span class='verdict' style='background:#7f8c8d;cursor:help;' title='Hold: Strong upside to target (+21%), but Downtrend (-23% vs 200d)
+Composite Score 58
+-10 · Downtrend (-23% vs 200d)
++6 · Strong upside to target (+21%)
++5 · Near 52w low (10%) with intact fundamentals
+-4 · Cool sector momentum
+= verdict score 55'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--fg-strong);font-variant-numeric:tabular-nums;'>55</span></td></tr>
+<tr data-verdict='HOLD' data-verdict-score='53.7' data-quality='6' data-gain='24284.4' data-gain-pct='289.1' data-day-pct='1.3714935705379907' data-upside='-10.435099313433929' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='95.8' data-score='55.7' data-insider='no_signal' data-has-insider='1' data-trend='uptrend' data-ma-pct='108.6' data-port-pct='19.872595385496815' data-days-held='203' data-recommendation='strong_buy' data-has-tax='0' data-search='amd advanced micro devices technology'><td class='ticker' data-sort='AMD'><span class='ticker' style='cursor:help;' title='Advanced Micro Devices, Inc. operates as a semiconductor company internationally. It operates in three segments: Data Center, Client and Gaming, and Embedded.'>AMD</span></td><td data-sort='Advanced Micro Devices'><div style='font-weight:500;cursor:help;' title='Advanced Micro Devices, Inc. operates as a semiconductor company internationally. It operates in three segments: Data Center, Client and Gaming, and Embedded.'>Advanced Micro Devices</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +28.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='32684.4'><div>$32,684.40</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>19.87%</div></td><td class='num' data-sort='24284.4'><div>$140.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$24,284.40 (+289.1%)</div></td><td class='num' data-sort='-10.435099313433929'><div><strong>$544.74</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $487.90</span></div><div style='font-size:10px;margin-top:1px;' class='pos-down'>-10.4% upside</div></td><td class='num' data-sort='1.3714935705379907'><div class='pos-up' style='font-weight:600;'>+1.37%</div><div class='pos-up' style='font-size:10px;margin-top:1px;'>$442.20</div></td><td data-sort='95.8'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:96%;top:-3px;width:3px;height:12px;background:#e67e22;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>96% · near high</span></div><div style='margin-top:3px;'><span title="Price $544.74 · 50d $411.05 · 200d $261.15" style='display:inline-block;background:#d4edda;color:#1e7e34;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↑ Up</span> <span style='color:var(--fg-muted);'>+109%</span></div></td><td data-sort='6'><span title="Revenue growth >=10%: 13.6% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="EPS growth >=10%: 48.6% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 181.0 trailing / 41.6 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="PEG < 2: 1.3% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="ROE >= 15%: 3.8% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Op margin >= 15%: 6.8% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.1% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 7.2% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 1.8% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>6/9</span></td><td class='num' data-sort='55.7'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 56
+
+Quality  63
+Growth   73
+Value    18
+Analyst  76
+Insider  48' style='font-weight:700;color:#7d9b3a;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>56</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-up);' title='Quality: 63'>Q</span><span style='color:var(--pos-up);' title='Growth: 73'>G</span><span style='color:var(--pos-down);' title='Value: 18'>V</span><span style='color:var(--pos-up);' title='Analyst: 76'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.8235294117647058'><div title="42 Buy · 9 Hold · 0 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:82.4%;background:#27ae60;"></div><div style="width:17.6%;background:#f39c12;"></div></div><div title="42 Buy · 9 Hold · 0 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">42</span>·<span style="color:#f39c12;">9</span>·<span style="color:#c0392b;">0</span><span style="color:var(--fg-faint);"> 51</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 10 open-market sell(s) | 20 total Form 4 filings | $16.3M discretionary selling | $148.2M via 10b5-1 plan (8 filings) - preset, low signal | $1.6M tax-withhold (mechanical) | 9 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$16.3M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='53.7'><span class='verdict' style='background:#7f8c8d;cursor:help;' title='Hold: Uptrend (+109% vs 200d), but Fails 3/9 quality filters
+Composite Score 56
++12 · Uptrend (+109% vs 200d)
+-8 · Fails 3/9 quality filters
++5 · Hot sector momentum
+-4 · Near 52w high (96%)
+-4 · Already overweight (20% of portfolio)
+-3 · Slightly above target (-10%)
+= verdict score 54'>HOLD</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--fg-strong);font-variant-numeric:tabular-nums;'>54</span></td></tr>
+<tr data-verdict='TRIM' data-verdict-score='36.7' data-quality='3' data-gain='13496.399999999998' data-gain-pct='99.97333333333331' data-day-pct='0.6543343176403477' data-upside='4.8219095879450755' data-bucket='compounder' data-sector-mom='Hot' data-sector='Technology' data-pos52='85.3' data-score='40.7' data-insider='no_signal' data-has-insider='1' data-trend='uptrend' data-ma-pct='11.8' data-port-pct='16.414207819786387' data-days-held='1565' data-recommendation='buy' data-has-tax='1' data-search='aapl apple technology'><td class='ticker' data-sort='AAPL'><span class='ticker' style='cursor:help;' title='Apple Inc. designs, manufactures, and markets smartphones, personal computers, tablets, wearables, and accessories worldwide. The company offers iPhone, a line of smartphones; Mac, a line of personal computers; iPad, a line of multi-purpose tablets; and wearables, home, and ac...'>AAPL</span></td><td data-sort='Apple'><div style='font-weight:500;cursor:help;' title='Apple Inc. designs, manufactures, and markets smartphones, personal computers, tablets, wearables, and accessories worldwide. The company offers iPhone, a line of smartphones; Mac, a line of personal computers; iPad, a line of multi-purpose tablets; and wearables, home, and ac...'>Apple</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Technology <span title="XLK: +28.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#c0392b;padding:1px 5px;border-radius:6px;margin-left:3px;'>🔥 Hot</span></div></td><td class='num' data-sort='26996.399999999998'><div>$26,996.40</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>16.41%</div></td><td class='num' data-sort='13496.399999999998'><div>$150.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$13,496.40 (+100.0%)</div></td><td class='num' data-sort='4.8219095879450755'><div><strong>$299.96</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $314.42</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+4.8% upside</div></td><td class='num' data-sort='0.6543343176403477'><div class='pos-up' style='font-weight:600;'>+0.65%</div><div class='pos-up' style='font-size:10px;margin-top:1px;'>$175.50</div></td><td data-sort='85.3'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:85%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>85%</span></div><div style='margin-top:3px;'><span title="Price $299.96 · 50d $288.74 · 200d $268.19" style='display:inline-block;background:#d4edda;color:#1e7e34;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>↑ Up</span> <span style='color:var(--fg-muted);'>+12%</span></div></td><td data-sort='3'><span title="Revenue growth >=10%: 1.8% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="EPS growth >=10%: 3.9% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="P/E < 30: 36.4 trailing / 31.2 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="PEG < 2: 2.4% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="ROE >= 15%: 157.5% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 31.1% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.8% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 101.1% ($B (3/3 yrs +, declining)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Quick ratio > 1.0: 0.9% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>3/9</span></td><td class='num' data-sort='40.7'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 41
+
+Quality  59
+Growth   10
+Value    16
+Analyst  71
+Insider  48' style='font-weight:700;color:#e67e22;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>41</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:#e67e22;' title='Quality: 59'>Q</span><span style='color:var(--pos-down);' title='Growth: 10'>G</span><span style='color:var(--pos-down);' title='Value: 16'>V</span><span style='color:var(--pos-up);' title='Analyst: 71'>A</span><span style='color:#e67e22;' title='Insider: 48'>I</span></span></div></td><td data-sort='0.5531914893617021'><div title="29 Buy · 15 Hold · 3 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:61.7%;background:#27ae60;"></div><div style="width:31.9%;background:#f39c12;"></div><div style="width:6.4%;background:#c0392b;"></div></div><div title="29 Buy · 15 Hold · 3 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">29</span>·<span style="color:#f39c12;">15</span>·<span style="color:#c0392b;">3</span><span style="color:var(--fg-faint);"> 47</span></div></td><td data-sort='48'><span title="Underlying signal: Selling | 0 open-market buy(s), 7 open-market sell(s) | 11 total Form 4 filings | $86.7M discretionary selling | $25.0M via 10b5-1 plan (5 filings) - preset, low signal | $40.7M tax-withhold (mechanical) | 9 grants/exercises | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>-$86.7M disc. · small for size<br><span style='color:#bdc3c7;'>tiny vs market cap</span></div></td><td data-sort='36.7'><span class='verdict' style='background:#e67e22;cursor:help;' title='Trim candidate: Fails 6/9 quality filters
+Composite Score 41
+-15 · Fails 6/9 quality filters
++10 · Uptrend (+12% vs 200d)
++5 · Hot sector momentum
+-4 · Already overweight (16% of portfolio)
+= verdict score 37'>TRIM</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:#e67e22;font-variant-numeric:tabular-nums;'>37</span></td></tr>
+<tr data-verdict='TRIM' data-verdict-score='32.9' data-quality='4' data-gain='2296.25' data-gain-pct='31.89236111111111' data-day-pct='-0.19181377896894214' data-upside='14.038625773331578' data-bucket='compounder' data-sector-mom='Neutral' data-sector='Consumer Defensive' data-pos52='41.8' data-score='44.9' data-insider='no_signal' data-has-insider='1' data-trend='sideways' data-ma-pct='-0.9' data-port-pct='5.773859514922231' data-days-held='1056' data-recommendation='buy' data-has-tax='1' data-search='cost costco consumer defensive'><td class='ticker' data-sort='COST'><span class='ticker' style='cursor:help;' title='Costco Wholesale Corporation, together with its subsidiaries, engages in the operation of membership warehouses in the United States, Puerto Rico, Canada, Mexico, Japan, the United Kingdom, Korea, Australia, Taiwan, China, Spain, France, Iceland, New Zealand, and Sweden.'>COST</span></td><td data-sort='Costco'><div style='font-weight:500;cursor:help;' title='Costco Wholesale Corporation, together with its subsidiaries, engages in the operation of membership warehouses in the United States, Puerto Rico, Canada, Mexico, Japan, the United Kingdom, Korea, Australia, Taiwan, China, Spain, France, Iceland, New Zealand, and Sweden.'>Costco</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Consumer Defensive <span title="XLP: +1.6% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#7f8c8d;padding:1px 5px;border-radius:6px;margin-left:3px;'>→ Neutral</span></div></td><td class='num' data-sort='9496.25'><div>$9,496.25</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>5.77%</div></td><td class='num' data-sort='2296.25'><div>$720.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-up'>$2,296.25 (+31.9%)</div></td><td class='num' data-sort='14.038625773331578'><div><strong>$949.62</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $1,082.94</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+14.0% upside</div></td><td class='num' data-sort='-0.19181377896894214'><div class='pos-down' style='font-weight:600;'>-0.19%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-18.25</div></td><td data-sort='41.8'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:42%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>42%</span></div><div style='margin-top:3px;'><span title="Price $949.62 · 50d $1001.08 · 200d $957.95" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>→ Sideways</span> <span style='color:var(--fg-muted);'>-1%</span></div></td><td data-sort='4'><span title="Revenue growth >=10%: 6.6% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="EPS growth >=10%: 11.5% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="P/E < 30: 47.7 trailing / 42.0 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="PEG < 2: 4.6% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="ROE >= 15%: 28.0% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Op margin >= 15%: 3.6% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.6% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 7.0% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 0.6% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>4/9</span></td><td class='num' data-sort='44.9'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 45
+
+Quality  54
+Growth   30
+Value    23
+Analyst  71
+Insider  50' style='font-weight:700;color:#e67e22;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>45</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:#e67e22;' title='Quality: 54'>Q</span><span style='color:var(--pos-down);' title='Growth: 30'>G</span><span style='color:var(--pos-down);' title='Value: 23'>V</span><span style='color:var(--pos-up);' title='Analyst: 71'>A</span><span style='color:#e67e22;' title='Insider: 50'>I</span></span></div></td><td data-sort='0.5405405405405406'><div title="22 Buy · 13 Hold · 2 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:59.5%;background:#27ae60;"></div><div style="width:35.1%;background:#f39c12;"></div><div style="width:5.4%;background:#c0392b;"></div></div><div title="22 Buy · 13 Hold · 2 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">22</span>·<span style="color:#f39c12;">13</span>·<span style="color:#c0392b;">2</span><span style="color:var(--fg-faint);"> 37</span></div></td><td data-sort='50'><span title="Underlying signal: Neutral | 0 open-market buy(s), 1 open-market sell(s) | 1 total Form 4 filings | $695k discretionary selling | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>1 filings<br><span style='color:#bdc3c7;'>no clear direction</span></div></td><td data-sort='32.9'><span class='verdict' style='background:#e67e22;cursor:help;' title='Trim candidate: Fails 5/9 quality filters
+Composite Score 45
+-15 · Fails 5/9 quality filters
++3 · Moderate upside to target (+14%)
+= verdict score 33'>TRIM</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-down);font-variant-numeric:tabular-nums;'>33</span></td></tr>
+<tr data-verdict='SELL' data-verdict-score='27.9' data-quality='4' data-gain='-2532.7500000000005' data-gain-pct='-40.20238095238096' data-day-pct='-0.3768318524395081' data-upside='16.216523989647627' data-bucket='compounder' data-sector-mom='Neutral' data-sector='Healthcare' data-pos52='35.5' data-score='39.9' data-insider='no_signal' data-has-insider='1' data-trend='sideways' data-ma-pct='-2.9' data-port-pct='2.2905433468569982' data-days-held='1178' data-recommendation='buy' data-has-tax='1' data-search='pfe pfizer healthcare'><td class='ticker' data-sort='PFE'><span class='ticker' style='cursor:help;' title='Pfizer Inc. discovers, develops, manufactures, markets, distributes, and sells biopharmaceutical products in the United States and internationally. It operates in three segments: Biopharma, PC1, and Pfizer Ignite.'>PFE</span></td><td data-sort='Pfizer'><div style='font-weight:500;cursor:help;' title='Pfizer Inc. discovers, develops, manufactures, markets, distributes, and sells biopharmaceutical products in the United States and internationally. It operates in three segments: Biopharma, PC1, and Pfizer Ignite.'>Pfizer</div><div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>Healthcare <span title="XLV: +0.1% vs 200d" style='font-size:9px;font-weight:600;color:#fff;background:#7f8c8d;padding:1px 5px;border-radius:6px;margin-left:3px;'>→ Neutral</span></div></td><td class='num' data-sort='3767.2499999999995'><div>$3,767.25</div><div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>2.29%</div></td><td class='num' data-sort='-2532.7500000000005'><div>$42.00 avg</div><div style='font-size:10px;margin-top:1px;' class='pos-down'>$-2,532.75 (-40.2%)</div></td><td class='num' data-sort='16.216523989647627'><div><strong>$25.11</strong> <span style='color:var(--fg-muted);font-size:11px;'>→ $29.19</span></div><div style='font-size:10px;margin-top:1px;' class='pos-up'>+16.2% upside</div></td><td class='num' data-sort='-0.3768318524395081'><div class='pos-down' style='font-weight:600;'>-0.38%</div><div class='pos-down' style='font-size:10px;margin-top:1px;'>$-14.25</div></td><td data-sort='35.5'><div style='display:flex;align-items:center;gap:6px;'><div style='position:relative;width:54px;height:6px;background:var(--bg-chip-neutral);border-radius:3px;'><div style='position:absolute;left:36%;top:-3px;width:3px;height:12px;background:#95a5a6;border-radius:2px;'></div></div><span style='font-size:10px;color:var(--fg-muted);'>36%</span></div><div style='margin-top:3px;'><span title="Price $25.11 · 50d $26.25 · 200d $25.88" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;'>→ Sideways</span> <span style='color:var(--fg-muted);'>-3%</span></div></td><td data-sort='4'><span title="Revenue growth >=10%: -14.8% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="EPS growth >=10%: -37.2% (3yr CAGR) (threshold >= 10%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="P/E < 30: 19.2 trailing / 8.9 fwd (threshold < 30)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="PEG < 2: 13.8% (threshold < 2)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="ROE >= 15%: 6.8% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span><span title="Op margin >= 15%: 19.6% (3yr avg) (threshold >= 15%)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Debt/Equity < 1: 0.7% (threshold < 1)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="FCF positive & growing: 12.4% ($B (3/3 yrs +, growing)) (threshold > 0, all yrs)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#27ae60;margin:0 1px;"></span><span title="Quick ratio > 1.0: 0.9% (threshold > 1.0)" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#c0392b;margin:0 1px;"></span> <span style='color:var(--fg-muted);font-size:11px'>4/9</span></td><td class='num' data-sort='39.9'><div style='display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;'><span title='Composite Score: 40
+
+Quality  37
+Growth   0
+Value    58
+Analyst  66
+Insider  50' style='font-weight:700;color:#e67e22;font-size:15px;cursor:help;font-variant-numeric:tabular-nums;'>40</span><span style='font-size:9px;font-weight:700;letter-spacing:1.5px;margin-top:1px;cursor:help;'><span style='color:var(--pos-down);' title='Quality: 37'>Q</span><span style='color:var(--pos-down);' title='Growth: 0'>G</span><span style='color:#e67e22;' title='Value: 58'>V</span><span style='color:var(--pos-up);' title='Analyst: 66'>A</span><span style='color:#e67e22;' title='Insider: 50'>I</span></span></div></td><td data-sort='0.3103448275862069'><div title="11 Buy · 16 Hold · 2 Sell · yahoo" style="display:flex;height:9px;border-radius:3px;overflow:hidden;min-width:60px;max-width:84px;margin-bottom:2px;cursor:help;"><div style="width:37.9%;background:#27ae60;"></div><div style="width:55.2%;background:#f39c12;"></div><div style="width:6.9%;background:#c0392b;"></div></div><div title="11 Buy · 16 Hold · 2 Sell · yahoo" style="font-size:10px;cursor:help;font-variant-numeric:tabular-nums;"><span style="color:#27ae60;">11</span>·<span style="color:#f39c12;">16</span>·<span style="color:#c0392b;">2</span><span style="color:var(--fg-faint);"> 29</span></div></td><td data-sort='50'><span title="Underlying signal: Neutral | 0 open-market buy(s), 1 open-market sell(s) | 25 total Form 4 filings | $51k discretionary selling | source: sec" style='display:inline-block;background:#ecf0f1;color:#7f8c8d;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600;'>— No signal</span><div style='font-size:10px;color:#7f8c8d;margin-top:2px;'>25 filings<br><span style='color:#bdc3c7;'>no clear direction</span></div></td><td data-sort='27.9'><span class='verdict' style='background:#c0392b;cursor:help;' title='Weak: Fails 5/9 quality filters
+Composite Score 40
+-15 · Fails 5/9 quality filters
++3 · Moderate upside to target (+16%)
+= verdict score 28'>SELL</span><span style='margin-left:6px;font-weight:600;font-size:13px;color:var(--pos-down);font-variant-numeric:tabular-nums;'>28</span></td></tr>
+</tbody></table></div>
+<h2 style='margin-top:48px;'>Tax-Aware Trim Guidance</h2>
+<p style="color:var(--fg-muted);font-size:12px;margin-top:-6px;margin-bottom:8px;">For positions flagged SELL or TRIM: holding-period status, estimated tax if trimmed now, and the least-taxable ways to do it.</p>
+<p style="background:var(--bg-chip-yellow);border-left:3px solid #f39c12;padding:8px 12px;font-size:11px;color:var(--fg-chip-amber);margin-bottom:18px;border-radius:3px;"><strong>Not tax advice.</strong> When order history is available, lots are reconstructed via FIFO (the IRS default) for exact short/long-term splits. If you manually selected specific lots at past sales, your actual lots may differ. State tax, NIIT, AMT, and your full income picture also matter. Confirm in Robinhood's app and consult a tax professional before acting.</p>
+<h3 style='margin-top:32px;'>Per-Position Trim Detail</h3>
+<div style='border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-card);padding:14px 16px;margin-bottom:14px;'><div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'><span class='ticker' style='font-size:15px;'>AAPL</span><span class='verdict' style='background:#e67e22'>TRIM</span><span style='font-size:11px;background:var(--bg-chip-amber);color:var(--fg-chip-amber);padding:3px 8px;border-radius:4px;'>Mixed: 75 LT + 15 ST</span></div>
+<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'><table style='margin:0;font-size:12px;width:auto;border-collapse:collapse;'><tr><th style='background:#fff;color:#7f8c8d;text-align:left;padding:2px 12px 2px 0;border:none;'></th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Shares</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Unrealized</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Est. tax if sold</th></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-up);'>Long-term</td><td style='text-align:right;padding:2px 12px;border:none;'>75</td><td style='text-align:right;padding:2px 12px;border:none;'>$11,997.00</td><td style='text-align:right;padding:2px 12px;border:none;'>$1,799.55 (15%)</td></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-down);'>Short-term</td><td style='text-align:right;padding:2px 12px;border:none;'>15</td><td style='text-align:right;padding:2px 12px;border:none;'>$1,499.40</td><td style='text-align:right;padding:2px 12px;border:none;'>$359.86 (24%)</td></tr><tr style='border-top:1px solid var(--border-medium);font-weight:600;'><td style='padding:3px 12px 3px 0;border:none;'>Total</td><td style='text-align:right;padding:3px 12px;border:none;'>90</td><td style='text-align:right;padding:3px 12px;border:none;'>$13,496.40</td><td style='text-align:right;padding:3px 12px;border:none;'>$2,159.41</td></tr></table></div>
+<details style='margin-bottom:8px;'><summary style='font-size:11px;color:var(--fg-muted);cursor:pointer;'>View all 3 lot(s)</summary><table style='margin:6px 0 0;font-size:11px;'><thead><tr><th>Purchased</th><th class='num'>Shares</th><th class='num'>Buy Price</th><th class='num'>Held (days)</th><th>Status</th><th class='num'>Unrealized</th></tr></thead><tbody><tr><td>2022-08-15</td><td class='num'>50</td><td class='num'>$130.00</td><td class='num'>1407</td><td><span style='color:var(--pos-up);'>LT</span></td><td class='num' style='color:var(--pos-up);'>$8,498.00</td></tr><tr><td>2024-01-20</td><td class='num'>25</td><td class='num'>$160.00</td><td class='num'>884</td><td><span style='color:var(--pos-up);'>LT</span></td><td class='num' style='color:var(--pos-up);'>$3,499.00</td></tr><tr><td>2026-04-10</td><td class='num'>15</td><td class='num'>$200.00</td><td class='num'>73</td><td><span style='color:#a02622;'>ST (293d to LT)</span></td><td class='num' style='color:var(--pos-up);'>$1,499.40</td></tr></tbody></table></div></details>
+<div style='font-size:12px;color:#34495e;background:#f8f9fa;padding:8px 10px;border-radius:4px;margin-bottom:8px;'>⏱ You hold a mix: 75 long-term share(s) and 15 short-term. Trim the long-term shares first for the lower rate.</div>
+<ul style='margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--fg-body);'><li style='margin-bottom:4px;'>Specifically identify the long-term lots at sale (75 share(s)) so you're taxed at the lower capital-gains rate instead of ordinary rates.</li><li style='margin-bottom:4px;'>Pair the sale with tax-loss harvesting elsewhere this year to offset the realized gain dollar-for-dollar.</li><li style='margin-bottom:4px;'>Spread the trim across two tax years to avoid bunching the gain into one bracket.</li></ul>
+</div>
+<div style='border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-card);padding:14px 16px;margin-bottom:14px;'><div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'><span class='ticker' style='font-size:15px;'>COST</span><span class='verdict' style='background:#e67e22'>TRIM</span><span style='font-size:11px;background:var(--bg-chip-amber);color:var(--fg-chip-amber);padding:3px 8px;border-radius:4px;'>Mixed: 6 LT + 4 ST</span></div>
+<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'><table style='margin:0;font-size:12px;width:auto;border-collapse:collapse;'><tr><th style='background:#fff;color:#7f8c8d;text-align:left;padding:2px 12px 2px 0;border:none;'></th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Shares</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Unrealized</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Est. tax if sold</th></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-up);'>Long-term</td><td style='text-align:right;padding:2px 12px;border:none;'>6</td><td style='text-align:right;padding:2px 12px;border:none;'>$1,497.75</td><td style='text-align:right;padding:2px 12px;border:none;'>$224.66 (15%)</td></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-down);'>Short-term</td><td style='text-align:right;padding:2px 12px;border:none;'>4</td><td style='text-align:right;padding:2px 12px;border:none;'>$798.50</td><td style='text-align:right;padding:2px 12px;border:none;'>$191.64 (24%)</td></tr><tr style='border-top:1px solid var(--border-medium);font-weight:600;'><td style='padding:3px 12px 3px 0;border:none;'>Total</td><td style='text-align:right;padding:3px 12px;border:none;'>10</td><td style='text-align:right;padding:3px 12px;border:none;'>$2,296.25</td><td style='text-align:right;padding:3px 12px;border:none;'>$416.30</td></tr></table></div>
+<details style='margin-bottom:8px;'><summary style='font-size:11px;color:var(--fg-muted);cursor:pointer;'>View all 2 lot(s)</summary><table style='margin:6px 0 0;font-size:11px;'><thead><tr><th>Purchased</th><th class='num'>Shares</th><th class='num'>Buy Price</th><th class='num'>Held (days)</th><th>Status</th><th class='num'>Unrealized</th></tr></thead><tbody><tr><td>2023-08-01</td><td class='num'>6</td><td class='num'>$700.00</td><td class='num'>1056</td><td><span style='color:var(--pos-up);'>LT</span></td><td class='num' style='color:var(--pos-up);'>$1,497.75</td></tr><tr><td>2026-02-15</td><td class='num'>4</td><td class='num'>$750.00</td><td class='num'>127</td><td><span style='color:#a02622;'>ST (239d to LT)</span></td><td class='num' style='color:var(--pos-up);'>$798.50</td></tr></tbody></table></div></details>
+<div style='font-size:12px;color:#34495e;background:#f8f9fa;padding:8px 10px;border-radius:4px;margin-bottom:8px;'>⏱ You hold a mix: 6 long-term share(s) and 4 short-term. Trim the long-term shares first for the lower rate.</div>
+<ul style='margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--fg-body);'><li style='margin-bottom:4px;'>Specifically identify the long-term lots at sale (6 share(s)) so you're taxed at the lower capital-gains rate instead of ordinary rates.</li><li style='margin-bottom:4px;'>Pair the sale with tax-loss harvesting elsewhere this year to offset the realized gain dollar-for-dollar.</li><li style='margin-bottom:4px;'>Spread the trim across two tax years to avoid bunching the gain into one bracket.</li></ul>
+</div>
+<div style='border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-card);padding:14px 16px;margin-bottom:14px;'><div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'><span class='ticker' style='font-size:15px;'>PFE</span><span class='verdict' style='background:#c0392b'>SELL</span><span style='font-size:11px;background:var(--bg-chip-amber);color:var(--fg-chip-amber);padding:3px 8px;border-radius:4px;'>Mixed: 100 LT + 50 ST</span></div>
+<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'><table style='margin:0;font-size:12px;width:auto;border-collapse:collapse;'><tr><th style='background:#fff;color:#7f8c8d;text-align:left;padding:2px 12px 2px 0;border:none;'></th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Shares</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Unrealized</th><th style='background:#fff;color:#7f8c8d;text-align:right;padding:2px 12px;border:none;'>Est. tax if sold</th></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-up);'>Long-term</td><td style='text-align:right;padding:2px 12px;border:none;'>100</td><td style='text-align:right;padding:2px 12px;border:none;'>$-1,988.50</td><td style='text-align:right;padding:2px 12px;border:none;'>$0.00</td></tr><tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-down);'>Short-term</td><td style='text-align:right;padding:2px 12px;border:none;'>50</td><td style='text-align:right;padding:2px 12px;border:none;'>$-544.25</td><td style='text-align:right;padding:2px 12px;border:none;'>$0.00</td></tr><tr style='border-top:1px solid var(--border-medium);font-weight:600;'><td style='padding:3px 12px 3px 0;border:none;'>Total</td><td style='text-align:right;padding:3px 12px;border:none;'>150</td><td style='text-align:right;padding:3px 12px;border:none;'>$-2,532.75</td><td style='text-align:right;padding:3px 12px;border:none;'>$0.00</td></tr></table></div>
+<details style='margin-bottom:8px;'><summary style='font-size:11px;color:var(--fg-muted);cursor:pointer;'>View all 2 lot(s)</summary><table style='margin:6px 0 0;font-size:11px;'><thead><tr><th>Purchased</th><th class='num'>Shares</th><th class='num'>Buy Price</th><th class='num'>Held (days)</th><th>Status</th><th class='num'>Unrealized</th></tr></thead><tbody><tr><td>2023-04-01</td><td class='num'>100</td><td class='num'>$45.00</td><td class='num'>1178</td><td><span style='color:var(--pos-up);'>LT</span></td><td class='num' style='color:var(--pos-down);'>$-1,988.50</td></tr><tr><td>2025-09-10</td><td class='num'>50</td><td class='num'>$36.00</td><td class='num'>285</td><td><span style='color:#a02622;'>ST (81d to LT)</span></td><td class='num' style='color:var(--pos-down);'>$-544.25</td></tr></tbody></table></div></details>
+<div style='font-size:12px;color:#34495e;background:#f8f9fa;padding:8px 10px;border-radius:4px;margin-bottom:8px;'>⏱ You hold a mix: 100 long-term share(s) and 50 short-term. Trim the long-term shares first for the lower rate.</div>
+<ul style='margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--fg-body);'><li style='margin-bottom:4px;'>Specifically identify the long-term lots at sale (100 share(s)) so you're taxed at the lower capital-gains rate instead of ordinary rates.</li><li style='margin-bottom:4px;'>Some lots are at a loss: selling those specific lots harvests a deductible capital loss (mind the 30-day wash-sale rule if rebuying).</li></ul>
+</div>
+
+<p style="color:#95a5a6;font-size:11px;margin-top:30px;">
+Prices live via yfinance. Analyst ratings via Finnhub if configured, else yfinance fallback.
+Quality dots: green = pass, red = fail. Hover for actual values.
+Click any column header to sort. Click again to reverse.
+Verdicts are framework outputs, not investment advice.
+</p>
+<script>
+// Measure the sticky h2 height so pinned table headers (thead) sit exactly
+// beneath it (CSS uses top: var(--h2-pin-h)). Re-measured on resize because
+// the h2 height changes with viewport font scaling.
+(function() {
+  function setPinOffset() {
+    var h2 = document.querySelector('h2');
+    if (h2) {
+      // -1px overlap avoids a hairline gap between h2 and pinned thead
+      document.documentElement.style.setProperty(
+        '--h2-pin-h', (h2.offsetHeight - 1) + 'px');
+    }
+  }
+  setPinOffset();
+  window.addEventListener('resize', setPinOffset);
+  window.addEventListener('load', setPinOffset);
+})();
+// Hourly auto-refresh toggle: when enabled (persisted in localStorage), every
+// hour it triggers the GitHub Actions workflow (same flow as the manual
+// Refresh button: dispatch -> poll -> reload when the new report deploys).
+// Fallbacks: no stored token or no refresh widget -> plain page reload; a
+// refresh already in progress -> skip this cycle (its success path reloads).
+// The reload keeps the password session (sessionStorage) and re-arms the
+// timer. A 30s interval checking a deadline (rather than one long setTimeout)
+// survives background-tab throttling and laptop sleep.
+(function() {
+  var KEY = 'auto-reload-hourly';
+  var PERIOD_MS = 3600000;
+  var btn = document.getElementById('autoReloadToggle');
+  if (!btn) return;
+  var timer = null;
+
+  function canDispatch() {
+    var rb = document.getElementById('ghRefreshBtn');
+    return typeof window.ghTriggerRefresh === 'function' && rb &&
+           typeof window.ghHasToken === 'function' && window.ghHasToken();
+  }
+  function label() {
+    if (!btn.classList.contains('active')) {
+      btn.innerHTML = '&#9201; Auto';
+      btn.title = 'Every hour: trigger the GitHub workflow to regenerate the '
+                + 'report, then reload this page when it deploys. (Without a '
+                + 'saved token it only reloads the page.)';
+      return;
+    }
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    var mins = Math.max(1, Math.round((nextAt - Date.now()) / 60000));
+    btn.innerHTML = '&#9201; Auto &middot; ' + mins + 'm';
+    btn.title = 'Auto-refresh is ON — in ~' + mins + ' min: '
+              + (canDispatch()
+                 ? 'trigger the workflow and reload when the new report deploys.'
+                 : 'reload the page (no saved token, so the workflow is not triggered).')
+              + ' Click to turn off.';
+  }
+  function fire() {
+    // Re-arm first so a failed run is retried next hour, not every 30s.
+    btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+    var rb = document.getElementById('ghRefreshBtn');
+    if (rb && rb.disabled) {
+      label();   // a refresh is already running — it reloads the page itself
+      return;
+    }
+    if (canDispatch()) {
+      window.ghTriggerRefresh();
+    } else {
+      location.reload();
+    }
+    label();
+  }
+  function check() {
+    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
+    if (nextAt && Date.now() >= nextAt) { fire(); return; }
+    label();
+  }
+  function setState(on, save, interactive) {
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (save) { try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {} }
+    if (timer) { clearInterval(timer); timer = null; }
+    if (on) {
+      // Ask for the token now (once) so the unattended hourly trigger can
+      // work later — prompting at 3am when the timer fires would be useless.
+      if (interactive && typeof window.ghEnsureToken === 'function'
+          && !((window.ghHasToken && window.ghHasToken()))) {
+        window.ghEnsureToken();
+      }
+      btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
+      timer = setInterval(check, 30000);
+      document.addEventListener('visibilitychange', check);
+    } else {
+      delete btn.dataset.nextAt;
+      document.removeEventListener('visibilitychange', check);
+    }
+    label();
+  }
+  btn.addEventListener('click', function() {
+    setState(!btn.classList.contains('active'), true, true);
+  });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  setState(saved === '1', false, false);
+})();
+(function() {
+  function sortableValue(td) {
+    var s = td.getAttribute('data-sort');
+    if (s === null || s === '') return null;
+    var n = parseFloat(s);
+    return isNaN(n) ? s.toLowerCase() : n;
+  }
+  document.querySelectorAll('table').forEach(function(table) {
+    var headers = table.querySelectorAll('th');
+    headers.forEach(function(th, idx) {
+      th.addEventListener('click', function() {
+        var tbody = table.querySelector('tbody');
+        var rows = Array.from(tbody.querySelectorAll('tr'));
+        var wasAsc = th.classList.contains('sort-asc');
+        // Default to descending on first click (most numeric cols are 'biggest first')
+        var asc = wasAsc ? false : false;
+        // If header was already descending, flip to ascending
+        if (th.classList.contains('sort-desc')) asc = true;
+        // Clear all headers' sort state
+        headers.forEach(function(h) {
+          h.classList.remove('sort-asc'); h.classList.remove('sort-desc');
+        });
+        th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+        rows.sort(function(a, b) {
+          var av = sortableValue(a.children[idx]);
+          var bv = sortableValue(b.children[idx]);
+          // Nulls sort last regardless of direction
+          if (av === null && bv === null) return 0;
+          if (av === null) return 1;
+          if (bv === null) return -1;
+          var cmp;
+          if (typeof av === 'number' && typeof bv === 'number') {
+            cmp = av - bv;
+          } else {
+            cmp = String(av).localeCompare(String(bv));
+          }
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(function(r) { tbody.appendChild(r); });
+      });
+    });
+  });
+})();
+
+/* ---------- Theme toggle ---------- */
+(function() {
+  var btn = document.getElementById('themeToggle');
+  if (!btn) return;
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') || 'light';
+  }
+  function setIcon() {
+    btn.textContent = currentTheme() === 'dark' ? '☀️' : '🌙';
+  }
+  setIcon();
+  btn.addEventListener('click', function() {
+    var next = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('portfolio-theme', next); } catch (e) {}
+    setIcon();
+  });
+})();
+
+/* ---------- Filter bar: multi-select pills + search + more toggle ---------- */
+(function() {
+  var searchInput = document.getElementById('searchInput');
+  var pills = document.querySelectorAll('.filter-pill[data-filter]');
+  var clearBtn = document.getElementById('clearFilters');
+  var moreToggle = document.getElementById('moreToggle');
+  var moreSection = document.getElementById('filterMore');
+  var statusEl = document.getElementById('filterStatus');
+  if (!searchInput || !pills.length) return;
+
+  var activeFilters = new Set();
+
+  function num(s) {
+    if (s === null || s === '') return NaN;
+    var n = parseFloat(s);
+    return isNaN(n) ? NaN : n;
+  }
+
+  function rowMatchesFilter(row, filter) {
+    var verdict = row.getAttribute('data-verdict') || '';
+    var verdictScore = num(row.getAttribute('data-verdict-score'));
+    var quality = num(row.getAttribute('data-quality'));
+    var gain = num(row.getAttribute('data-gain'));
+    var gainPct = num(row.getAttribute('data-gain-pct'));
+    var dayPct = num(row.getAttribute('data-day-pct'));
+    var upside = num(row.getAttribute('data-upside'));
+    var pos52 = num(row.getAttribute('data-pos52'));
+    var score = num(row.getAttribute('data-score'));
+    // Two sector attributes: the raw GICS name (Technology, Healthcare...)
+    // and the momentum label (Hot/Cool/Neutral). Both used by different filters.
+    var sectorRaw = (row.getAttribute('data-sector') || '').toLowerCase();
+    var sectorMom = row.getAttribute('data-sector-mom') || '';
+    var insider = row.getAttribute('data-insider') || '';
+    var hasInsider = row.getAttribute('data-has-insider') || '';
+    var trend = row.getAttribute('data-trend') || '';
+    var maPct = num(row.getAttribute('data-ma-pct'));
+    var portPct = num(row.getAttribute('data-port-pct'));
+    var daysHeld = num(row.getAttribute('data-days-held'));
+    var recommendation = row.getAttribute('data-recommendation') || '';
+    var hasTax = row.getAttribute('data-has-tax') || '0';
+    var bucket = row.getAttribute('data-bucket') || '';
+
+    switch (filter) {
+      // ------------- Essentials (top row) -------------
+      case 'action':          return verdict === 'SELL' || verdict === 'TRIM';
+      case 'buy':             return verdict === 'BUY'  || verdict === 'ADD';
+      case 'high-quality':    return !isNaN(quality) && quality >= 7;
+      case 'hot-sector':      return sectorMom === 'Hot';
+      case 'insider-buy':     return insider === 'supports_buy';
+
+      // ------------- Verdict-specific -------------
+      case 'verdict-add':     return verdict === 'ADD';
+      case 'verdict-hold':    return verdict === 'HOLD';
+      case 'verdict-trim':    return verdict === 'TRIM';
+      case 'verdict-sell':    return verdict === 'SELL';
+      case 'verdict-buy':     return verdict === 'BUY';
+      case 'verdict-watch':   return verdict === 'WATCH';
+      case 'verdict-score-high': return !isNaN(verdictScore) && verdictScore >= 75;
+      case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
+
+      // ------------- Quality / Composite -------------
+      case 'high-score':      return !isNaN(score) && score >= 70;
+      case 'mid-score':       return !isNaN(score) && score >= 50 && score < 70;
+      case 'weak-score':      return !isNaN(score) && score < 40;
+      case 'passes-9':        return !isNaN(quality) && quality === 9;
+      case 'passes-8':        return !isNaN(quality) && quality >= 8;
+      case 'quality-6':       return !isNaN(quality) && quality === 6;
+      case 'low-quality':     return !isNaN(quality) && quality < 5;
+
+      // ------------- Sector momentum -------------
+      case 'cool-sector':     return sectorMom === 'Cool';
+      case 'neutral-sector':  return sectorMom === 'Neutral';
+
+      // ------------- By sector (case-insensitive substring match) -------------
+      case 'sector-technology':         return sectorRaw.indexOf('technolog') !== -1;
+      case 'sector-healthcare':         return sectorRaw.indexOf('healthcare') !== -1;
+      case 'sector-financial':          return sectorRaw.indexOf('financ') !== -1;
+      case 'sector-comm':               return sectorRaw.indexOf('communication') !== -1;
+      case 'sector-consumer-cyclical':  return sectorRaw.indexOf('consumer cyclical') !== -1
+                                            || sectorRaw.indexOf('discretionary') !== -1;
+      case 'sector-consumer-defensive': return sectorRaw.indexOf('consumer defensive') !== -1
+                                            || sectorRaw.indexOf('staples') !== -1;
+      case 'sector-energy':             return sectorRaw.indexOf('energy') !== -1;
+      case 'sector-industrials':        return sectorRaw.indexOf('industrial') !== -1;
+      case 'sector-utilities':          return sectorRaw.indexOf('utilit') !== -1;
+      case 'sector-real-estate':        return sectorRaw.indexOf('real estate') !== -1;
+      case 'sector-basic-materials':    return sectorRaw.indexOf('basic material') !== -1
+                                            || sectorRaw.indexOf('materials') !== -1;
+
+      // ------------- Trend -------------
+      case 'uptrend':         return trend === 'uptrend';
+      case 'sideways':        return trend === 'sideways';
+      case 'downtrend':       return trend === 'downtrend';
+      case 'far-above-ma':    return !isNaN(maPct) && maPct >= 25;
+      case 'far-below-ma':    return !isNaN(maPct) && maPct <= -15;
+      case 'near-200d-ma':    return !isNaN(maPct) && Math.abs(maPct) <= 5;
+
+      // ------------- Price action -------------
+      case 'winners':
+        if (!isNaN(gain))   return gain > 0;
+        if (!isNaN(upside)) return upside > 0;
+        return false;
+      case 'big-winners':     return !isNaN(gainPct) && gainPct >= 25;
+      case 'huge-winners':    return !isNaN(gainPct) && gainPct >= 100;
+      case 'losers':
+        if (!isNaN(gain))   return gain < 0;
+        if (!isNaN(upside)) return upside < 0;
+        return false;
+      case 'beaten-down':     return !isNaN(gainPct) && gainPct <= -15;
+      case 'deep-losers':     return !isNaN(gainPct) && gainPct <= -30;
+      case 'near-low':        return !isNaN(pos52) && pos52 <= 25;
+      case 'mid-range':       return !isNaN(pos52) && pos52 >= 40 && pos52 <= 70;
+      case 'near-high':       return !isNaN(pos52) && pos52 >= 90;
+      case 'big-upside':      return !isNaN(upside) && upside >= 20;
+      case 'massive-upside':  return !isNaN(upside) && upside >= 40;
+      case 'overvalued':      return !isNaN(upside) && upside < 0;
+      case 'very-overvalued': return !isNaN(upside) && upside <= -15;
+
+      // ------------- Today's move -------------
+      case 'up-today':        return !isNaN(dayPct) && dayPct > 0;
+      case 'down-today':      return !isNaN(dayPct) && dayPct < 0;
+      case 'big-up-today':    return !isNaN(dayPct) && dayPct >= 3;
+      case 'big-down-today':  return !isNaN(dayPct) && dayPct <= -3;
+
+      // ------------- Analyst rating -------------
+      case 'analyst-strong-buy': return recommendation === 'strong_buy';
+      case 'analyst-buy':        return recommendation === 'buy';
+      case 'analyst-hold':       return recommendation === 'hold';
+      case 'analyst-sell':       return recommendation === 'sell' || recommendation === 'strong_sell';
+
+      // ------------- Insider -------------
+      case 'insider-caution':   return insider === 'caution';
+      case 'insider-no-signal': return insider === 'no_signal';
+      case 'has-insider-data':  return hasInsider === '1';
+
+      // ------------- Position size -------------
+      case 'very-large-position': return !isNaN(portPct) && portPct >= 20;
+      case 'large-position':      return !isNaN(portPct) && portPct >= 10;
+      case 'mid-position':        return !isNaN(portPct) && portPct >= 2 && portPct < 10;
+      case 'small-position':      return !isNaN(portPct) && portPct > 0 && portPct < 2;
+
+      // ------------- Holding period -------------
+      case 'long-term':       return !isNaN(daysHeld) && daysHeld > 365;
+      case 'short-term':      return !isNaN(daysHeld) && daysHeld <= 365;
+      case 'approaching-lt':  return !isNaN(daysHeld) && daysHeld >= 275 && daysHeld <= 365;
+      case 'recent-buy':      return !isNaN(daysHeld) && daysHeld < 30;
+
+      // ------------- Tax -------------
+      case 'has-tax-flag':       return hasTax === '1';
+      case 'tax-loss-candidate': return !isNaN(gainPct) && gainPct <= -5;
+
+      // ------------- Type -------------
+      case 'compounder-only': return bucket === 'compounder';
+      case 'thematic-only':   return bucket === 'thematic' || bucket === 'etf';
+
+      default: return true;
+    }
+  }
+
+  function applyFilters() {
+    var searchTerm = searchInput.value.trim().toLowerCase();
+    var visible = 0, total = 0;
+
+    document.querySelectorAll('tbody tr').forEach(function(row) {
+      total++;
+      var searchData = row.getAttribute('data-search') || '';
+      var matches = !searchTerm || searchData.indexOf(searchTerm) !== -1;
+      if (matches && activeFilters.size > 0) {
+        for (var f of activeFilters) {
+          if (!rowMatchesFilter(row, f)) { matches = false; break; }
+        }
+      }
+      row.style.display = matches ? '' : 'none';
+      if (matches) visible++;
+    });
+
+    // Hide empty tables (and their .table-wrap + preceding h3 sub-heading)
+    document.querySelectorAll('.table-wrap').forEach(function(wrap) {
+      var anyVisible = false;
+      wrap.querySelectorAll('tbody tr').forEach(function(r) {
+        if (r.style.display !== 'none') anyVisible = true;
+      });
+      wrap.style.display = anyVisible ? '' : 'none';
+      var prev = wrap.previousElementSibling;
+      while (prev && prev.tagName !== 'H2' && prev.tagName !== 'H3') {
+        prev = prev.previousElementSibling;
+      }
+      if (prev && prev.tagName === 'H3') {
+        prev.style.display = anyVisible ? '' : 'none';
+      }
+    });
+
+    if (statusEl) {
+      if (visible === total && !searchTerm && activeFilters.size === 0) {
+        statusEl.textContent = 'Showing all ' + total;
+      } else {
+        var bits = [];
+        if (activeFilters.size) bits.push(activeFilters.size + ' filter' + (activeFilters.size > 1 ? 's' : ''));
+        if (searchTerm) bits.push('search');
+        var suffix = bits.length ? ' (' + bits.join(' + ') + ')' : '';
+        statusEl.textContent = 'Showing ' + visible + ' of ' + total + suffix;
+      }
+    }
+    if (clearBtn) {
+      var hasAny = activeFilters.size > 0 || !!searchTerm;
+      clearBtn.style.opacity = hasAny ? '1' : '0.4';
+      clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
+    }
+    // Highlight the More-filters button when advanced filters are active,
+    // WITHOUT force-opening — the panel is hover/scroll controlled below, so
+    // it stays hidden until hovered even while an advanced filter is on.
+    if (moreSection && moreToggle) {
+      var anyMoreActive =
+        moreSection.querySelectorAll('.filter-pill.active').length > 0;
+      moreToggle.classList.toggle('expanded', anyMoreActive);
+    }
+  }
+
+  // Pills toggle on click (multi-select)
+  pills.forEach(function(pill) {
+    pill.addEventListener('click', function() {
+      var f = pill.getAttribute('data-filter');
+      if (activeFilters.has(f)) {
+        activeFilters.delete(f);
+        pill.classList.remove('active');
+      } else {
+        activeFilters.add(f);
+        pill.classList.add('active');
+      }
+      applyFilters();
+      recordUsageDebounced();   // learn the user's combos over time
+      renderFreqActive();
+    });
+  });
+
+  // Clear-all
+  if (clearBtn) {
+    clearBtn.addEventListener('click', function() {
+      activeFilters.clear();
+      pills.forEach(function(p) { p.classList.remove('active'); });
+      searchInput.value = '';
+      applyFilters();
+      renderFreqActive();
+    });
+  }
+
+  // More-filters: hover the button to open; auto-hide when the pointer
+  // leaves the filter bar or the page scrolls. Click still toggles — needed
+  // on touch devices, where hover/mouseleave don't fire. The 'expanded'
+  // highlight (active advanced filters) is managed separately in applyFilters,
+  // so only the arrow + .show reflect open/closed here.
+  if (moreToggle && moreSection) {
+    function openMore() {
+      moreSection.classList.add('show');
+      moreToggle.textContent = 'More filters ▴';
+    }
+    function closeMore() {
+      if (!moreSection.classList.contains('show')) return;
+      moreSection.classList.remove('show');
+      moreToggle.textContent = 'More filters ▾';
+    }
+    moreToggle.addEventListener('mouseenter', openMore);
+    moreToggle.addEventListener('click', function() {
+      moreSection.classList.contains('show') ? closeMore() : openMore();
+    });
+    var filterBar = moreToggle.closest('.filter-bar');
+    if (filterBar) filterBar.addEventListener('mouseleave', closeMore);
+    window.addEventListener('scroll', closeMore, { passive: true });
+  }
+
+  // ----- Frequent filter combos -----
+  // Most-used filter combinations, persisted in localStorage and shown as ★
+  // pills at the top — adapting to how you actually filter. localStorage is
+  // per-origin, so this history survives every regenerated/republished report.
+  var freqEl = document.getElementById('freqFilters');
+  var USAGE_KEY = 'filterComboUsage';
+  var FREQ_MAX = 6;   // how many ★ combo pills to show
+  // Seed (and fallback) combos = the former fixed quick-picks.
+  var DEFAULT_COMBOS = [['buy'], ['action'], ['high-quality'],
+                        ['hot-sector'], ['insider-buy']];
+
+  function loadUsage() {
+    try { return JSON.parse(localStorage.getItem(USAGE_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+  function saveUsage(u) {
+    try { localStorage.setItem(USAGE_KEY, JSON.stringify(u)); } catch (e) {}
+  }
+  function comboKey(keys) { return keys.slice().sort().join('+'); }
+  function currentKey() { return Array.from(activeFilters).sort().join('+'); }
+
+  var recordTimer = null;
+  function recordUsageDebounced() {
+    // Record the combo the user settles on (not every intermediate toggle).
+    clearTimeout(recordTimer);
+    recordTimer = setTimeout(function() {
+      if (!activeFilters.size) return;        // never record the empty set
+      var u = loadUsage();
+      u[currentKey()] = (u[currentKey()] || 0) + 1;
+      var keys = Object.keys(u);
+      if (keys.length > 40) {                 // cap growth: keep the top 40
+        keys.sort(function(a, b) { return u[b] - u[a]; });
+        var t = {}; keys.slice(0, 40).forEach(function(x) { t[x] = u[x]; });
+        u = t;
+      }
+      saveUsage(u);
+    }, 1500);
+  }
+
+  function comboLabel(keys) {
+    var out = [];
+    for (var i = 0; i < keys.length; i++) {
+      var p = document.querySelector('.filter-pill[data-filter="' + keys[i] + '"]');
+      if (!p) return null;                    // key absent in this report version
+      out.push(p.textContent.trim());
+    }
+    return out.join(' + ');
+  }
+
+  function setCombo(keys) {
+    activeFilters.clear();
+    pills.forEach(function(p) {
+      var on = keys.indexOf(p.getAttribute('data-filter')) >= 0;
+      p.classList.toggle('active', on);
+      if (on) activeFilters.add(p.getAttribute('data-filter'));
+    });
+    applyFilters();
+    renderFreqActive();
+  }
+
+  function renderFreqActive() {
+    if (!freqEl) return;
+    var cur = currentKey();
+    freqEl.querySelectorAll('.freq-pill').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.combo === cur);
+    });
+  }
+
+  function renderFrequent() {
+    if (!freqEl) return;
+    var u = loadUsage();
+    var combos = Object.keys(u)
+      .sort(function(a, b) { return u[b] - u[a]; })
+      .map(function(k) { return k.split('+'); });
+    // Pad with default quick-picks not already present so the bar is never empty.
+    var seen = {};
+    combos.forEach(function(c) { seen[comboKey(c)] = 1; });
+    DEFAULT_COMBOS.forEach(function(c) {
+      if (!seen[comboKey(c)]) { combos.push(c); seen[comboKey(c)] = 1; }
+    });
+    freqEl.innerHTML = '';
+    var shown = 0;
+    for (var i = 0; i < combos.length && shown < FREQ_MAX; i++) {
+      var label = comboLabel(combos[i]);
+      if (!label) continue;                   // skip combos with stale keys
+      var b = document.createElement('button');
+      b.className = 'filter-pill freq-pill';
+      b.textContent = label;
+      b.dataset.combo = comboKey(combos[i]);
+      b.title = 'Saved filter combo — click to apply, click again to clear';
+      (function(keys) {
+        b.addEventListener('click', function() {
+          if (currentKey() === comboKey(keys)) { setCombo([]); }   // toggle off
+          else { setCombo(keys); recordUsageDebounced(); }
+        });
+      })(combos[i]);
+      freqEl.appendChild(b);
+      shown++;
+    }
+    renderFreqActive();
+  }
+
+  renderFrequent();
+  searchInput.addEventListener('input', applyFilters);
+  applyFilters();
+})();
+</script>
+<script>
+// Quick recommendations: hover the chip to reveal the panel; auto-hide when
+// the pointer leaves or the page scrolls. Click toggles for touch devices
+// (where hover/mouseleave don't fire). Same pattern as the More-filters panel.
+(function() {
+  var wrap = document.getElementById('qrWrap');
+  var trigger = document.getElementById('qrTrigger');
+  if (!wrap || !trigger) return;
+  function open() { wrap.classList.add('open'); }
+  function close() { wrap.classList.remove('open'); }
+  trigger.addEventListener('mouseenter', open);
+  trigger.addEventListener('click', function() {
+    wrap.classList.contains('open') ? close() : open();
+  });
+  wrap.addEventListener('mouseleave', close);
+  window.addEventListener('scroll', close, { passive: true });
+})();
+</script>
+<script>
+// Mobile tap-to-reveal tooltips. Native title="" tooltips never appear on a
+// tap, so on touch-primary devices (no hover, coarse pointer) tapping any
+// element that carries a title — quality dots, score cell, verdict pill,
+// insider detail, cost/gain, range/trend — shows that text in a bottom
+// sheet. Sortable column headers and buttons are excluded so tap still
+// performs their action. Desktop hover is untouched (this only runs when
+// hover is unavailable).
+(function() {
+  var touch = false;
+  try {
+    touch = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+  } catch (e) {}
+  if (!touch) return;
+
+  var backdrop = document.createElement('div');
+  backdrop.className = 'm-tip-backdrop';
+  var sheet = document.createElement('div');
+  sheet.className = 'm-tip';
+  sheet.setAttribute('role', 'dialog');
+  sheet.innerHTML =
+    '<div class="m-tip-label" id="mTipLabel"></div>' +
+    '<div class="m-tip-body" id="mTipBody"></div>' +
+    '<button type="button" class="m-tip-close" id="mTipClose">Got it</button>';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(sheet);
+  var bodyEl = sheet.querySelector('#mTipBody');
+  var labelEl = sheet.querySelector('#mTipLabel');
+
+  function openTip(text, label) {
+    bodyEl.textContent = text;
+    labelEl.textContent = label || '';
+    labelEl.style.display = label ? '' : 'none';
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  }
+  function closeTip() {
+    backdrop.classList.remove('show');
+    sheet.classList.remove('show');
+  }
+
+  // Elements with their own tap action (or that aren't real tooltips).
+  var SKIP = 'th,button,a,summary,label,input,select,' +
+             '.refresh-btn,.theme-toggle,#autoReloadToggle';
+
+  // Best-effort: the column header text for a tapped data cell, as a label.
+  function columnLabel(cell) {
+    if (!cell || cell.tagName !== 'TD') return '';
+    var table = cell.closest('table');
+    if (!table) return '';
+    var idx = Array.prototype.indexOf.call(cell.parentNode.children, cell);
+    var ths = table.querySelectorAll('thead th');
+    if (idx >= 0 && idx < ths.length) {
+      // Trim a trailing info glyph (ⓘ / ℹ) and whitespace.
+      return (ths[idx].textContent || '')
+        .replace(/[ⓘℹ\s]+$/g, '').trim();
+    }
+    return '';
+  }
+
+  document.addEventListener('click', function(e) {
+    if (sheet.contains(e.target) || backdrop.contains(e.target)) return;
+    if (e.target.closest(SKIP)) return;
+    var el = e.target.closest('[title]');
+    if (!el) return;
+    var text = el.getAttribute('title');
+    if (!text || !text.trim()) return;
+    e.preventDefault();
+    openTip(text, columnLabel(el.closest('td')));
+  }, false);
+
+  backdrop.addEventListener('click', closeTip);
+  document.getElementById('mTipClose').addEventListener('click', closeTip);
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeTip();
+  });
+})();
+</script>
+</body></html>
