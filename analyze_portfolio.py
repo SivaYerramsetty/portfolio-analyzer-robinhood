@@ -1792,6 +1792,13 @@ class PositionAnalysis:
     prev_close: Optional[float] = None
     day_change: Optional[float] = None          # per-share $ change today
     day_change_pct: Optional[float] = None      # % change today
+    # Extended-hours move (after-hours / pre-market): the current extended
+    # price vs the regular-session price. Only populated when the market is
+    # closed and an extended price is actually in use.
+    regular_market_price: Optional[float] = None   # regular-session price (close/last)
+    after_hours_change: Optional[float] = None      # per-share $ change in extended session
+    after_hours_change_pct: Optional[float] = None  # % vs regular price
+    extended_session: Optional[str] = None          # "post" | "pre" | None
     # Analyst data
     target_mean: Optional[float] = None
     target_high: Optional[float] = None
@@ -1913,6 +1920,19 @@ def analyze_position(
         if _rh_px and _rh_px > 0 and (
                 _regular is None or _sane_extended(_rh_px, _regular)):
             pa.current_price = _rh_px
+
+        # After-hours / pre-market move: the extended price now in use vs the
+        # regular-session price. Non-None only when the market is closed and an
+        # extended price differs from the regular close (during regular hours
+        # current_price == _regular, so this stays None and the header tile is
+        # hidden). Session is inferred from which extended price is in use.
+        pa.regular_market_price = _regular
+        if (_regular and _regular > 0 and pa.current_price is not None
+                and abs(pa.current_price - _regular) > 1e-9):
+            pa.after_hours_change = pa.current_price - _regular
+            pa.after_hours_change_pct = pa.after_hours_change / _regular * 100
+            pa.extended_session = ("pre" if (_pre and abs(pa.current_price - _pre) < 1e-9)
+                                   else "post")
 
         # Compute LIVE market value from live price × shares
         if pa.current_price is not None:
@@ -4267,6 +4287,27 @@ def generate_html_report(
     day_change_pct = (day_change_total / prev_day_total * 100
                       if prev_day_total else None)
 
+    # After-hours move: per-position extended-session $ impact, % vs the
+    # regular-close portfolio total. Only populated when the market is closed
+    # (positions carry after_hours_change); otherwise the tile is hidden.
+    ah_positions = [r for r in results
+                    if r.after_hours_change is not None and r.shares]
+    ah_change_total = sum((r.after_hours_change or 0) * (r.shares or 0)
+                          for r in ah_positions)
+    ah_regular_total = sum(
+        ((r.regular_market_price if r.regular_market_price is not None
+          else r.current_price) or 0) * (r.shares or 0)
+        for r in results if r.shares
+    )
+    ah_change_pct = (ah_change_total / ah_regular_total * 100
+                     if ah_regular_total and ah_positions else None)
+    # Label after the dominant extended session (pre-market only if no
+    # after-hours quotes are present).
+    ah_label = ("Pre-market change"
+                if (ah_positions
+                    and all(r.extended_session == "pre" for r in ah_positions))
+                else "After-hours change")
+
     compounders = [r for r in results if r.bucket == "compounder"]
     thematics = [r for r in results if r.bucket == "thematic"]
     # Default order: verdict score high → low (market value as tiebreak).
@@ -4376,9 +4417,23 @@ def generate_html_report(
                 f'Today\'s change</div>')
         else:
             today_stat = ""
+        # After-hours-change stat (colored), shown only when the market is
+        # closed and we have extended-hours pricing for at least one position.
+        if ah_change_pct is not None:
+            ah_color = ("var(--pos-up)" if ah_change_total > 0
+                        else "var(--pos-down)" if ah_change_total < 0
+                        else "var(--fg-strong)")
+            after_hours_stat = (
+                f'<div class="stat"><strong style="color:{ah_color};">'
+                f'{_fmt_money(ah_change_total)} '
+                f'({_fmt_pct(ah_change_pct, 2, True)})</strong>'
+                f'{ah_label}</div>')
+        else:
+            after_hours_stat = ""
         holdings_summary = f"""
     <div class="stat"><strong>{_fmt_money(live_total)}</strong>Portfolio value (live)</div>
     {today_stat}
+    {after_hours_stat}
     <a class="stat clickable" href="#compounders" onclick="scrollToSection('compounders');return false;"><strong>{len(compounders)}</strong>Compounder positions</a>
     <a class="stat clickable" href="#thematic" onclick="scrollToSection('thematic');return false;"><strong>{len(thematics)}</strong>Thematic / ETF positions</a>
     <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{len(action_items)}</strong>Sell / Trim flags</a>
