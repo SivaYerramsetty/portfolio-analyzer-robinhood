@@ -821,7 +821,7 @@ def _compute_multi_year_growth(tkr, info: dict) -> None:
 # --- Fundamentals (quarterly-derived growth metrics) disk cache --------------
 # _compute_multi_year_growth() makes the run's two heaviest yfinance calls per
 # ticker (income_stmt + balance_sheet) to derive metrics that only change when a
-# company reports — i.e. quarterly, never intraday. For an hourly-refreshing
+# company reports — i.e. quarterly, never intraday. For a frequently-refreshing
 # report that's wasted work, so we cache the *output* metrics per ticker with a
 # TTL (default 24h). Live prices are NOT cached (they come from .info every run),
 # so verdicts are identical to a fresh run within the TTL window. The cache lives
@@ -2474,7 +2474,7 @@ def _build_refresh_widget() -> tuple[str, str]:
     }
     return tok ? tok.trim() : null;
   }
-  // Hooks for the hourly auto-refresh toggle: check for a stored token
+  // Hooks for the auto-refresh toggle: check for a stored token
   // without prompting, and ensure one exists (prompting once) at enable time.
   window.ghHasToken = function() { return !!localStorage.getItem(TOKEN_KEY); };
   window.ghEnsureToken = function() { return getToken(false); };
@@ -4888,7 +4888,7 @@ def generate_html_report(
 </head>
 <body>
 <script>
-  // Keep refreshes (browser reload or the hourly auto-refresh) anchored at the
+  // Keep refreshes (browser reload or the auto-refresh) anchored at the
   // top. Two things otherwise scroll the page on reload: (1) the browser's
   // default scroll-position restoration, and (2) a stale "#section" hash left in
   // the URL (e.g. after a header tile jump) which makes the browser re-jump to
@@ -4939,7 +4939,7 @@ def generate_html_report(
     {qr_chip_html}
     {refresh_button_html}
     <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
-            title="Auto-reload this page every hour to pick up the latest published report">
+            title="Auto-reload this page every 30 min to pick up the latest published report">
       &#9201; Auto</button>
     <button class="theme-toggle" id="themeToggle"
             title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
@@ -5327,8 +5327,8 @@ Verdicts are framework outputs, not investment advice.
   window.addEventListener('resize', setPinOffset);
   window.addEventListener('load', setPinOffset);
 })();
-// Hourly auto-refresh toggle: when enabled (persisted in localStorage), every
-// hour it triggers the GitHub Actions workflow (same flow as the manual
+// Auto-refresh toggle: when enabled (persisted in localStorage), every
+// 30 min it triggers the GitHub Actions workflow (same flow as the manual
 // Refresh button: dispatch -> poll -> reload when the new report deploys).
 // Fallbacks: no stored token or no refresh widget -> plain page reload; a
 // refresh already in progress -> skip this cycle (its success path reloads).
@@ -5337,7 +5337,7 @@ Verdicts are framework outputs, not investment advice.
 // survives background-tab throttling and laptop sleep.
 (function() {
   var KEY = 'auto-reload-hourly';
-  var PERIOD_MS = 3600000;
+  var PERIOD_MS = 1800000;
   var btn = document.getElementById('autoReloadToggle');
   if (!btn) return;
   var timer = null;
@@ -5350,7 +5350,7 @@ Verdicts are framework outputs, not investment advice.
   function label() {
     if (!btn.classList.contains('active')) {
       btn.innerHTML = '&#9201; Auto';
-      btn.title = 'Every hour: trigger the GitHub workflow to regenerate the '
+      btn.title = 'Every 30 min: trigger the GitHub workflow to regenerate the '
                 + 'report, then reload this page when it deploys. (Without a '
                 + 'saved token it only reloads the page.)';
       return;
@@ -5365,7 +5365,7 @@ Verdicts are framework outputs, not investment advice.
               + ' Click to turn off.';
   }
   function fire() {
-    // Re-arm first so a failed run is retried next hour, not every 30s.
+    // Re-arm first so a failed run is retried next cycle, not every 30s.
     btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
     var rb = document.getElementById('ghRefreshBtn');
     if (rb && rb.disabled) {
@@ -5390,7 +5390,7 @@ Verdicts are framework outputs, not investment advice.
     if (save) { try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {} }
     if (timer) { clearInterval(timer); timer = null; }
     if (on) {
-      // Ask for the token now (once) so the unattended hourly trigger can
+      // Ask for the token now (once) so the unattended auto-refresh trigger can
       // work later — prompting at 3am when the timer fires would be useless.
       if (interactive && typeof window.ghEnsureToken === 'function'
           && !((window.ghHasToken && window.ghHasToken()))) {
