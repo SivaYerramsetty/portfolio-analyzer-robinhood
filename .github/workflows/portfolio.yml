@@ -86,6 +86,8 @@ jobs:
           RH_SESSION_B64:     ${{ secrets.RH_SESSION_B64 }}
           RH_DEVICE_APPROVAL: ${{ inputs.device_approval }}
           FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}   # enables news-sentiment scoring (optional)
+          NEWS_MODEL:         ${{ vars.NEWS_MODEL }}              # optional: e.g. claude-haiku-4-5 to cut cost
           TAX_FILING_STATUS:  ${{ secrets.TAX_FILING_STATUS }}
           TAX_TAXABLE_INCOME: ${{ secrets.TAX_TAXABLE_INCOME }}
           TAX_STATE_RATE:     ${{ secrets.TAX_STATE_RATE }}

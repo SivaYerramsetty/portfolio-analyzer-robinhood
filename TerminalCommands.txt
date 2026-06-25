@@ -53,6 +53,10 @@ python analyze_portfolio.py --tickers AAPL,MSFT,GOOGL,NVDA --out lookup.html
 
 python analyze_portfolio.py --add-to-watchlist "Screening" --tickers NVDA,GOOGL
 
+python analyze_portfolio.py --source robinhood --include-watchlists --out report.html
+
+python analyze_portfolio.py --source robinhood --include-watchlists --tax --out report.html
+
 
 ============================================================================
 MODE 1 — LIVE ROBINHOOD (your real positions)

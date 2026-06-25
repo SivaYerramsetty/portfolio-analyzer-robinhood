@@ -502,6 +502,39 @@ def fetch_positions() -> list[dict]:
     return positions
 
 
+def fetch_latest_prices(tickers: list[str],
+                        include_extended: bool = True) -> dict[str, float]:
+    """Batch-fetch latest prices from Robinhood, preferring the extended-hours
+    last trade when available (i.e. after-hours / pre-market while the regular
+    session is closed).
+
+    Returns {ticker: price} only for tickers that resolved to a positive float;
+    symbols Robinhood doesn't recognize (or that have no quote) are omitted.
+    robin_stocks.get_latest_price returns prices positionally for the input
+    symbols, so we zip them back together.
+    """
+    _require_rh()
+    syms = [t for t in dict.fromkeys(tickers) if t]   # dedupe, keep order
+    out: dict[str, float] = {}
+    if not syms:
+        return out
+    try:
+        prices = rh.stocks.get_latest_price(
+            syms, includeExtendedHours=include_extended)
+    except Exception as e:
+        print(f"[robinhood] latest-price fetch failed: {e}")
+        return out
+    for sym, px in zip(syms, prices or []):
+        try:
+            if px is not None:
+                p = float(px)
+                if p > 0:
+                    out[sym] = p
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _fetch_position_open_dates() -> dict[str, str]:
     """
     Map ticker -> earliest position open date (ISO 'YYYY-MM-DD').

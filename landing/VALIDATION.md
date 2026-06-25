@@ -15,12 +15,13 @@ Those matter more than raw clicks.
 
 ---
 
-## Step 1 — Wire up the waitlist form (5 min, free)
-The landing page uses [Formspree](https://formspree.io) (free tier = 50 submissions/mo).
+## Step 1 — Waitlist form ✅ (done)
+The landing page is wired to [Formspree](https://formspree.io) endpoint
+`https://formspree.io/f/xojoarnn` (free tier = 50 submissions/mo) using the page's own
+dependency-free AJAX handler.
 
-1. Sign up at formspree.io → **New form** → copy the form ID (looks like `xyzabcde`).
-2. In `index.html`, replace `YOUR_FORM_ID` in the `<form action=...>` line with your ID.
-3. Submit a test email to yourself to confirm it lands.
+- Submit a test email to yourself once the page is published to confirm it lands. The first
+  real submission to a new Formspree form triggers a one-time email-confirmation step.
 
 > Prefer no-code? Swap the whole form for a [Tally](https://tally.so) or Google Form embed.
 > Want analytics? Add a free [Plausible](https://plausible.io) or
