@@ -4077,6 +4077,7 @@ def _current_rec_snapshot(
                 "price": r.current_price,
                 "alloc": 0.0,
                 "verdict": (r.verdict.label if r.verdict else None),
+                "verdict_score": (r.verdict.score if r.verdict else None),
                 "name": r.name,
                 "sector": r.sector,
                 **_rec_diagnostic(r),
@@ -4088,6 +4089,7 @@ def _current_rec_snapshot(
             "price": r.current_price,
             "alloc": (r.live_pct_portfolio if r.live_pct_portfolio is not None else 0.0),
             "verdict": (r.verdict.label if r.verdict else None),
+            "verdict_score": (r.verdict.score if r.verdict else None),
             "name": r.name,
             "sector": r.sector,
             **_rec_diagnostic(r),
@@ -4119,12 +4121,14 @@ def update_recs_history(
                 "first_date": run_date,
                 "first_price": cur["price"],
                 "first_verdict": cur["verdict"],
+                "first_verdict_score": cur.get("verdict_score"),
                 "first_alloc": cur["alloc"],
                 "first_why": cur.get("why", ""),
                 "first_news": cur.get("news"),
                 "last_date": run_date,
                 "last_price": cur["price"],
                 "last_verdict": cur["verdict"],
+                "last_verdict_score": cur.get("verdict_score"),
                 "last_alloc": cur["alloc"],
                 "last_why": cur.get("why", ""),
                 "last_news": cur.get("news"),
@@ -4138,6 +4142,7 @@ def update_recs_history(
         entry["last_date"] = run_date
         entry["last_price"] = cur["price"]
         entry["last_verdict"] = cur["verdict"]
+        entry["last_verdict_score"] = cur.get("verdict_score")
         entry["last_alloc"] = cur["alloc"]
         entry["last_why"] = cur.get("why", "")
         entry["last_news"] = cur.get("news")
@@ -4265,6 +4270,9 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
             "sector": e.get("sector"),
             "first_date": e.get("first_date"),
             "first_verdict": e.get("first_verdict"),
+            "first_verdict_score": e.get("first_verdict_score"),
+            "last_verdict": e.get("last_verdict"),
+            "last_verdict_score": e.get("last_verdict_score"),
             "first_price": first_price,
             "current_price": last_price,
             "gain_pct": gain_pct,
@@ -4305,7 +4313,13 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
         return html
 
     # ----- Populated table -----
-    verdict_colors = {"ADD": "#27ae60", "BUY": "#27ae60", "WATCH": "#2980b9"}
+    verdict_colors = {
+        "ADD": "#27ae60", "BUY": "#27ae60", "BUY MORE": "#27ae60",
+        "WATCH": "#2980b9",
+        "HOLD": "#2c3e50",
+        "TRIM": "#e67e22",
+        "SELL": "#c0392b",
+    }
     html += (
         '<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:18px;">'
         f"Stocks the analyzer has tracked (every holding and watchlist name) that "
@@ -4319,40 +4333,54 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
         "<th>Ticker</th>"
         "<th>Name / Sector</th>"
         "<th>First seen</th>"
-        "<th class='num'>First price</th>"
-        "<th class='num'>Current</th>"
+        "<th>First verdict</th>"
+        "<th>Current verdict</th>"
         "<th class='num'>Gain since</th>"
-        "<th class='num' title='Largest gain over the first-seen price.' style='cursor:help;'>Peak gain</th>"
-        "<th class='num'>You hold</th>"
-        "<th>Why it&#39;s a miss</th>"
+        "<th title='Hover for full explanation.' style='cursor:help;'>Miss reason &#9432;</th>"
         "</tr></thead><tbody>\n"
     )
+    import re as _re
     for m in missed:
         label = m.get("first_verdict") or "—"
         color = verdict_colors.get(label, "#7f8c8d")
+        cur_verdict = m.get("last_verdict") or "—"
+        cur_color = verdict_colors.get(cur_verdict, "#7f8c8d")
+        ticker = _esc(m["ticker"])
         sector = _esc(m["sector"]) if m.get("sector") else "—"
-        alloc = m.get("last_alloc") or 0.0
-        hold_html = ("<span style='color:var(--fg-faint);'>Not held</span>"
-                     if alloc <= 0 else _fmt_pct(alloc, 2))
-        date_part = (f"<span style='color:var(--fg-muted);font-size:11px;'>"
-                     f"{_esc(_fmt_short_date(m.get('first_date')))}</span><br>"
-                     if m.get("first_date") else "")
-        # reason is pre-built HTML (contains <strong>); render as-is.
+        first_date = m.get("first_date") or ""
+        date_iso = first_date[:10] if first_date else ""
+        date_display = _esc(_fmt_short_date(first_date)) if first_date else "—"
+        # reason is pre-built HTML (contains <strong>); store as HTML in data-reason.
         reason_html = m.get("reason") or ""
-        html += "<tr>"
-        html += f"<td class='ticker'><strong>{_esc(m['ticker'])}</strong></td>"
-        html += (f"<td><div style='font-weight:500'>{_esc(m['name'])}</div>"
+        # Escape for use inside a single-quoted HTML attribute.
+        reason_attr = reason_html.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&#39;")
+        # Short preview text (strip tags) for the visible truncated cell.
+        reason_preview = _re.sub(r'<[^>]+>', '', reason_html).replace('&ldquo;', '"').replace('&rdquo;', '"').replace('&mdash;', '—').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').strip()
+        search_val = f"{m['ticker'].lower()} {m['name'].lower()} {(m.get('sector') or '').lower()}"
+        html += f"<tr data-search='{_esc(search_val)}'>"
+        html += (f"<td class='ticker' data-sort='{ticker}'>"
+                 f"<a class='miss-ticker-link' data-ticker='{ticker}' href='#' "
+                 f"style='font-weight:700;color:inherit;text-decoration:underline;"
+                 f"text-decoration-style:dotted;cursor:pointer;'>{ticker}</a></td>")
+        html += (f"<td data-sort='{_esc(m['name'])}'><div style='font-weight:500'>{_esc(m['name'])}</div>"
                  f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
-        html += (f"<td>{date_part}"
-                 f"<span class='verdict' style='background:{color};'>{label}</span></td>")
-        html += f"<td class='num'>{_fmt_money(m['first_price'])}</td>"
-        html += f"<td class='num'>{_fmt_money(m['current_price'])}</td>"
-        html += (f"<td class='num pos-up' style='font-weight:600;'>"
+        html += (f"<td data-sort='{date_iso}'>"
+                 f"<span style='color:var(--fg-muted);font-size:11px;'>{date_display}</span></td>")
+        def _verdict_chip(v_label, v_color, v_score):
+            score_str = (f"<span class='vscore' style='color:var(--fg-body);font-size:11px;"
+                         f"font-weight:700;margin-left:4px;font-variant-numeric:tabular-nums;'>"
+                         f"{int(round(v_score))}</span>") if v_score is not None else ""
+            return (f"<span class='verdict' style='background:{v_color};'>{v_label}</span>"
+                    f"{score_str}")
+        first_score = m.get("first_verdict_score")
+        cur_score   = m.get("last_verdict_score")
+        html += f"<td data-sort='{label}'>{_verdict_chip(label, color, first_score)}</td>"
+        html += f"<td data-sort='{cur_verdict}'>{_verdict_chip(_esc(cur_verdict), cur_color, cur_score)}</td>"
+        html += (f"<td class='num pos-up' data-sort='{m['gain_pct']:.2f}' style='font-weight:600;'>"
                  f"{_fmt_pct(m['gain_pct'], 1, True)}</td>")
-        html += f"<td class='num'>{_fmt_pct(m['peak_gain_pct'], 1, True)}</td>"
-        html += f"<td class='num'>{hold_html}</td>"
-        html += (f"<td style='font-size:12px;color:var(--fg-muted);max-width:320px;"
-                 f"white-space:normal;line-height:1.45;'>{reason_html}</td>")
+        # miss-reason cell: JS (at page load) converts this into a vcell+vcard
+        # hover card identical to the verdict-score tooltip system.
+        html += f"<td class='miss-reason' data-reason='{reason_attr}'></td>"
         html += "</tr>\n"
     html += "</tbody></table></div>\n"
     return html
@@ -4909,6 +4937,9 @@ def generate_html_report(
             text-align: left; font-size: 12px; line-height: 1.45;
             white-space: normal; cursor: default; }}
   .vcard.show {{ display: block; }}
+  .miss-trigger {{ font-size: 11px; color: var(--fg-muted); cursor: help;
+                  border-bottom: 1px dotted var(--fg-muted); white-space: nowrap; }}
+  .miss-vcard {{ width: 360px; }}
   .vcard-head {{ display: flex; align-items: baseline;
                  justify-content: space-between; gap: 10px; margin-bottom: 8px; }}
   .vcard-headline {{ font-weight: 600; color: var(--fg-strong); font-size: 12px; }}
@@ -6182,6 +6213,10 @@ Verdicts are framework outputs, not investment advice.
   renderFrequent();
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
+  window.applySearchFilter = function(term) {{
+    searchInput.value = term;
+    applyFilters();
+  }};
 })();
 
 // Smooth-scroll a header summary tile to its section (no-ops if the section
@@ -6350,6 +6385,45 @@ window.scrollToSection = function(id) {
     hide();
   }, { capture: true, passive: true });
   window.addEventListener('resize', hide);
+})();
+</script>
+<script>
+/* ---------- Missed Opportunities: vcell tooltip + ticker click ---------- */
+(function() {
+  document.querySelectorAll('td.miss-reason').forEach(function(td) {
+    var raw = td.getAttribute('data-reason') || '';
+    if (!raw) return;
+    var vcell = document.createElement('span');
+    vcell.className = 'vcell';
+    vcell.setAttribute('data-tip', 'Miss reason');
+    var trigger = document.createElement('span');
+    trigger.className = 'miss-trigger';
+    trigger.textContent = '📋 Why a miss';
+    var card = document.createElement('div');
+    card.className = 'vcard miss-vcard';
+    card.setAttribute('role', 'tooltip');
+    card.innerHTML = raw;
+    vcell.appendChild(trigger);
+    vcell.appendChild(card);
+    td.removeAttribute('style');
+    td.style.whiteSpace = 'nowrap';
+    while (td.firstChild) td.removeChild(td.firstChild);
+    td.appendChild(vcell);
+  });
+  document.querySelectorAll('.miss-ticker-link').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+      e.preventDefault();
+      var ticker = el.getAttribute('data-ticker') || '';
+      if (!ticker) return;
+      if (typeof window.applySearchFilter === 'function') {
+        window.applySearchFilter(ticker);
+      } else {
+        var input = document.getElementById('searchInput');
+        if (input) {{ input.value = ticker; input.dispatchEvent(new Event('input', {{bubbles:true}})); }}
+      }
+      window.scrollTo({{ top: 0, behavior: 'smooth' }});
+    });
+  });
 })();
 </script>
 </body></html>
