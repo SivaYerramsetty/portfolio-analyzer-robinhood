@@ -4352,8 +4352,10 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
         date_display = _esc(_fmt_short_date(first_date)) if first_date else "—"
         # reason is pre-built HTML (contains <strong>); store as HTML in data-reason.
         reason_html = m.get("reason") or ""
-        # Escape for use inside a single-quoted HTML attribute.
-        reason_attr = reason_html.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&#39;")
+        # Escape for use inside a double-quoted HTML attribute.
+        # Headlines can contain apostrophes (safe in double-quoted attrs) but not
+        # straight double quotes, so only &quot; escaping is needed for ".
+        reason_attr = reason_html.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
         # Short preview text (strip tags) for the visible truncated cell.
         reason_preview = _re.sub(r'<[^>]+>', '', reason_html).replace('&ldquo;', '"').replace('&rdquo;', '"').replace('&mdash;', '—').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').strip()
         search_val = f"{m['ticker'].lower()} {m['name'].lower()} {(m.get('sector') or '').lower()}"
@@ -4380,7 +4382,7 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
                  f"{_fmt_pct(m['gain_pct'], 1, True)}</td>")
         # miss-reason cell: JS (at page load) converts this into a vcell+vcard
         # hover card identical to the verdict-score tooltip system.
-        html += f"<td class='miss-reason' data-reason='{reason_attr}'></td>"
+        html += f'<td class=\'miss-reason\' data-reason="{reason_attr}"></td>'
         html += "</tr>\n"
     html += "</tbody></table></div>\n"
     return html
@@ -6410,20 +6412,36 @@ window.scrollToSection = function(id) {
     while (td.firstChild) td.removeChild(td.firstChild);
     td.appendChild(vcell);
   });
-  document.querySelectorAll('.miss-ticker-link').forEach(function(el) {
-    el.addEventListener('click', function(e) {
+  var _missedWrap = (function() {{
+    var h = document.getElementById('missed-opps');
+    if (!h) return null;
+    var n = h.nextElementSibling;
+    while (n && !n.classList.contains('table-wrap')) n = n.nextElementSibling;
+    return n;
+  }})();
+
+  document.querySelectorAll('.miss-ticker-link').forEach(function(el) {{
+    el.addEventListener('click', function(e) {{
       e.preventDefault();
       var ticker = el.getAttribute('data-ticker') || '';
       if (!ticker) return;
-      if (typeof window.applySearchFilter === 'function') {
+      if (typeof window.applySearchFilter === 'function') {{
         window.applySearchFilter(ticker);
-      } else {
+      }} else {{
         var input = document.getElementById('searchInput');
         if (input) {{ input.value = ticker; input.dispatchEvent(new Event('input', {{bubbles:true}})); }}
-      }
-      window.scrollTo({{ top: 0, behavior: 'smooth' }});
-    });
-  });
+      }}
+      var mainVisible = Array.from(document.querySelectorAll('tbody tr[data-search]')).some(function(r) {{
+        return r.style.display !== 'none' && (!_missedWrap || !_missedWrap.contains(r));
+      }});
+      if (mainVisible) {{
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
+      }} else {{
+        var h2 = document.getElementById('missed-opps');
+        if (h2) h2.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+      }}
+    }});
+  }});
 })();
 </script>
 </body></html>
