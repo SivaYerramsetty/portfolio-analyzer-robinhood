@@ -6215,10 +6215,10 @@ Verdicts are framework outputs, not investment advice.
   renderFrequent();
   searchInput.addEventListener('input', applyFilters);
   applyFilters();
-  window.applySearchFilter = function(term) {{
+  window.applySearchFilter = function(term) {
     searchInput.value = term;
     applyFilters();
-  }};
+  };
 })();
 
 // Smooth-scroll a header summary tile to its section (no-ops if the section
@@ -6412,36 +6412,36 @@ window.scrollToSection = function(id) {
     while (td.firstChild) td.removeChild(td.firstChild);
     td.appendChild(vcell);
   });
-  var _missedWrap = (function() {{
+  var _missedWrap = (function() {
     var h = document.getElementById('missed-opps');
     if (!h) return null;
     var n = h.nextElementSibling;
     while (n && !n.classList.contains('table-wrap')) n = n.nextElementSibling;
     return n;
-  }})();
+  })();
 
-  document.querySelectorAll('.miss-ticker-link').forEach(function(el) {{
-    el.addEventListener('click', function(e) {{
+  document.querySelectorAll('.miss-ticker-link').forEach(function(el) {
+    el.addEventListener('click', function(e) {
       e.preventDefault();
       var ticker = el.getAttribute('data-ticker') || '';
       if (!ticker) return;
-      if (typeof window.applySearchFilter === 'function') {{
+      if (typeof window.applySearchFilter === 'function') {
         window.applySearchFilter(ticker);
-      }} else {{
+      } else {
         var input = document.getElementById('searchInput');
-        if (input) {{ input.value = ticker; input.dispatchEvent(new Event('input', {{bubbles:true}})); }}
-      }}
-      var mainVisible = Array.from(document.querySelectorAll('tbody tr[data-search]')).some(function(r) {{
+        if (input) { input.value = ticker; input.dispatchEvent(new Event('input', {bubbles:true})); }
+      }
+      var mainVisible = Array.from(document.querySelectorAll('tbody tr[data-search]')).some(function(r) {
         return r.style.display !== 'none' && (!_missedWrap || !_missedWrap.contains(r));
-      }});
-      if (mainVisible) {{
-        window.scrollTo({{ top: 0, behavior: 'smooth' }});
-      }} else {{
+      });
+      if (mainVisible) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
         var h2 = document.getElementById('missed-opps');
-        if (h2) h2.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
-      }}
-    }});
-  }});
+        if (h2) h2.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+  });
 })();
 </script>
 </body></html>
