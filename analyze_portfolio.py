@@ -4574,7 +4574,7 @@ def generate_html_report(
     add_items = [r for r in results if r.verdict and r.verdict.label == "ADD"]
 
     _now_est = datetime.now(ZoneInfo("America/New_York"))
-    now = _now_est.strftime("%B %d, %Y · %I:%M %p EST")
+    now = _now_est.strftime("%B %d, %Y · %I:%M %p %Z")
 
     # --- Relative "last updated X ago" ---
     def _relative_time(dt) -> str:
@@ -4590,6 +4590,9 @@ def generate_html_report(
         return f"{mins}m ago"
 
     relative_now = _relative_time(_now_est)
+    # Epoch ms of generation, embedded so the browser can keep the
+    # "last updated X ago" text ticking while the page sits open.
+    now_epoch_ms = int(_now_est.timestamp() * 1000)
     refresh_button_html, refresh_status_html = _build_refresh_widget()
     delta_class = "pos-up" if delta >= 0 else "pos-down"
     delta_sign = "+" if delta >= 0 else ""
@@ -5295,6 +5298,32 @@ def generate_html_report(
       location.reload();
     }}
   }};
+
+  // Keep "Last updated X ago" ticking. The Python side can only bake in
+  // "0m ago" (it renders at generation time), so the real relative age is
+  // computed here from the embedded generation timestamp and refreshed
+  // every 30s while the page stays open.
+  (function() {{
+    function tick() {{
+      var el = document.getElementById('lastUpdatedAgo');
+      if (!el) return;
+      var gen = parseInt(el.getAttribute('data-generated-ms'), 10);
+      if (!gen) return;
+      var s = Math.max(0, Math.floor((Date.now() - gen) / 1000));
+      var d = Math.floor(s / 86400);
+      var h = Math.floor((s % 86400) / 3600);
+      var m = Math.floor((s % 3600) / 60);
+      el.textContent = d > 0 ? d + 'd ' + h + 'h ago'
+                     : h > 0 ? h + 'h ' + m + 'm ago'
+                     : m + 'm ago';
+    }}
+    if (document.readyState === 'loading') {{
+      document.addEventListener('DOMContentLoaded', tick);
+    }} else {{
+      tick();
+    }}
+    setInterval(tick, 30000);
+  }})();
 </script>
 <script>
   // Apply saved theme BEFORE first paint to avoid a white flash on dark-mode loads.
@@ -5312,7 +5341,7 @@ def generate_html_report(
 <div class="report-header">
   <div>
     <h1>{report_title}</h1>
-    <div class="sub">Last updated {relative_now} · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
+    <div class="sub">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
   </div>
   <div class="report-controls">
     {qr_chip_html}
