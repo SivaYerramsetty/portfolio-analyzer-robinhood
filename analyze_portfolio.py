@@ -1113,6 +1113,10 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
 # string, can't interpolate Python there).
 EARNINGS_SOON_DAYS = 7
 
+# Verdict score below which a position is included in the tax analysis
+# section (in addition to explicit SELL/TRIM verdicts).
+TAX_FLAG_SCORE_THRESHOLD = 75
+
 
 @dataclass
 class Verdict:
@@ -2518,7 +2522,15 @@ def _build_refresh_widget() -> tuple[str, str]:
     repo = _gh_repo_slug()
     if not repo:
         return "", ""
-    button = ('<button id="ghRefreshBtn" class="refresh-btn" '
+    # Tax toggle sits before the refresh button. Its state lives in
+    # localStorage; when on, the dispatch below sends include_tax=true so the
+    # regenerated report contains the Tax-Aware Trim Guidance section.
+    button = ('<button id="taxSectionToggle" class="refresh-btn tax-toggle" '
+              'aria-pressed="false" '
+              'title="Include the Tax-Aware Trim Guidance section in the '
+              'next data refresh">'
+              '&#129534; Tax</button>'
+              '<button id="ghRefreshBtn" class="refresh-btn" '
               'onclick="ghTriggerRefresh()" '
               'title="Trigger the GitHub Actions workflow to regenerate this report">'
               '&#10227; Refresh data</button>')
@@ -2531,7 +2543,35 @@ def _build_refresh_widget() -> tuple[str, str]:
   var WORKFLOW = "portfolio.yml";   // file name under .github/workflows/
   var REF = "main";
   var TOKEN_KEY = "gh-dispatch-token";
+  var TAX_KEY = "tax-section-enabled";
   var pollTimer = null, startedAt = null;
+
+  function taxEnabled() {
+    try { return localStorage.getItem(TAX_KEY) === "1"; }
+    catch (e) { return false; }
+  }
+  // Tax section toggle: persisted per-browser; honored by every dispatch
+  // (manual button AND the auto-refresh timer, which calls ghTriggerRefresh).
+  (function() {
+    var tb = document.getElementById("taxSectionToggle");
+    if (!tb) return;
+    function paint() {
+      var on = taxEnabled();
+      tb.classList.toggle("active", on);
+      tb.setAttribute("aria-pressed", on ? "true" : "false");
+      tb.title = on
+        ? "Tax section ON \\u2014 the next data refresh will include the " +
+          "Tax-Aware Trim Guidance section. Click to turn off."
+        : "Include the Tax-Aware Trim Guidance section in the next data " +
+          "refresh (fetches full order history, so the run takes longer).";
+    }
+    tb.addEventListener("click", function() {
+      try { localStorage.setItem(TAX_KEY, taxEnabled() ? "0" : "1"); }
+      catch (e) {}
+      paint();
+    });
+    paint();
+  })();
 
   function setStatus(msg, isError) {
     var el = document.getElementById("ghRefreshStatus");
@@ -2573,13 +2613,18 @@ def _build_refresh_widget() -> tuple[str, str]:
     btn.disabled = true;
     setStatus("Triggering workflow\\u2026");
     try {
+      var payload = {ref: REF};
+      // workflow_dispatch inputs must be strings, even for boolean-typed ones.
+      if (taxEnabled()) payload.inputs = {include_tax: "true"};
       var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
         method: "POST", headers: headers(tok),
-        body: JSON.stringify({ref: REF})
+        body: JSON.stringify(payload)
       });
       if (r.status === 204) {
         startedAt = Date.now();
-        setStatus("Workflow queued \\u2014 a fresh report usually takes a few minutes\\u2026");
+        setStatus("Workflow queued" +
+                  (taxEnabled() ? " with tax section" : "") +
+                  " \\u2014 a fresh report usually takes a few minutes\\u2026");
         pollTimer = setInterval(pollRun, 12000);
       } else if (r.status === 401 || r.status === 403) {
         localStorage.removeItem(TOKEN_KEY);
@@ -3659,15 +3704,17 @@ def _render_tax_section(flagged: list,
     """Render the tax section: YTD realized + recommendations + per-position trim guidance.
 
     Args:
-      flagged: list of PositionAnalysis with `tax` field populated (SELL/TRIM verdicts)
+      flagged: list of PositionAnalysis with `tax` field populated
+               (SELL/TRIM verdicts, or verdict score below 75)
       all_holdings: full holdings list (used to find loss-harvest candidates)
       realized_ytd: dict from fetch_realized_ytd() — if present, YTD section renders
     """
     html = "<h2 style='margin-top:48px;'>Tax-Aware Trim Guidance</h2>\n"
     html += (
         '<p style="color:var(--fg-muted);font-size:12px;margin-top:-6px;margin-bottom:8px;">'
-        "For positions flagged SELL or TRIM: holding-period status, estimated tax "
-        "if trimmed now, and the least-taxable ways to do it."
+        "For positions flagged SELL or TRIM, or with a verdict score below 75: "
+        "holding-period status, estimated tax if trimmed now, and the "
+        "least-taxable ways to do it."
         "</p>\n"
     )
     html += (
@@ -4821,9 +4868,10 @@ def generate_html_report(
                   transition: transform 0.15s, background 0.2s; }}
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
   .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
-  .auto-toggle.active {{ background: var(--bg-chip-green);
-                         color: var(--fg-chip-green);
-                         border-color: var(--pos-up); }}
+  .auto-toggle.active,
+  .tax-toggle.active {{ background: var(--bg-chip-green);
+                        color: var(--fg-chip-green);
+                        border-color: var(--pos-up); }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);
                      text-align: right; margin: -6px 0 10px; }}
   .refresh-status:empty {{ display: none; }}
@@ -6855,15 +6903,21 @@ def main():
     except Exception as e:
         print(f"[history] Skipped missed-opportunity tracking: {e}")
 
-    # Tax analysis for SELL/TRIM positions (holding period + trim timing).
+    # Tax analysis for SELL/TRIM and low-score positions (holding period +
+    # trim timing).
     try:
         from tax_analysis import (TaxConfig, analyze_tax, analyze_tax_with_lots,
                                   reconcile_lots_with_position)
         tax_cfg = TaxConfig.from_env()
         # Tax analysis is opt-in (--tax). When off, leave `flagged` empty so no
         # r.tax is populated and the tax section is omitted from the report.
+        # Flag SELL/TRIM verdicts plus any position whose verdict score is
+        # below 75 — weak-scoring holds are trim candidates too.
         flagged = ([r for r in results
-                    if r.verdict and r.verdict.label in ("SELL", "TRIM")]
+                    if r.verdict and (
+                        r.verdict.label in ("SELL", "TRIM")
+                        or (r.verdict.score is not None
+                            and r.verdict.score < TAX_FLAG_SCORE_THRESHOLD))]
                    if args.tax else [])
         if flagged:
             has_lots = bool(tax_lots_lookup)
