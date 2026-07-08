@@ -329,6 +329,291 @@ def fetch_finnhub_price_target(ticker: str) -> Optional[dict]:
 
 
 # ============================================================
+# Market-wide Fear & Greed — the gauge at the top of the report
+# ============================================================
+# Primary source is CNN's Fear & Greed index (recognizable 0–100 number +
+# rating). Its data endpoint is undocumented, so if it fails in CI we fall back
+# to a VIX-implied estimate via yfinance, and if THAT fails we serve the last
+# cached reading. Result is cached in .cache/ (gitignored; carried across CI
+# runs) so warm runs and brief CNN outages don't blank the gauge.
+# Set MARKET_METER=0 to disable entirely.
+
+_FEAR_GREED_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "fear_greed.json"
+_FEAR_GREED_TTL_SEC = 30 * 60  # re-fetch at most every 30 min
+
+
+def _fg_rating(score: float) -> str:
+    """CNN's bucket labels for a 0–100 score."""
+    if score < 25:
+        return "Extreme Fear"
+    if score < 45:
+        return "Fear"
+    if score <= 55:
+        return "Neutral"
+    if score <= 75:
+        return "Greed"
+    return "Extreme Greed"
+
+
+def _fetch_fear_greed_cnn() -> Optional[dict]:
+    """CNN Fear & Greed index. Returns a normalized dict or None."""
+    if not requests:
+        return None
+    try:
+        r = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers={
+                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0 Safari/537.36"),
+                "Accept": "application/json",
+            },
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        fg = (r.json() or {}).get("fear_and_greed") or {}
+        score = fg.get("score")
+        if score is None:
+            return None
+        score = round(float(score))
+        return {
+            "score": score,
+            "rating": _fg_rating(score),
+            "source": "CNN Fear & Greed",
+            "previous_close": fg.get("previous_close"),
+            "previous_week": fg.get("previous_1_week"),
+            "previous_month": fg.get("previous_1_month"),
+        }
+    except Exception:
+        return None
+
+
+def _fetch_fear_greed_vix() -> Optional[dict]:
+    """VIX-implied fear/greed estimate via yfinance (fallback source)."""
+    try:
+        hist = yf.Ticker("^VIX").history(period="5d")
+        if hist is None or hist.empty:
+            return None
+        vix = float(hist["Close"].dropna().iloc[-1])
+        # Inverse-linear map: calm VIX → greed, spiking VIX → fear.
+        # VIX 10 → 100, 20 → 70, 30 → 40, 40 → 10 (clamped to 0–100).
+        score = round(max(0.0, min(100.0, 100.0 - (vix - 10.0) * 3.0)))
+        return {
+            "score": score,
+            "rating": _fg_rating(score),
+            "source": f"VIX-implied (VIX {vix:.1f})",
+            "previous_close": None,
+            "previous_week": None,
+            "previous_month": None,
+        }
+    except Exception:
+        return None
+
+
+def fetch_market_fear_greed() -> Optional[dict]:
+    """
+    Market-wide Fear & Greed reading for the top-of-report gauge.
+
+    Order of preference: fresh cache → CNN → VIX estimate → stale cache.
+    Returns {"score", "rating", "source", "previous_*"} or None if every
+    source (and the cache) is unavailable.
+    """
+    if os.environ.get("MARKET_METER", "").strip() == "0":
+        return None
+
+    # Fresh cache short-circuits any network call.
+    cached: Optional[dict] = None
+    try:
+        if _FEAR_GREED_CACHE_PATH.exists():
+            cached = json.loads(_FEAR_GREED_CACHE_PATH.read_text())
+            if time.time() - cached.get("fetched_at", 0) < _FEAR_GREED_TTL_SEC:
+                return cached
+    except Exception:
+        cached = None
+
+    data = _fetch_fear_greed_cnn() or _fetch_fear_greed_vix()
+    if data:
+        data["fetched_at"] = time.time()
+        try:
+            _FEAR_GREED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _FEAR_GREED_CACHE_PATH.write_text(json.dumps(data))
+        except Exception:
+            pass
+        return data
+
+    # Every live source failed — serve the last reading we have, however stale.
+    return cached
+
+
+def _zone_color(score: float) -> str:
+    """Red (low) → green (high). Shared by every top-of-report gauge, so
+    'needle to the right / greener' always reads as the healthier end."""
+    return (
+        "#e5484d" if score < 25 else
+        "#f76b15" if score < 45 else
+        "#f5b301" if score <= 55 else
+        "#7fbf3f" if score <= 75 else
+        "#2fa84f"
+    )
+
+
+def _render_gauge_card(dom_id: str, score: float, rating: str, label: str,
+                       sub_html: str = "", source: str = "",
+                       tooltip: str = "") -> str:
+    """
+    One semicircular SVG dial (0–100) rendered as a `.market-meter` card.
+    Every top-of-report meter is built through here so they stay identical
+    in shape/behavior; only the number, rating and captions differ.
+    """
+    score = max(0, min(100, int(round(score))))
+    color = _zone_color(score)
+
+    # Needle geometry: score 0 → 180° (left), 100 → 0° (right), 50 → straight up.
+    angle = _math.radians(180.0 - (score / 100.0) * 180.0)
+    cx, cy, needle_len = 100.0, 100.0, 68.0
+    nx = cx + needle_len * _math.cos(angle)
+    ny = cy - needle_len * _math.sin(angle)
+    grad = f"grad-{dom_id}"  # unique per card so duplicate IDs don't collide
+    title_attr = f' title="{tooltip}"' if tooltip else ""
+    source_html = f'<div class="fg-source">{source}</div>' if source else ""
+
+    return f"""
+<div class="market-meter" id="{dom_id}"{title_attr}>
+  <svg class="fg-gauge" viewBox="0 0 200 118" role="img"
+       aria-label="{label}: {score}, {rating}">
+    <defs>
+      <linearGradient id="{grad}" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#e5484d"/>
+        <stop offset="30%" stop-color="#f76b15"/>
+        <stop offset="50%" stop-color="#f5b301"/>
+        <stop offset="72%" stop-color="#7fbf3f"/>
+        <stop offset="100%" stop-color="#2fa84f"/>
+      </linearGradient>
+    </defs>
+    <path d="M20,100 A80,80 0 0 1 180,100" fill="none"
+          stroke="url(#{grad})" stroke-width="15" stroke-linecap="round"/>
+    <line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}"
+          stroke="var(--fg-strong)" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="{cx}" cy="{cy}" r="6" fill="var(--fg-strong)"/>
+  </svg>
+  <div class="fg-readout">
+    <div class="fg-score" style="color:{color};">{score}</div>
+    <div class="fg-rating" style="color:{color};">{rating}</div>
+    <div class="fg-label">{label}</div>
+    {sub_html}
+    {source_html}
+  </div>
+</div>"""
+
+
+def _render_fear_greed_gauge(fg: Optional[dict]) -> str:
+    """Market Fear & Greed dial. Empty string when no reading is available."""
+    if not fg:
+        return ""
+    score = max(0, min(100, int(fg.get("score", 50))))
+    rating = fg.get("rating") or _fg_rating(score)
+    source = fg.get("source") or "Fear & Greed"
+
+    # Optional "vs prior" context — only present for the CNN source.
+    prev_bits = []
+    for lbl, key in (("Prev close", "previous_close"),
+                     ("Week ago", "previous_week"),
+                     ("Month ago", "previous_month")):
+        v = fg.get(key)
+        if isinstance(v, (int, float)):
+            prev_bits.append(
+                f'<span class="fg-prev-item">{lbl} <strong>{round(v)}</strong></span>'
+            )
+    sub_html = (f'<div class="fg-prev">{"".join(prev_bits)}</div>'
+                if prev_bits else "")
+
+    return _render_gauge_card(
+        dom_id="marketMeter", score=score, rating=rating,
+        label="Market Fear &amp; Greed", sub_html=sub_html, source=source,
+        tooltip="Market-wide sentiment. A contrarian, slow-moving gauge — not a timing signal.",
+    )
+
+
+def _render_portfolio_health_gauge(results: list) -> str:
+    """
+    Value-weighted average of per-position verdict scores (0–100).
+    Pairs 'how the market feels' with 'how strong your book is'.
+    """
+    scored = [r for r in results
+              if r.verdict and r.verdict.score is not None
+              and r.live_market_value is not None]
+    if not scored:
+        return ""
+    total_val = sum(r.live_market_value for r in scored)
+    if total_val <= 0:
+        return ""
+    health = sum(r.verdict.score * r.live_market_value for r in scored) / total_val
+    rating = (
+        "Weak" if health < 25 else
+        "Soft" if health < 45 else
+        "Mixed" if health <= 55 else
+        "Solid" if health <= 75 else
+        "Strong"
+    )
+    strong = sum(1 for r in scored if r.verdict.score >= 55)
+    weak = sum(1 for r in scored if r.verdict.score < 45)
+    sub_html = (
+        '<div class="fg-prev">'
+        f'<span class="fg-prev-item">Strong <strong>{strong}</strong></span>'
+        f'<span class="fg-prev-item">Weak <strong>{weak}</strong></span>'
+        f'<span class="fg-prev-item">Rated <strong>{len(scored)}</strong></span>'
+        '</div>'
+    )
+    return _render_gauge_card(
+        dom_id="healthMeter", score=health, rating=rating,
+        label="Portfolio Health", sub_html=sub_html,
+        source="Value-weighted verdict scores",
+        tooltip="Your holdings' verdict scores, weighted by position size. Higher = a stronger book overall.",
+    )
+
+
+def _render_diversification_gauge(results: list) -> str:
+    """
+    Diversification dial (0–100) from position weights. Uses effective number
+    of holdings (1 / Herfindahl index), normalized so ~15 effective names = 100.
+    High = broadly spread; low = concentrated (single-name risk).
+    """
+    holdings = [r for r in results
+                if r.live_market_value is not None and r.live_market_value > 0]
+    if len(holdings) < 2:
+        return ""
+    total_val = sum(r.live_market_value for r in holdings)
+    if total_val <= 0:
+        return ""
+    weights = [(r.ticker, r.live_market_value / total_val) for r in holdings]
+    hhi = sum(w * w for _, w in weights)
+    eff_n = 1.0 / hhi if hhi > 0 else len(holdings)
+    score = max(0.0, min(100.0, eff_n / 15.0 * 100.0))
+    rating = (
+        "Concentrated" if score < 25 else
+        "Focused" if score < 45 else
+        "Balanced" if score <= 55 else
+        "Diversified" if score <= 75 else
+        "Broadly Diversified"
+    )
+    top_ticker, top_w = max(weights, key=lambda x: x[1])
+    sub_html = (
+        '<div class="fg-prev">'
+        f'<span class="fg-prev-item">Top <strong>{top_ticker} {top_w * 100:.0f}%</strong></span>'
+        f'<span class="fg-prev-item">Positions <strong>{len(holdings)}</strong></span>'
+        f'<span class="fg-prev-item">Effective <strong>~{eff_n:.0f}</strong></span>'
+        '</div>'
+    )
+    return _render_gauge_card(
+        dom_id="diversifyMeter", score=score, rating=rating,
+        label="Diversification", sub_html=sub_html,
+        source="Effective holdings (Herfindahl)",
+        tooltip="How spread out your portfolio is. Based on effective number of holdings; low = concentrated single-name risk.",
+    )
+
+
+# ============================================================
 # News sentiment — bounded nudge to the verdict score
 # ============================================================
 # Recent headlines per ticker (Finnhub free company-news, yfinance fallback) are
@@ -4623,6 +4908,20 @@ def generate_html_report(
     has_holdings = bool(results)
     report_title = "Portfolio Analysis" if has_holdings else "Stock Analysis"
 
+    # Top-of-report meter row: market sentiment · book quality · concentration.
+    # Each renderer returns "" when its data is unavailable, so the row simply
+    # shows whichever gauges apply (and collapses entirely with no holdings).
+    _meter_cards = [
+        _render_fear_greed_gauge(fetch_market_fear_greed()),
+        _render_portfolio_health_gauge(results),
+        _render_diversification_gauge(results),
+    ]
+    _meter_cards = [c for c in _meter_cards if c]
+    market_meter_html = (
+        f'<div class="market-meters-row">{"".join(_meter_cards)}</div>'
+        if _meter_cards else ""
+    )
+
     # Quick-recommendations chip — sits in the header controls beside Refresh.
     # Hover reveals the full list (JS handles hover/scroll/leave auto-hide).
     qr_chip_html = ""
@@ -4896,6 +5195,29 @@ def generate_html_report(
   .sub {{ color: var(--fg-muted); font-size: 13px; margin-bottom: 28px; }}
 
   /* ---------- Summary card ---------- */
+  /* Top-of-report meters — market sentiment · portfolio health · diversification. */
+  .market-meters-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }}
+  .market-meter {{ display: flex; align-items: center; gap: 12px;
+                   flex: 1 1 240px; min-width: 210px;
+                   background: var(--bg-summary); border: 1px solid var(--border-medium);
+                   border-radius: 9px; padding: 8px 14px;
+                   box-shadow: var(--shadow-card); }}
+  .fg-gauge {{ width: 96px; height: auto; flex: 0 0 auto; }}
+  .fg-readout {{ display: flex; flex-direction: column; gap: 0; line-height: 1.15; }}
+  .fg-score {{ font-size: 21px; font-weight: 800; letter-spacing: -0.5px; }}
+  .fg-rating {{ font-size: 12px; font-weight: 700; }}
+  .fg-label {{ font-size: 8.5px; font-weight: 600; text-transform: uppercase;
+               letter-spacing: 0.4px; color: var(--fg-muted); margin-top: 2px; }}
+  .fg-prev {{ display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 3px; }}
+  .fg-prev-item {{ font-size: 8.5px; color: var(--fg-muted);
+                   text-transform: uppercase; letter-spacing: 0.3px; }}
+  .fg-prev-item strong {{ color: var(--fg-strong); font-size: 9.5px; }}
+  .fg-source {{ font-size: 8.5px; color: var(--fg-muted); margin-top: 3px; opacity: 0.8; }}
+  @media (max-width: 520px) {{
+    .market-meter {{ gap: 10px; padding: 8px 12px; }}
+    .fg-gauge {{ width: 84px; }}
+    .fg-score {{ font-size: 19px; }}
+  }}
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
                    border-radius: 10px; padding: 14px 20px;
                    margin-bottom: 16px;
@@ -5354,6 +5676,7 @@ def generate_html_report(
   </div>
 </div>
 {refresh_status_html}
+{market_meter_html}
 
 <div class="summary-card">
   <div class="summary-row">{holdings_summary}
