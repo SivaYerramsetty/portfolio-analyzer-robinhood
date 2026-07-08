@@ -3157,6 +3157,21 @@ def _tr_open(r) -> str:
             insider = "caution"
         else:
             insider = "no_signal"
+    # Rank movement vs the previous run (set by _attach_rank_moves; may be
+    # absent in lookup mode). data-rank-move: up/down/new/''; data-rank-delta is
+    # the signed places gained (+climbed / -slipped) for magnitude filters.
+    rank_move = ""
+    rank_delta = ""
+    _rm = getattr(r, "_rank_move", None)
+    if _rm:
+        if _rm.get("new"):
+            rank_move = "new"
+        else:
+            _d = _rm.get("delta") or 0
+            if _d > 0:
+                rank_move, rank_delta = "up", _d
+            elif _d < 0:
+                rank_move, rank_delta = "down", _d
     # Whether tax analysis is populated (for "show tax-relevant" filter)
     has_tax = "1" if getattr(r, "tax", None) is not None else "0"
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
@@ -3179,6 +3194,7 @@ def _tr_open(r) -> str:
         f"data-days-held='{days_held}' "
         f"data-recommendation='{recommendation}' "
         f"data-has-tax='{has_tax}' "
+        f"data-rank-move='{rank_move}' data-rank-delta='{rank_delta}' "
         f"data-search='{search_text}'>"
     )
 
@@ -3262,10 +3278,40 @@ def _trend_cell(r) -> str:
     )
 
 
+def _rank_move_badge(r) -> str:
+    """Small ▲/▼/NEW chip showing rank movement vs the previous run (rank is by
+    verdict score within the ticker's table). Unchanged rows render nothing, to
+    keep tables clean. Movement is set on r._rank_move by _attach_rank_moves."""
+    move = getattr(r, "_rank_move", None)
+    if not move:
+        return ""
+    base = ("font-size:8px;font-weight:700;padding:1px 4px;border-radius:6px;"
+            "margin-left:5px;vertical-align:middle;")
+    if move.get("new"):
+        return (f"<span title='New to the rankings this run' "
+                f"style='{base}letter-spacing:.3px;"
+                f"background:var(--bg-chip-blue);color:var(--fg-chip-blue);'>"
+                f"NEW</span>")
+    delta = move.get("delta") or 0
+    if delta == 0:
+        return ""
+    if delta > 0:
+        arrow, bg, fg, word = "▲", "var(--bg-chip-green)", "var(--fg-chip-green)", "up"
+    else:
+        arrow, bg, fg, word = "▼", "var(--bg-chip-red)", "var(--fg-chip-red)", "down"
+    n = abs(delta)
+    title = (f"Moved {word} {n} place{'s' if n != 1 else ''} "
+             f"vs last run (by verdict rank)")
+    return (f"<span title='{title}' style='{base}"
+            f"background:{bg};color:{fg};'>{arrow}{n}</span>")
+
+
 def _ticker_cell(r) -> str:
-    """Render ticker with business-summary tooltip on hover."""
+    """Render ticker with business-summary tooltip on hover, plus a rank-movement
+    badge (▲/▼/NEW) vs the previous run."""
     if not r.ticker:
         return "—"
+    badge = _rank_move_badge(r)
     if r.business_summary:
         # Escape attribute-breaking chars
         summary = (r.business_summary
@@ -3273,8 +3319,8 @@ def _ticker_cell(r) -> str:
                    .replace("'", "&#39;")
                    .replace('"', "&quot;"))
         return (f"<span class='ticker' style='cursor:help;' "
-                f"title='{summary}'>{r.ticker}</span>")
-    return f"<span class='ticker'>{r.ticker}</span>"
+                f"title='{summary}'>{r.ticker}</span>{badge}")
+    return f"<span class='ticker'>{r.ticker}</span>{badge}"
 
 
 def _news_chip(r) -> str:
@@ -4429,22 +4475,111 @@ def _current_rec_snapshot(
     return snapshot
 
 
+# --- Run-over-run ranking -------------------------------------------------
+# Every report table is sorted by verdict score (highest conviction first). We
+# record each ticker's position under that canonical sort so the next run can
+# show how far it climbed or slipped (▲/▼ badges in the ticker cell). Rank is
+# tracked per group — holdings compounders, holdings thematics, and each
+# watchlist rank independently — so we only ever compare like-for-like.
+
+def _holding_rank_key(r):
+    """Default holdings sort: verdict score desc, market value as tiebreak."""
+    score = (r.verdict.score if r.verdict and r.verdict.score is not None else -1)
+    return (score, r.live_market_value or 0)
+
+
+def _watchlist_rank_key(r):
+    """Default watchlist sort: verdict score desc, upside as tiebreak."""
+    score = (r.verdict.score if r.verdict and r.verdict.score is not None else -1)
+    return (score, r.upside_pct if r.upside_pct is not None else -1e6)
+
+
+def compute_run_ranks(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+) -> dict[str, dict]:
+    """Return {ticker: {"group": str, "rank": int}} — each ticker's 1-based
+    position under the report's default (verdict-score) sort within its group.
+    Groups: 'compounder', 'thematic', 'watch:<list>'. Held tickers are excluded
+    from watchlist ranking to mirror the rendered tables (holdings win)."""
+    ranks: dict[str, dict] = {}
+    compounders = sorted((r for r in results if r.bucket == "compounder"),
+                         key=_holding_rank_key, reverse=True)
+    thematics = sorted((r for r in results if r.bucket == "thematic"),
+                       key=_holding_rank_key, reverse=True)
+    for group, lst in (("compounder", compounders), ("thematic", thematics)):
+        for i, r in enumerate(lst, 1):
+            ranks[r.ticker] = {"group": group, "rank": i}
+    if watchlists:
+        held = {r.ticker for r in results}
+        for wl_name, items in watchlists.items():
+            ordered = sorted((r for r in items if r.ticker not in held),
+                             key=_watchlist_rank_key, reverse=True)
+            for i, r in enumerate(ordered, 1):
+                # A ticker in several lists is ranked by the first list it
+                # appears in (its analysis object is shared across lists).
+                ranks.setdefault(r.ticker,
+                                 {"group": f"watch:{wl_name}", "rank": i})
+    return ranks
+
+
+def _attach_rank_moves(
+    history: dict,
+    ranks: dict[str, dict],
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+) -> None:
+    """Compare this run's ranks against the ledger's last-stored ranks and stash
+    the movement on each analysis object as `r._rank_move` for the ticker badge:
+    {"delta": places_gained, "new": bool}. Positive delta = climbed. `new` marks
+    a ticker with no comparable prior rank (first sighting, or it changed group).
+    MUST run before update_recs_history shifts last→prev."""
+    tickers = history.get("tickers", {})
+
+    def _move_for(ticker: str) -> Optional[dict]:
+        cur = ranks.get(ticker)
+        if not cur:
+            return None
+        entry = tickers.get(ticker)
+        prev_rank = None
+        if entry and entry.get("last_rank_group") == cur["group"]:
+            prev_rank = entry.get("last_rank")
+        if prev_rank is None:
+            return {"delta": None, "new": True}
+        return {"delta": prev_rank - cur["rank"], "new": False}
+
+    seen: set[str] = set()
+    for r in results:
+        r._rank_move = _move_for(r.ticker)
+        seen.add(r.ticker)
+    for items in (watchlists or {}).values():
+        for r in items:
+            if r.ticker not in seen:
+                r._rank_move = _move_for(r.ticker)
+                seen.add(r.ticker)
+
+
 def update_recs_history(
     history: dict,
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     run_date: Optional[str] = None,
+    ranks: Optional[dict[str, dict]] = None,
 ) -> dict:
     """Record the first sighting of every ticker we see (any verdict) and refresh
     latest price/alloc for already-tracked tickers. Mutates and returns
-    `history`."""
+    `history`. `ranks` (from compute_run_ranks) is persisted per ticker with a
+    last→prev shift so the next run can render rank-movement badges."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    if ranks is None:
+        ranks = compute_run_ranks(results, watchlists)
     tickers = history.setdefault("tickers", {})
     snapshot = _current_rec_snapshot(results, watchlists)
 
     for ticker, cur in snapshot.items():
         entry = tickers.get(ticker)
+        cur_rank = ranks.get(ticker) or {}
         if entry is None:
             # Track every ticker from its first sighting, whatever the verdict.
             tickers[ticker] = {
@@ -4466,6 +4601,10 @@ def update_recs_history(
                 "last_news": cur.get("news"),
                 "peak_price": cur["price"],
                 "peak_date": run_date,
+                "last_rank": cur_rank.get("rank"),
+                "last_rank_group": cur_rank.get("group"),
+                "prev_rank": None,
+                "prev_rank_group": None,
             }
             continue
         # Refresh latest snapshot for an already-tracked ticker.
@@ -4489,6 +4628,11 @@ def update_recs_history(
         if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
             entry["peak_price"] = cur["price"]
             entry["peak_date"] = run_date
+        # Rank: shift the prior run's rank into prev, then record this run's.
+        entry["prev_rank"] = entry.get("last_rank")
+        entry["prev_rank_group"] = entry.get("last_rank_group")
+        entry["last_rank"] = cur_rank.get("rank")
+        entry["last_rank_group"] = cur_rank.get("group")
     return history
 
 
@@ -4847,12 +4991,9 @@ def generate_html_report(
     compounders = [r for r in results if r.bucket == "compounder"]
     thematics = [r for r in results if r.bucket == "thematic"]
     # Default order: verdict score high → low (market value as tiebreak).
-    def _verdict_sort_key(r):
-        score = (r.verdict.score if r.verdict and r.verdict.score is not None
-                 else -1)
-        return (score, r.live_market_value or 0)
-    compounders.sort(key=_verdict_sort_key, reverse=True)
-    thematics.sort(key=_verdict_sort_key, reverse=True)
+    # Shared with compute_run_ranks so rank badges match the displayed order.
+    compounders.sort(key=_holding_rank_key, reverse=True)
+    thematics.sort(key=_holding_rank_key, reverse=True)
 
     action_items = [r for r in results
                     if r.verdict and r.verdict.label in ("SELL", "TRIM")]
@@ -5715,6 +5856,8 @@ def generate_html_report(
       <button class="filter-pill" data-filter="verdict-buy">BUY (watchlist) only</button>
       <button class="filter-pill" data-filter="verdict-watch">WATCH only</button>
       <button class="filter-pill" data-filter="verdict-score-high">Verdict score 75+</button>
+      <button class="filter-pill" data-filter="verdict-score-85">Verdict score 85+</button>
+      <button class="filter-pill" data-filter="verdict-score-90">Verdict score 90+</button>
       <button class="filter-pill" data-filter="verdict-score-low">Verdict score &lt;40</button>
     </div>
     <div class="filter-group">
@@ -5777,6 +5920,14 @@ def generate_html_report(
       <button class="filter-pill" data-filter="down-today">▼ Down today</button>
       <button class="filter-pill" data-filter="big-up-today">▲ Movers (+3%)</button>
       <button class="filter-pill" data-filter="big-down-today">▼ Movers (-3%)</button>
+    </div>
+    <div class="filter-group">
+      <span class="filter-group-label">Rank movement</span>
+      <button class="filter-pill" data-filter="moved-up">▲ Moved up</button>
+      <button class="filter-pill" data-filter="moved-down">▼ Moved down</button>
+      <button class="filter-pill" data-filter="big-climbers">▲▲ Big climbers (3+)</button>
+      <button class="filter-pill" data-filter="big-fallers">▼▼ Big fallers (3+)</button>
+      <button class="filter-pill" data-filter="rank-new">★ New this run</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Analyst rating</span>
@@ -5909,11 +6060,8 @@ def generate_html_report(
             if not items:
                 continue
             # Default order: verdict score high → low (upside as tiebreak).
-            items.sort(key=lambda r: (
-                (r.verdict.score if r.verdict and r.verdict.score is not None
-                 else -1),
-                (r.upside_pct if r.upside_pct is not None else -1e6),
-            ), reverse=True)
+            # Shared with compute_run_ranks so rank badges match the display.
+            items.sort(key=_watchlist_rank_key, reverse=True)
             html += f"<h3 style='margin-top:24px;color:#34495e;'>📋 {wl_name} ({len(items)})</h3>\n"
             html += "<div class='table-wrap'><table>\n<thead><tr>"
             html += (
@@ -6253,6 +6401,8 @@ Verdicts are framework outputs, not investment advice.
     var hasTax = row.getAttribute('data-has-tax') || '0';
     var bucket = row.getAttribute('data-bucket') || '';
     var earningsDays = num(row.getAttribute('data-earnings-days'));
+    var rankMove = row.getAttribute('data-rank-move') || '';
+    var rankDelta = num(row.getAttribute('data-rank-delta'));
 
     switch (filter) {
       // ------------- Essentials (top row) -------------
@@ -6270,7 +6420,16 @@ Verdicts are framework outputs, not investment advice.
       case 'verdict-buy':     return verdict === 'BUY';
       case 'verdict-watch':   return verdict === 'WATCH';
       case 'verdict-score-high': return !isNaN(verdictScore) && verdictScore >= 75;
+      case 'verdict-score-85':   return !isNaN(verdictScore) && verdictScore >= 85;
+      case 'verdict-score-90':   return !isNaN(verdictScore) && verdictScore >= 90;
       case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
+
+      // ------------- Rank movement (vs previous run) -------------
+      case 'moved-up':       return rankMove === 'up';
+      case 'moved-down':     return rankMove === 'down';
+      case 'rank-new':       return rankMove === 'new';
+      case 'big-climbers':   return rankMove === 'up'   && !isNaN(rankDelta) && rankDelta >= 3;
+      case 'big-fallers':    return rankMove === 'down' && !isNaN(rankDelta) && rankDelta <= -3;
 
       // ------------- Quality / Composite -------------
       case 'high-score':      return !isNaN(score) && score >= 70;
@@ -7245,7 +7404,14 @@ def main():
     recs_tracked_count = 0
     try:
         recs_history = load_recs_history()
-        update_recs_history(recs_history, results, watchlists_analyzed or None)
+        # Rank each ticker under the report's default sort, then diff against the
+        # ledger's last-stored ranks (attaches r._rank_move for the ▲/▼ badges)
+        # BEFORE update_recs_history shifts last→prev.
+        run_ranks = compute_run_ranks(results, watchlists_analyzed or None)
+        _attach_rank_moves(recs_history, run_ranks, results,
+                           watchlists_analyzed or None)
+        update_recs_history(recs_history, results, watchlists_analyzed or None,
+                            ranks=run_ranks)
         save_recs_history(recs_history)
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
