@@ -446,6 +446,135 @@ def fetch_market_fear_greed() -> Optional[dict]:
     return cached
 
 
+# --- S&P 500 benchmark returns (for the portfolio-vs-market summary stat) ----
+_SP500_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "sp500_returns.json"
+_SP500_TTL_SEC = 30 * 60  # re-fetch at most every 30 min
+
+
+def fetch_benchmark_returns() -> Optional[dict]:
+    """S&P 500 (^GSPC) reference returns for the portfolio-vs-market stat:
+    {"today_pct", "ytd_pct"}. today = last close vs the prior close; ytd = last
+    close vs the first close of the calendar year. Cached in .cache/ (30-min
+    TTL, carried across CI runs like the fear/greed cache); a stale cache is
+    served if a fetch fails so the stat doesn't blank on a brief yfinance
+    hiccup. Returns None only when there is no data at all."""
+    if os.environ.get("MARKET_METER", "").strip() == "0":
+        return None
+
+    cached: Optional[dict] = None
+    try:
+        if _SP500_CACHE_PATH.exists():
+            cached = json.loads(_SP500_CACHE_PATH.read_text())
+            if time.time() - cached.get("fetched_at", 0) < _SP500_TTL_SEC:
+                return cached
+    except Exception:
+        cached = None
+
+    try:
+        hist = yf.Ticker("^GSPC").history(period="ytd")
+        closes = hist["Close"].dropna() if hist is not None else None
+        if closes is None or len(closes) < 2:
+            return cached
+        first = float(closes.iloc[0])
+        prev = float(closes.iloc[-2])
+        last = float(closes.iloc[-1])
+        data = {
+            "today_pct": ((last - prev) / prev * 100) if prev else None,
+            "ytd_pct": ((last - first) / first * 100) if first else None,
+            "fetched_at": time.time(),
+        }
+        try:
+            _SP500_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _SP500_CACHE_PATH.write_text(json.dumps(data))
+        except Exception:
+            pass
+        return data
+    except Exception:
+        return cached
+
+
+def _compute_holdings_ytd_return(results) -> Optional[float]:
+    """Market-value-weighted YTD price return (%) of the CURRENT holdings — a
+    like-for-like counterpart to the S&P 500 YTD figure. Each holding's live
+    price is compared to its first close of the calendar year, weighted by live
+    market value; holdings whose YTD history is unavailable are dropped and the
+    weights renormalize over the rest. This is an approximation of 'how the
+    stocks I hold now have done this year', not a true time-weighted account
+    return (it ignores intra-year buys/sells). Returns None if no history."""
+    holdings = [r for r in results
+                if getattr(r, "current_price", None)
+                and getattr(r, "live_market_value", None)
+                and r.live_market_value > 0 and getattr(r, "ticker", None)]
+    if not holdings:
+        return None
+    tickers = sorted({r.ticker for r in holdings})
+    year = datetime.now(ZoneInfo("America/New_York")).year
+    try:
+        raw = yf.download(tickers, start=f"{year}-01-01",
+                          progress=False, auto_adjust=False)
+        close = raw["Close"]
+    except Exception:
+        return None
+
+    start_prices: dict[str, float] = {}
+    try:
+        if hasattr(close, "columns"):        # multi-ticker DataFrame
+            for t in tickers:
+                if t in close.columns:
+                    s = close[t].dropna()
+                    if not s.empty:
+                        start_prices[t] = float(s.iloc[0])
+        else:                                 # single-ticker Series
+            s = close.dropna()
+            if not s.empty and len(tickers) == 1:
+                start_prices[tickers[0]] = float(s.iloc[0])
+    except Exception:
+        return None
+
+    acc = 0.0
+    total_w = 0.0
+    for r in holdings:
+        sp = start_prices.get(r.ticker)
+        if not sp or sp <= 0:
+            continue
+        acc += r.live_market_value * ((r.current_price - sp) / sp)
+        total_w += r.live_market_value
+    if total_w <= 0:
+        return None
+    return acc / total_w * 100
+
+
+def _render_benchmark_stat(port_today_pct: Optional[float],
+                           port_ytd_pct: Optional[float],
+                           bench: Optional[dict]) -> str:
+    """Two standalone summary tiles — 'vs S&P 500 · Today' and 'vs S&P 500 ·
+    YTD' — matching the single-value layout of the other stats in the row. Each
+    shows the portfolio's return as the big figure (green when it beats the
+    index for that horizon, red when it lags) with the S&P's own return in the
+    label. A tile appears only when both sides have data; nothing renders if the
+    benchmark is unavailable or no horizon can be shown."""
+    if not bench:
+        return ""
+    tip = ("Your current holdings' price return vs the S&P 500 (^GSPC). "
+           "Today = vs prior close; YTD = vs the first close of the year. "
+           "Green = beating the index. YTD is value-weighted over holdings "
+           "with available history (ignores intra-year trades).")
+    blocks = []
+    for label, port_val, spx in (
+        ("Today", port_today_pct, bench.get("today_pct")),
+        ("YTD", port_ytd_pct, bench.get("ytd_pct")),
+    ):
+        if port_val is None or spx is None:
+            continue
+        color = "var(--pos-up)" if port_val >= spx else "var(--pos-down)"
+        blocks.append(
+            f'<div class="stat" title="{tip}">'
+            f'<strong style="color:{color};">{_fmt_pct(port_val, 2, True)}</strong>'
+            f'vs S&amp;P 500 · {label} ({_fmt_pct(spx, 2, True)})</div>'
+        )
+    return "".join(blocks)
+
+
 def _zone_color(score: float) -> str:
     """Red (low) → green (high). Shared by every top-of-report gauge, so
     'needle to the right / greener' always reads as the healthier end."""
@@ -3157,7 +3286,7 @@ def _tr_open(r) -> str:
             insider = "caution"
         else:
             insider = "no_signal"
-    # Rank movement vs the previous run (set by _attach_rank_moves; may be
+    # Rank movement vs the previous day (set by _attach_rank_moves; may be
     # absent in lookup mode). data-rank-move: up/down/new/''; data-rank-delta is
     # the signed places gained (+climbed / -slipped) for magnitude filters.
     rank_move = ""
@@ -3279,7 +3408,7 @@ def _trend_cell(r) -> str:
 
 
 def _rank_move_badge(r) -> str:
-    """Small ▲/▼/NEW chip showing rank movement vs the previous run (rank is by
+    """Small ▲/▼/NEW chip showing rank movement vs the previous day (rank is by
     verdict score within the ticker's table). Unchanged rows render nothing, to
     keep tables clean. Movement is set on r._rank_move by _attach_rank_moves."""
     move = getattr(r, "_rank_move", None)
@@ -3301,14 +3430,14 @@ def _rank_move_badge(r) -> str:
         arrow, bg, fg, word = "▼", "var(--bg-chip-red)", "var(--fg-chip-red)", "down"
     n = abs(delta)
     title = (f"Moved {word} {n} place{'s' if n != 1 else ''} "
-             f"vs last run (by verdict rank)")
+             f"vs the previous day (by verdict rank)")
     return (f"<span title='{title}' style='{base}"
             f"background:{bg};color:{fg};'>{arrow}{n}</span>")
 
 
 def _ticker_cell(r) -> str:
     """Render ticker with business-summary tooltip on hover, plus a rank-movement
-    badge (▲/▼/NEW) vs the previous run."""
+    badge (▲/▼/NEW) vs the previous day."""
     if not r.ticker:
         return "—"
     badge = _rank_move_badge(r)
@@ -4528,12 +4657,21 @@ def _attach_rank_moves(
     ranks: dict[str, dict],
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    run_date: Optional[str] = None,
 ) -> None:
-    """Compare this run's ranks against the ledger's last-stored ranks and stash
-    the movement on each analysis object as `r._rank_move` for the ticker badge:
-    {"delta": places_gained, "new": bool}. Positive delta = climbed. `new` marks
-    a ticker with no comparable prior rank (first sighting, or it changed group).
-    MUST run before update_recs_history shifts last→prev."""
+    """Compare this run's ranks against the rank recorded on the *previous
+    calendar day* (not merely the previous run) and stash the movement on each
+    analysis object as `r._rank_move` for the ticker badge: {"delta":
+    places_gained, "new": bool}. Positive delta = climbed. `new` marks a ticker
+    with no comparable prior-day rank (first sighting, or it changed group).
+
+    Comparing to the prior day (rather than the prior run) means the two runs on
+    the same trading day — 9:30 AM and 4 PM — both show movement relative to
+    yesterday's close-of-day ranking, instead of the afternoon run diffing only
+    against the morning run. MUST run before update_recs_history rolls the
+    baseline forward."""
+    if run_date is None:
+        run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     tickers = history.get("tickers", {})
 
     def _move_for(ticker: str) -> Optional[dict]:
@@ -4541,12 +4679,21 @@ def _attach_rank_moves(
         if not cur:
             return None
         entry = tickers.get(ticker)
-        prev_rank = None
-        if entry and entry.get("last_rank_group") == cur["group"]:
-            prev_rank = entry.get("last_rank")
-        if prev_rank is None:
+        if not entry:
             return {"delta": None, "new": True}
-        return {"delta": prev_rank - cur["rank"], "new": False}
+        # Baseline = rank as of the last run of a previous calendar day. If the
+        # most recent stored run was itself on an earlier day, that run IS the
+        # prior-day baseline; if it already ran earlier today, use the retained
+        # prior-day baseline so both of today's runs compare to yesterday.
+        if entry.get("last_rank_date") != run_date:
+            base_rank = entry.get("last_rank")
+            base_group = entry.get("last_rank_group")
+        else:
+            base_rank = entry.get("prev_day_rank")
+            base_group = entry.get("prev_day_rank_group")
+        if base_rank is None or base_group != cur["group"]:
+            return {"delta": None, "new": True}
+        return {"delta": base_rank - cur["rank"], "new": False}
 
     seen: set[str] = set()
     for r in results:
@@ -4568,8 +4715,9 @@ def update_recs_history(
 ) -> dict:
     """Record the first sighting of every ticker we see (any verdict) and refresh
     latest price/alloc for already-tracked tickers. Mutates and returns
-    `history`. `ranks` (from compute_run_ranks) is persisted per ticker with a
-    last→prev shift so the next run can render rank-movement badges."""
+    `history`. `ranks` (from compute_run_ranks) is persisted per ticker, rolling
+    a prior-DAY baseline forward on the first run of each new day so the next run
+    can render rank-movement badges relative to yesterday."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     if ranks is None:
@@ -4603,8 +4751,13 @@ def update_recs_history(
                 "peak_date": run_date,
                 "last_rank": cur_rank.get("rank"),
                 "last_rank_group": cur_rank.get("group"),
+                "last_rank_date": run_date,
                 "prev_rank": None,
                 "prev_rank_group": None,
+                # Daily baseline: the rank as of the last run of a prior day,
+                # what the ▲/▼ badge diffs against. None until a new day runs.
+                "prev_day_rank": None,
+                "prev_day_rank_group": None,
             }
             continue
         # Refresh latest snapshot for an already-tracked ticker.
@@ -4628,11 +4781,18 @@ def update_recs_history(
         if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
             entry["peak_price"] = cur["price"]
             entry["peak_date"] = run_date
-        # Rank: shift the prior run's rank into prev, then record this run's.
+        # Rank: on the first run of a new day, roll the daily baseline forward
+        # (the prior run — yesterday's last — becomes what today diffs against).
+        # Same-day re-runs keep the baseline so both runs compare to yesterday.
+        if entry.get("last_rank_date") != run_date:
+            entry["prev_day_rank"] = entry.get("last_rank")
+            entry["prev_day_rank_group"] = entry.get("last_rank_group")
+        # prev_rank still tracks the immediately-previous run (kept for history).
         entry["prev_rank"] = entry.get("last_rank")
         entry["prev_rank_group"] = entry.get("last_rank_group")
         entry["last_rank"] = cur_rank.get("rank")
         entry["last_rank_group"] = cur_rank.get("group")
+        entry["last_rank_date"] = run_date
     return history
 
 
@@ -5139,6 +5299,17 @@ def generate_html_report(
             f'Earnings within {EARNINGS_SOON_DAYS}d</a>'
         )
 
+    # Portfolio-vs-S&P 500 stat — sits right after Earnings within 7d. Shows the
+    # current holdings' return against the index for Today and YTD. Only built
+    # with holdings, and hides itself if the benchmark can't be fetched.
+    benchmark_stat_html = ""
+    if has_holdings:
+        benchmark_stat_html = _render_benchmark_stat(
+            day_change_pct,
+            _compute_holdings_ytd_return(results),
+            fetch_benchmark_returns(),
+        )
+
     holdings_summary = ""
     if has_holdings:
         # Today's-change stat (colored), only when we have the data.
@@ -5597,7 +5768,7 @@ def generate_html_report(
                        border-color: var(--fg-chip-red); }}
   /* Frequent-combo pills live in #freqFilters; display:contents lets the
      buttons flow directly in the filter-bar-top flex row. The ★ marks them
-     as your saved/most-used combos vs. the regular pills in More filters. */
+     as your recently-used combos vs. the regular pills in More filters. */
   #freqFilters {{ display: contents; }}
   .freq-pill::before {{ content: "★ "; color: var(--accent, #e6a817);
                         font-size: 10px; }}
@@ -5824,14 +5995,15 @@ def generate_html_report(
     {watchlist_stat_html}
     {missed_stat_html}
     {earnings_stat_html}
+    {benchmark_stat_html}
   </div>
 </div>
 
 <div class="filter-bar">
   <div class="filter-bar-top">
     <input type="text" id="searchInput" placeholder="🔍 Search ticker or name…" autocomplete="off">
-    <!-- Your most-used filter combos, populated from localStorage by JS
-         (persists across regenerated reports — same Pages origin). Seeds
+    <!-- Your 10 most recently-used filter combos, populated from localStorage
+         by JS (persists across regenerated reports — same Pages origin). Seeds
          with the Quick-picks defaults below until usage history builds up. -->
     <span id="freqFilters"></span>
     <button class="more-toggle" id="moreToggle">More filters ▾</button>
@@ -5927,7 +6099,7 @@ def generate_html_report(
       <button class="filter-pill" data-filter="moved-down">▼ Moved down</button>
       <button class="filter-pill" data-filter="big-climbers">▲▲ Big climbers (3+)</button>
       <button class="filter-pill" data-filter="big-fallers">▼▼ Big fallers (3+)</button>
-      <button class="filter-pill" data-filter="rank-new">★ New this run</button>
+      <button class="filter-pill" data-filter="rank-new">★ New today</button>
     </div>
     <div class="filter-group">
       <span class="filter-group-label">Analyst rating</span>
@@ -6424,7 +6596,7 @@ Verdicts are framework outputs, not investment advice.
       case 'verdict-score-90':   return !isNaN(verdictScore) && verdictScore >= 90;
       case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
 
-      // ------------- Rank movement (vs previous run) -------------
+      // ------------- Rank movement (vs previous day) -------------
       case 'moved-up':       return rankMove === 'up';
       case 'moved-down':     return rankMove === 'down';
       case 'rank-new':       return rankMove === 'new';
@@ -6646,13 +6818,14 @@ Verdicts are framework outputs, not investment advice.
     window.addEventListener('scroll', closeMore, { passive: true });
   }
 
-  // ----- Frequent filter combos -----
-  // Most-used filter combinations, persisted in localStorage and shown as ★
-  // pills at the top — adapting to how you actually filter. localStorage is
-  // per-origin, so this history survives every regenerated/republished report.
+  // ----- Recently-used filter combos -----
+  // The most RECENTLY used filter combinations, persisted in localStorage and
+  // shown as ★ pills at the top — adapting to how you actually filter.
+  // localStorage is per-origin, so this history survives every
+  // regenerated/republished report.
   var freqEl = document.getElementById('freqFilters');
-  var USAGE_KEY = 'filterComboUsage';
-  var FREQ_MAX = 6;   // how many ★ combo pills to show
+  var USAGE_KEY = 'filterComboUsage';   // { comboKey: lastUsedEpochMs }
+  var FREQ_MAX = 10;   // how many ★ combo pills to show (latest N)
   // Seed (and fallback) combos = the former fixed quick-picks.
   var DEFAULT_COMBOS = [['buy'], ['action'], ['high-quality'],
                         ['hot-sector'], ['insider-buy']];
@@ -6669,14 +6842,15 @@ Verdicts are framework outputs, not investment advice.
 
   var recordTimer = null;
   function recordUsageDebounced() {
-    // Record the combo the user settles on (not every intermediate toggle).
+    // Record the combo the user settles on (not every intermediate toggle),
+    // stamped with when it was last used so the bar shows most-recent combos.
     clearTimeout(recordTimer);
     recordTimer = setTimeout(function() {
       if (!activeFilters.size) return;        // never record the empty set
       var u = loadUsage();
-      u[currentKey()] = (u[currentKey()] || 0) + 1;
+      u[currentKey()] = Date.now();           // last-used timestamp (ms)
       var keys = Object.keys(u);
-      if (keys.length > 40) {                 // cap growth: keep the top 40
+      if (keys.length > 40) {                 // cap growth: keep the 40 most recent
         keys.sort(function(a, b) { return u[b] - u[a]; });
         var t = {}; keys.slice(0, 40).forEach(function(x) { t[x] = u[x]; });
         u = t;
@@ -6719,6 +6893,7 @@ Verdicts are framework outputs, not investment advice.
   function renderFrequent() {
     if (!freqEl) return;
     var u = loadUsage();
+    // Most-recent first (values are last-used timestamps).
     var combos = Object.keys(u)
       .sort(function(a, b) { return u[b] - u[a]; })
       .map(function(k) { return k.split('+'); });
@@ -7405,13 +7580,15 @@ def main():
     try:
         recs_history = load_recs_history()
         # Rank each ticker under the report's default sort, then diff against the
-        # ledger's last-stored ranks (attaches r._rank_move for the ▲/▼ badges)
-        # BEFORE update_recs_history shifts last→prev.
+        # ledger's prior-DAY ranks (attaches r._rank_move for the ▲/▼ badges)
+        # BEFORE update_recs_history rolls the daily baseline forward. Both use
+        # the same run_date so the same-day/new-day split stays consistent.
+        _run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
         run_ranks = compute_run_ranks(results, watchlists_analyzed or None)
         _attach_rank_moves(recs_history, run_ranks, results,
-                           watchlists_analyzed or None)
+                           watchlists_analyzed or None, run_date=_run_date)
         update_recs_history(recs_history, results, watchlists_analyzed or None,
-                            ranks=run_ranks)
+                            run_date=_run_date, ranks=run_ranks)
         save_recs_history(recs_history)
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
