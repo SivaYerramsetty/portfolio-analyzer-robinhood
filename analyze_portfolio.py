@@ -1931,10 +1931,10 @@ def compute_verdict_v2(
             label, color = "ADD", "#27ae60"        # strong conviction add
         elif score >= 60:
             label, color = "HOLD", "#2c3e50"       # stay the course
-        elif score >= 42:
+        elif score >= 50:
             label, color = "HOLD", "#7f8c8d"       # weak HOLD (muted gray)
         elif score >= 28:
-            label, color = "TRIM", "#e67e22"
+            label, color = "TRIM", "#e67e22"       # below neutral (~50) — lean out
         else:
             label, color = "SELL", "#c0392b"
     else:
