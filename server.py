@@ -68,6 +68,10 @@ def _analyze_rows(rows, use_rh_ratings=True, is_watchlist=False, log_fn=None):
     return analyze_positions_parallel(
         rows, use_robinhood_ratings=use_rh_ratings,
         is_watchlist=is_watchlist, log_fn=log_fn,
+        # Someone is watching this refresh, so skip the news batch pre-pass —
+        # it trades minutes of latency for half-price scoring, which is the
+        # right call for the scheduled CI run and the wrong one here.
+        batch_news=False,
     )
 
 def _render_section_html(section: str, results, watchlists=None, realized_ytd=None,

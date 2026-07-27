@@ -167,9 +167,12 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 # When ANTHROPIC_API_KEY is set, each ticker's recent headlines are scored by
 # Claude and the result nudges the verdict (bounded; see _NEWS_* below). Unset
 # the key to disable entirely (no calls, no cost). NEWS_MODEL defaults to the
-# most capable model; set NEWS_MODEL=claude-haiku-4-5 to cut cost/latency ~5x.
+# cheapest model that fits the job — this is a one-sentence judgement over <=6
+# headlines, not a reasoning task, so Haiku is 5x cheaper than Opus at
+# equivalent quality here ($1/$5 vs $5/$25 per million in/out tokens). Set
+# NEWS_MODEL=claude-opus-5 if a sharper read is ever worth the 5x.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-NEWS_MODEL = os.environ.get("NEWS_MODEL", "claude-opus-4-8").strip() or "claude-opus-4-8"
+NEWS_MODEL = os.environ.get("NEWS_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
 
 
 # ============================================================
@@ -746,7 +749,7 @@ def _render_diversification_gauge(results: list) -> str:
 # News sentiment — bounded nudge to the verdict score
 # ============================================================
 # Recent headlines per ticker (Finnhub free company-news, yfinance fallback) are
-# scored into one bullish/bearish number, cached on disk (default 6h TTL), then
+# scored into one bullish/bearish number, cached on disk (default 12h TTL), then
 # mapped to a small bounded modifier in compute_verdict_v2 (see
 # _news_signal_modifier). Scoring is FREE by default via a headline lexicon; if
 # ANTHROPIC_API_KEY is set it upgrades to Claude for sharper reads. The cache
@@ -759,7 +762,14 @@ _news_cache: Optional[dict] = None
 _news_cache_dirty = False
 _news_hits = 0
 _news_misses = 0
+_news_batched = 0                 # tickers scored via the 50%-off Batches API
+_news_batch_inflight: set[str] = set()   # submitted, result not back yet
 _anthropic_client_singleton = None
+
+# Reserved key inside the news cache file holding batches that were submitted
+# but hadn't finished when the run ended. Not a valid ticker, so it can never
+# collide with a real cache entry.
+_NEWS_PENDING_KEY = "__pending_batches__"
 
 _NEWS_SENTIMENT_SCHEMA = {
     "type": "object",
@@ -774,10 +784,14 @@ _NEWS_SENTIMENT_SCHEMA = {
 
 
 def _news_cache_ttl_hours() -> float:
+    """Hours a scored ticker stays cached. 12h means at most one scoring call
+    per ticker per day even with a morning + afternoon run (they're 6.5h apart,
+    so a 6h TTL made the second run re-score everything). Lower it only if
+    intraday news needs to move the verdict the same session."""
     try:
-        return float(os.environ.get("NEWS_CACHE_TTL_HOURS", "6"))
+        return float(os.environ.get("NEWS_CACHE_TTL_HOURS", "12"))
     except ValueError:
-        return 6.0
+        return 12.0
 
 
 def _load_news_cache() -> dict:
@@ -858,16 +872,25 @@ def fetch_recent_headlines(ticker: str, max_items: int = 8) -> list[str]:
     return out[:max_items]
 
 
-def _call_claude_sentiment(client, ticker, name, headlines) -> Optional[dict]:
+# The prompt and the response parsing are shared by the real-time path
+# (_call_claude_sentiment) and the batch path (prewarm_news_sentiment) so the
+# two can never drift into scoring the same headlines differently.
+_NEWS_SYSTEM = (
+    "You are an equity news analyst. Read a stock's recent headlines and "
+    "judge the net sentiment for its forward price over the next few weeks. "
+    "Weigh material catalysts (earnings, guidance, M&A, regulatory, "
+    "litigation, products) far more than routine coverage; ignore generic "
+    "market commentary; be skeptical of hype."
+)
+
+
+def _news_request_params(ticker, name, headlines) -> dict:
+    """The Messages-API params for scoring one ticker — identical whether sent
+    real-time or inside a batch."""
     label = f"{name} ({ticker})" if name else ticker
-    bullets = "\n".join(f"- {h}" for h in headlines)
-    system = (
-        "You are an equity news analyst. Read a stock's recent headlines and "
-        "judge the net sentiment for its forward price over the next few weeks. "
-        "Weigh material catalysts (earnings, guidance, M&A, regulatory, "
-        "litigation, products) far more than routine coverage; ignore generic "
-        "market commentary; be skeptical of hype."
-    )
+    # Headlines carry their signal in the first clause; a few sources emit
+    # 300-char SEO titles. Trim so one outlier can't triple the input tokens.
+    bullets = "\n".join(f"- {h[:160]}" for h in headlines)
     prompt = (
         f"Stock: {label}\n\nRecent headlines (newest first):\n{bullets}\n\n"
         "Return JSON with: score (number from -1.0 very bearish to +1.0 very "
@@ -875,25 +898,43 @@ def _call_claude_sentiment(client, ticker, name, headlines) -> Optional[dict]:
         "bearish), and rationale (one concise sentence, max ~20 words, citing "
         "the key driver)."
     )
+    return {
+        "model": NEWS_MODEL,
+        # The schema caps this at a score, a label and a ~20-word rationale
+        # (~70 tokens). 200 is a spend guard rail, not a squeeze: output is
+        # billed on tokens actually generated, so this only bounds a runaway.
+        "max_tokens": 200,
+        "system": _NEWS_SYSTEM,
+        "messages": [{"role": "user", "content": prompt}],
+        "output_config": {"format": {"type": "json_schema",
+                                     "schema": _NEWS_SENTIMENT_SCHEMA}},
+    }
+
+
+def _parse_sentiment_response(content, headlines) -> Optional[dict]:
+    """Turn a Message's content blocks into a sentiment dict, or None if the
+    model returned something unparseable (caller falls back to the lexicon)."""
+    text = next((b.text for b in content if b.type == "text"), "")
+    data = json.loads(text)
+    score = max(-1.0, min(1.0, float(data.get("score", 0) or 0)))
+    return {
+        "score": score,
+        "label": str(data.get("label", "neutral")),
+        "rationale": str(data.get("rationale", "")).strip(),
+        "headlines": headlines[:5],
+        "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+    }
+
+
+def _call_claude_sentiment(client, ticker, name, headlines) -> Optional[dict]:
+    """Score one ticker in real time (full price). The batch path in
+    prewarm_news_sentiment is half the cost and handles the bulk of tickers;
+    this covers stragglers it didn't cover."""
     try:
         resp = client.with_options(timeout=20.0).messages.create(
-            model=NEWS_MODEL,
-            max_tokens=400,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {"type": "json_schema",
-                                       "schema": _NEWS_SENTIMENT_SCHEMA}},
+            **_news_request_params(ticker, name, headlines)
         )
-        text = next((b.text for b in resp.content if b.type == "text"), "")
-        data = json.loads(text)
-        score = max(-1.0, min(1.0, float(data.get("score", 0) or 0)))
-        return {
-            "score": score,
-            "label": str(data.get("label", "neutral")),
-            "rationale": str(data.get("rationale", "")).strip(),
-            "headlines": headlines[:5],
-            "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
-        }
+        return _parse_sentiment_response(resp.content, headlines)
     except Exception as e:
         print(f"[news] {ticker}: scoring failed ({type(e).__name__}: {e})")
         return None
@@ -970,10 +1011,14 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
     headlines = fetch_recent_headlines(ticker)
     result = None
     if headlines:
-        client = _anthropic_client()       # paid, higher quality — only if keyed
+        # A ticker already in flight in a batch must NOT be re-scored in real
+        # time — that would pay full price for an answer we've already bought at
+        # half. Use the free lexicon this run; the batch result lands in the
+        # cache on a later run (see _harvest_pending_news_batches).
+        client = None if ticker in _news_batch_inflight else _anthropic_client()
         if client is not None:
             result = _call_claude_sentiment(client, ticker, name, headlines)
-        if result is None:                 # no key, or LLM failed -> free lexicon
+        if result is None:                 # no key, in-flight, or LLM failed
             result = _lexicon_sentiment(headlines)
 
     if ttl > 0:
@@ -982,6 +1027,226 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
             _news_cache_dirty = True
             _news_misses += 1
     return result
+
+
+# ============================================================
+# News sentiment — batch pre-pass (50% cheaper than real-time)
+# ============================================================
+# Scoring every ticker one-at-a-time inside the analysis loop pays full API
+# price. The Batches API is half price for the same requests, and this run is a
+# nightly/scheduled job with no user waiting on any individual ticker — so all
+# cache misses are submitted as one batch up front, and the analysis loop then
+# reads them out of the cache as ordinary hits.
+#
+# Batches are usually done in well under a minute at this size, but the API only
+# guarantees 24h. So the wait is bounded (NEWS_BATCH_WAIT_SECONDS, default 300):
+# if the batch hasn't landed by then the run finishes on the free lexicon and
+# the batch id is persisted, so the NEXT run harvests the results instead of
+# abandoning work already paid for. Set NEWS_BATCH=0 to go back to real-time.
+
+
+def _news_batch_enabled() -> bool:
+    return os.environ.get("NEWS_BATCH", "1").strip() != "0"
+
+
+def _news_batch_wait_seconds() -> float:
+    try:
+        return float(os.environ.get("NEWS_BATCH_WAIT_SECONDS", "") or 300)
+    except ValueError:
+        return 300.0
+
+
+def _news_cache_fresh(cache: dict, ticker: str, ttl: float) -> bool:
+    entry = cache.get(ticker)
+    return bool(entry and (time.time() - entry.get("ts", 0)) < ttl * 3600)
+
+
+def _store_batch_results(client, batch_id: str, id_map: dict,
+                         headlines_by_ticker: dict) -> int:
+    """Write a finished batch's results into the news cache. Returns how many
+    tickers were scored. Unparseable or errored entries are simply left out —
+    the ticker falls through to the lexicon on the next read."""
+    global _news_cache_dirty, _news_batched
+    scored = 0
+    for res in client.messages.batches.results(batch_id):
+        ticker = id_map.get(res.custom_id)
+        if not ticker:
+            continue
+        if res.result.type != "succeeded":
+            print(f"[news-batch] {ticker}: {res.result.type}")
+            continue
+        try:
+            sentiment = _parse_sentiment_response(
+                res.result.message.content,
+                headlines_by_ticker.get(ticker, []),
+            )
+        except Exception as e:
+            print(f"[news-batch] {ticker}: unparseable ({type(e).__name__}: {e})")
+            continue
+        with _news_cache_lock:
+            _load_news_cache()[ticker] = {"ts": time.time(), "sentiment": sentiment}
+            _news_cache_dirty = True
+            _news_batched += 1
+        scored += 1
+    _flush_news_cache()   # make paid-for scores durable immediately
+    return scored
+
+
+def _pending_batches() -> list:
+    with _news_cache_lock:
+        pending = _load_news_cache().get(_NEWS_PENDING_KEY)
+    return pending if isinstance(pending, list) else []
+
+
+def _set_pending_batches(pending: list) -> None:
+    """Replace the pending-batch list and persist immediately. The flush is not
+    optional: a run that harvests everything and has nothing left to score
+    reaches no other flush point, and would re-harvest the same batch forever."""
+    global _news_cache_dirty
+    with _news_cache_lock:
+        cache = _load_news_cache()
+        if pending:
+            cache[_NEWS_PENDING_KEY] = pending
+        else:
+            cache.pop(_NEWS_PENDING_KEY, None)
+        _news_cache_dirty = True
+    _flush_news_cache()
+
+
+def _harvest_pending_news_batches(client) -> None:
+    """Collect results from batches a previous run submitted but didn't wait
+    out. Never blocks: a batch still running is left pending for the run after
+    this one. Batches older than 24h are dropped (the API expires them)."""
+    pending = _pending_batches()
+    if not pending:
+        return
+    still_pending = []
+    for rec in pending:
+        batch_id, id_map = rec.get("id"), rec.get("map") or {}
+        if not batch_id:
+            continue
+        if time.time() - rec.get("ts", 0) > 24 * 3600:
+            print(f"[news-batch] dropping expired batch {batch_id}")
+            continue
+        try:
+            status = client.messages.batches.retrieve(batch_id).processing_status
+        except Exception as e:
+            print(f"[news-batch] {batch_id}: status check failed "
+                  f"({type(e).__name__}: {e})")
+            still_pending.append(rec)
+            continue
+        if status != "ended":
+            still_pending.append(rec)
+            continue
+        try:
+            n = _store_batch_results(client, batch_id, id_map,
+                                     rec.get("headlines") or {})
+            print(f"[news-batch] harvested {n} score(s) from prior run's batch "
+                  f"{batch_id}")
+        except Exception as e:
+            print(f"[news-batch] {batch_id}: result fetch failed "
+                  f"({type(e).__name__}: {e})")
+            still_pending.append(rec)
+    _set_pending_batches(still_pending)
+
+
+def prewarm_news_sentiment(rows: list[dict]) -> None:
+    """Score every cache-missing ticker in `rows` via the Batches API (half the
+    real-time price) before the analysis loop runs. Best-effort throughout: any
+    failure leaves the existing real-time/lexicon path to handle the ticker.
+
+    Safe to call more than once per process — tickers already cached or already
+    in flight are skipped."""
+    if os.environ.get("NEWS_SIGNAL", "1") == "0" or not _news_batch_enabled():
+        return
+    client = _anthropic_client()
+    if client is None:            # no key -> lexicon path, nothing to batch
+        return
+
+    try:
+        _harvest_pending_news_batches(client)
+    except Exception as e:
+        print(f"[news-batch] harvest failed ({type(e).__name__}: {e})")
+
+    ttl = _news_cache_ttl_hours()
+    with _news_cache_lock:
+        cache = _load_news_cache()
+        todo = [r for r in rows
+                if r.get("ticker")
+                and r["ticker"] not in _news_batch_inflight
+                and not _news_cache_fresh(cache, r["ticker"], ttl)
+                # ETFs and thematic plays never reach the news scorer in the
+                # analysis loop (compounders only), so batching them would buy
+                # answers nothing reads. Static sets only — quoteType detection
+                # needs a network call we don't have here.
+                and r["ticker"] not in KNOWN_ETFS
+                and r["ticker"] not in THEMATIC_OVERRIDES]
+    if not todo:
+        return
+
+    # Headline fetch is network-bound and independent per ticker; serially this
+    # would add ~1s each to startup.
+    def _fetch(row):
+        return row["ticker"], row.get("name"), fetch_recent_headlines(row["ticker"])
+
+    fetched = []
+    with ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
+        for ticker, name, headlines in ex.map(_fetch, todo):
+            if headlines:
+                fetched.append((ticker, name, headlines))
+    if not fetched:
+        return
+    # Kept so a result can be stored next to the headlines it was scored from
+    # (the report renders them), including across a cross-run harvest.
+    headlines_by_ticker = {t: h[:5] for t, _, h in fetched}
+
+    # custom_id must be [a-zA-Z0-9_-], so index rather than using the ticker
+    # directly (a symbol like BRK.B would be rejected).
+    id_map = {f"news-{i}": ticker for i, (ticker, _, _) in enumerate(fetched)}
+    requests = [
+        {"custom_id": f"news-{i}",
+         "params": _news_request_params(ticker, name, headlines)}
+        for i, (ticker, name, headlines) in enumerate(fetched)
+    ]
+
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except Exception as e:
+        print(f"[news-batch] submit failed ({type(e).__name__}: {e}) — "
+              f"falling back to real-time scoring")
+        return
+
+    _news_batch_inflight.update(id_map.values())
+    deadline = time.time() + _news_batch_wait_seconds()
+    print(f"[news-batch] submitted {len(requests)} ticker(s) as {batch.id}; "
+          f"waiting up to {_news_batch_wait_seconds():.0f}s")
+    try:
+        while True:
+            status = client.messages.batches.retrieve(batch.id).processing_status
+            if status == "ended":
+                n = _store_batch_results(client, batch.id, id_map,
+                                         headlines_by_ticker)
+                _news_batch_inflight.difference_update(id_map.values())
+                print(f"[news-batch] {n}/{len(requests)} scored at 50% cost")
+                return
+            if time.time() >= deadline:
+                break
+            time.sleep(min(5.0, max(0.5, deadline - time.time())))
+    except Exception as e:
+        print(f"[news-batch] polling failed ({type(e).__name__}: {e})")
+        _news_batch_inflight.difference_update(id_map.values())
+        return
+
+    # Still running. Leave the tickers marked in-flight so this run uses the
+    # lexicon rather than paying full price, and record the batch so the next
+    # run picks up the results we've already been charged for.
+    print(f"[news-batch] {batch.id} still running after "
+          f"{_news_batch_wait_seconds():.0f}s — using lexicon this run, "
+          f"results will be harvested next run")
+    _set_pending_batches(_pending_batches() + [{
+        "id": batch.id, "ts": time.time(), "map": id_map,
+        "headlines": headlines_by_ticker,
+    }])
 
 
 def _news_signal_modifier(news: Optional[dict]):
@@ -2773,6 +3038,7 @@ def analyze_positions_parallel(
     is_watchlist: bool = False,
     max_workers: Optional[int] = None,
     log_fn=None,
+    batch_news: bool = True,
 ) -> list[PositionAnalysis]:
     """Run analyze_position over rows concurrently, preserving input order.
 
@@ -2780,6 +3046,10 @@ def analyze_positions_parallel(
     given — used by server.py to stream into the dashboard log panel). A
     ticker whose analysis errored is retried once after a short pause, which
     absorbs transient Yahoo rate-limit hiccups.
+
+    batch_news pre-scores news sentiment through the half-price Batches API,
+    which can block for minutes. Right for a scheduled run; pass False from
+    anything a person is waiting on (see server.py).
     """
     if max_workers is None:
         try:
@@ -2787,6 +3057,15 @@ def analyze_positions_parallel(
         except ValueError:
             max_workers = 6
     max_workers = max(1, min(max_workers, len(rows) or 1))
+
+    # Score news for every cache-missing ticker in one half-price batch before
+    # the loop starts, so the per-ticker calls below are cache hits. No-op
+    # without an API key, with NEWS_BATCH=0, or when everything is still fresh.
+    if batch_news:
+        try:
+            prewarm_news_sentiment(rows)
+        except Exception as e:
+            print(f"[news-batch] pre-pass skipped ({type(e).__name__}: {e})")
 
     total = len(rows)
     results: list[Optional[PositionAnalysis]] = [None] * total
@@ -2840,11 +3119,18 @@ def analyze_positions_parallel(
               f"(skipped {_fund_hits} statement-fetch pairs)")
     # Same for the news-sentiment cache (headlines fetched + scored on misses;
     # scoring is Claude when keyed, else the free lexicon).
+    # Same for the news-sentiment cache. A ticker scored by the batch pre-pass
+    # is already in the cache by the time the loop reads it, so it counts as a
+    # hit here — _news_batched is what that cost, at half rate. Misses are the
+    # stragglers scored inline (real-time price, or free lexicon without a key).
     _flush_news_cache()
     if _news_hits or _news_misses:
-        _mode = "Claude" if ANTHROPIC_API_KEY else "lexicon (free)"
-        print(f"[news-cache] {_news_hits} hit / {_news_misses} miss "
-              f"({_news_misses} scored via {_mode} this batch)")
+        if not ANTHROPIC_API_KEY:
+            _how = f"{_news_misses} scored via lexicon (free)"
+        else:
+            _how = (f"{_news_batched} scored via {NEWS_MODEL} at 50% batch rate"
+                    f", {_news_misses} inline")
+        print(f"[news-cache] {_news_hits} hit / {_news_misses} miss ({_how})")
 
     return results  # type: ignore[return-value]
 
