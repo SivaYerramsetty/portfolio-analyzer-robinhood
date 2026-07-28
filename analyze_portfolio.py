@@ -1116,7 +1116,11 @@ def _set_pending_batches(pending: list) -> None:
 def _harvest_pending_news_batches(client) -> None:
     """Collect results from batches a previous run submitted but didn't wait
     out. Never blocks: a batch still running is left pending for the run after
-    this one. Batches older than 24h are dropped (the API expires them)."""
+    this one. Batches older than 24h are dropped (the API expires them).
+
+    Tickers in a batch that is *still* running are marked in-flight, so this run
+    neither re-submits them in a new batch nor scores them real-time — either
+    would be paying a second time for an answer already bought."""
     pending = _pending_batches()
     if not pending:
         return
@@ -1134,9 +1138,11 @@ def _harvest_pending_news_batches(client) -> None:
             print(f"[news-batch] {batch_id}: status check failed "
                   f"({type(e).__name__}: {e})")
             still_pending.append(rec)
+            _news_batch_inflight.update(id_map.values())  # unknown -> don't re-buy
             continue
         if status != "ended":
             still_pending.append(rec)
+            _news_batch_inflight.update(id_map.values())
             continue
         try:
             n = _store_batch_results(client, batch_id, id_map,
