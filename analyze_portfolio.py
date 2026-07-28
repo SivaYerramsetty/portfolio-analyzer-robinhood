@@ -2068,8 +2068,35 @@ def compute_verdict_v2(
         passed = sum(1 for f in filters if f.passed)
         failed = len(filters) - passed
 
+    # ---- Price-vs-own-range axis: who owns it ----
+    # MA trend and 52-week position measure the SAME underlying variable —
+    # where price sits relative to its own recent history. Across the tracked
+    # universe they correlate at ~0.91: a stock at its 52-week low is *by
+    # construction* below its 200d MA. Scoring both double-counts one
+    # observation, and because the trend swing (±10) is twice the 52-week swing
+    # (±5) and carries the opposite sign at the extremes, the blunt rule
+    # silently vetoed the specific one — a quality name at a 52-week low earned
+    # +5 for "intact fundamentals at a low" and then gave back -10 for
+    # "downtrend", netting -5 for the exact setup the rule exists to find.
+    #
+    # Resolution follows the same no-double-counting doctrine already applied to
+    # insider activity and analyst targets above: the more specific rule wins.
+    # 52-week position is quality-gated, so it can distinguish a value entry
+    # from a falling knife; trend cannot. When price is at either extreme of its
+    # range, the 52-week rule owns the axis and the trend modifier stands down.
+    # In the broad middle (~20-92% of range) — most of the universe — nothing
+    # changes and trend scores as before.
+    week52_extreme = (week52_position is not None
+                      and (week52_position <= 20 or week52_position >= 92))
+
     # ---- Trend (50d MA / 200d MA alignment) ----
-    if trend == "uptrend":
+    if week52_extreme and trend in ("uptrend", "downtrend"):
+        # Deferred, but keep it visible in the breakdown so the hover still
+        # explains the full reasoning rather than silently dropping a factor.
+        contributors.append(
+            (f"{trend.capitalize()} not re-scored — already counted as "
+             f"52-week position ({week52_position:.0f}% of range)", 0))
+    elif trend == "uptrend":
         bonus = 10
         if pct_above_ma200 is not None and pct_above_ma200 >= 25:
             bonus = 12  # particularly strong uptrend
@@ -2251,6 +2278,13 @@ def compute_verdict_v2(
     for desc, delta in contributors_with_impact:
         sign = "+" if delta > 0 else ""
         breakdown_lines.append(f"{sign}{delta:.0f} · {desc}")
+    # Zero-impact entries after the base line are informational notes — a factor
+    # we deliberately did NOT score (e.g. trend standing down because 52-week
+    # position already covers that axis). They carry no delta but they explain
+    # an absence, so the breakdown would be misleading without them.
+    for desc, delta in contributors[1:]:
+        if delta == 0:
+            breakdown_lines.append(f"· {desc}")
     breakdown_lines.append(f"= verdict score {score:.0f}")
     reason = headline + " | " + " | ".join(breakdown_lines)
 
@@ -4846,12 +4880,52 @@ def _pick_catalyst_headline(ticker: str, name: Optional[str],
     return headlines[0].strip()
 
 
+def _rec_factors(r: PositionAnalysis) -> dict:
+    """Numeric factor snapshot stored per ledger entry.
+
+    `why` (below) records the verdict's drags as *rendered prose*, which is fine
+    for the report but useless for measurement — you can't correlate a sentence
+    with a forward return. Without these raw values, asking "did the 52-week
+    position actually predict anything?" means re-downloading history and
+    recomputing every factor from scratch. Persisting them makes that a query
+    over the ledger instead.
+
+    Rounded to keep the pretty-printed JSON diffs readable; None-valued factors
+    are dropped so limited-coverage tickers don't store a wall of nulls."""
+    def _r(v, nd=2):
+        return round(float(v), nd) if isinstance(v, (int, float)) else None
+
+    factors = {
+        # Price-vs-own-range axis (the two that used to double-count)
+        "week52_position": _r(r.week52_position, 1),
+        "pct_above_ma200": _r(r.pct_above_ma200, 1),
+        "trend": r.trend,
+        # Composite sub-scores, so score attribution needs no re-derivation
+        "score_quality": _r(r.score_quality, 1),
+        "score_growth": _r(r.score_growth, 1),
+        "score_value": _r(r.score_value, 1),
+        "score_analyst": _r(r.score_analyst, 1),
+        "score_insider": _r(r.score_insider, 1),
+        "composite_score": _r(r.composite_score, 1),
+        "composite_coverage": _r(r.composite_coverage, 3),
+        # Verdict-layer inputs
+        "upside_pct": _r(r.upside_pct, 1),
+        "sector_momentum": ((r.sector_momentum or {}).get("label")
+                            if isinstance(r.sector_momentum, dict) else None),
+        "quality_filters_passed": (sum(1 for f in r.filters if f.passed)
+                                   if r.filters else None),
+        "quality_filters_total": (len(r.filters) if r.filters else None),
+    }
+    return {k: v for k, v in factors.items() if v is not None}
+
+
 def _rec_diagnostic(r: PositionAnalysis) -> dict:
     """Compact 'why not a buy' diagnostic stored alongside each ledger snapshot:
-    the verdict's drag factors and the latest-news catalyst (when news scoring
-    is enabled). Lets the Missed Opportunities table explain why the analyzer
-    didn't flag a BUY/ADD and what news drove the run-up — without re-deriving
-    anything at render time."""
+    the verdict's drag factors, the latest-news catalyst (when news scoring
+    is enabled), and the numeric factor values behind the verdict. Lets the
+    Missed Opportunities table explain why the analyzer didn't flag a BUY/ADD
+    and what news drove the run-up — without re-deriving anything at render
+    time — and lets factor attribution run straight off the ledger."""
     news = None
     ns = getattr(r, "news_sentiment", None)
     if ns and (ns.get("rationale") or ns.get("label") or ns.get("headlines")):
@@ -4860,7 +4934,8 @@ def _rec_diagnostic(r: PositionAnalysis) -> dict:
             "rationale": (ns.get("rationale") or "").strip(),
             "headline": _pick_catalyst_headline(r.ticker, r.name, ns.get("headlines")),
         }
-    return {"why": _verdict_why_not_buy(r.verdict), "news": news}
+    return {"why": _verdict_why_not_buy(r.verdict), "news": news,
+            "factors": _rec_factors(r)}
 
 
 def _current_rec_snapshot(
@@ -5037,6 +5112,7 @@ def update_recs_history(
                 "first_alloc": cur["alloc"],
                 "first_why": cur.get("why", ""),
                 "first_news": cur.get("news"),
+                "first_factors": cur.get("factors") or {},
                 "last_date": run_date,
                 "last_price": cur["price"],
                 "last_verdict": cur["verdict"],
@@ -5044,6 +5120,7 @@ def update_recs_history(
                 "last_alloc": cur["alloc"],
                 "last_why": cur.get("why", ""),
                 "last_news": cur.get("news"),
+                "last_factors": cur.get("factors") or {},
                 "peak_price": cur["price"],
                 "peak_date": run_date,
                 "last_rank": cur_rank.get("rank"),
@@ -5067,6 +5144,7 @@ def update_recs_history(
         entry["last_alloc"] = cur["alloc"]
         entry["last_why"] = cur.get("why", "")
         entry["last_news"] = cur.get("news")
+        entry["last_factors"] = cur.get("factors") or {}
         # Backfill the first-sight diagnostics for entries created before this
         # field existed — but only while the verdict is unchanged, so the current
         # reasoning still represents the original sighting (don't misattribute a
@@ -5075,6 +5153,11 @@ def update_recs_history(
             entry["first_why"] = cur.get("why", "")
         if entry.get("first_news") is None and entry.get("first_verdict") == cur["verdict"]:
             entry["first_news"] = cur.get("news")
+        # Same rule for factors: only stamp the first-sight snapshot onto an
+        # older entry while the verdict still matches, so a backfilled value
+        # can't be mistaken for a genuine reading from the original sighting.
+        if not entry.get("first_factors") and entry.get("first_verdict") == cur["verdict"]:
+            entry["first_factors"] = cur.get("factors") or {}
         if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
             entry["peak_price"] = cur["price"]
             entry["peak_date"] = run_date
