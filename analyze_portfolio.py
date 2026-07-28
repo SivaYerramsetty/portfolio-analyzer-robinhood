@@ -1116,7 +1116,11 @@ def _set_pending_batches(pending: list) -> None:
 def _harvest_pending_news_batches(client) -> None:
     """Collect results from batches a previous run submitted but didn't wait
     out. Never blocks: a batch still running is left pending for the run after
-    this one. Batches older than 24h are dropped (the API expires them)."""
+    this one. Batches older than 24h are dropped (the API expires them).
+
+    Tickers in a batch that is *still* running are marked in-flight, so this run
+    neither re-submits them in a new batch nor scores them real-time — either
+    would be paying a second time for an answer already bought."""
     pending = _pending_batches()
     if not pending:
         return
@@ -1134,9 +1138,11 @@ def _harvest_pending_news_batches(client) -> None:
             print(f"[news-batch] {batch_id}: status check failed "
                   f"({type(e).__name__}: {e})")
             still_pending.append(rec)
+            _news_batch_inflight.update(id_map.values())  # unknown -> don't re-buy
             continue
         if status != "ended":
             still_pending.append(rec)
+            _news_batch_inflight.update(id_map.values())
             continue
         try:
             n = _store_batch_results(client, batch_id, id_map,
@@ -1217,9 +1223,14 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
         return
 
     _news_batch_inflight.update(id_map.values())
-    deadline = time.time() + _news_batch_wait_seconds()
+    wait = _news_batch_wait_seconds()
+    deadline = time.time() + wait
+    # wait=0 is the "always one run behind" mode: submit, don't block, and let
+    # the next run harvest. Sensible here because the scores carry a 12h TTL
+    # anyway, so waiting for same-run freshness buys very little.
     print(f"[news-batch] submitted {len(requests)} ticker(s) as {batch.id}; "
-          f"waiting up to {_news_batch_wait_seconds():.0f}s")
+          + ("not waiting (harvest on next run)" if wait <= 0
+             else f"waiting up to {wait:.0f}s"))
     try:
         while True:
             status = client.messages.batches.retrieve(batch.id).processing_status
@@ -1240,9 +1251,9 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
     # Still running. Leave the tickers marked in-flight so this run uses the
     # lexicon rather than paying full price, and record the batch so the next
     # run picks up the results we've already been charged for.
-    print(f"[news-batch] {batch.id} still running after "
-          f"{_news_batch_wait_seconds():.0f}s — using lexicon this run, "
-          f"results will be harvested next run")
+    print(f"[news-batch] {batch.id} queued"
+          + ("" if wait <= 0 else f", still running after {wait:.0f}s")
+          + " — lexicon this run, harvesting next run")
     _set_pending_batches(_pending_batches() + [{
         "id": batch.id, "ts": time.time(), "map": id_map,
         "headlines": headlines_by_ticker,
