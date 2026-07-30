@@ -749,12 +749,14 @@ def _render_diversification_gauge(results: list) -> str:
 # News sentiment — bounded nudge to the verdict score
 # ============================================================
 # Recent headlines per ticker (Finnhub free company-news, yfinance fallback) are
-# scored into one bullish/bearish number, cached on disk (default 12h TTL), then
-# mapped to a small bounded modifier in compute_verdict_v2 (see
-# _news_signal_modifier). Scoring is FREE by default via a headline lexicon; if
-# ANTHROPIC_API_KEY is set it upgrades to Claude for sharper reads. The cache
-# lives in .cache/ (gitignored; carried across CI runs) so warm runs re-fetch
-# nothing. Set NEWS_SIGNAL=0 to disable entirely.
+# scored into one bullish/bearish number, cached on disk (refreshed once per
+# calendar day by default — see _news_cache_mode), then mapped to a small
+# bounded modifier in compute_verdict_v2 (see _news_signal_modifier). Scoring is
+# FREE by default via a headline lexicon; if ANTHROPIC_API_KEY is set it upgrades
+# to Claude for sharper reads, and a prior Claude read is kept visible while a
+# refresh is in flight (stale-while-revalidate). The cache lives in .cache/
+# (gitignored; carried across CI runs) so warm runs re-fetch nothing. Set
+# NEWS_SIGNAL=0 to disable entirely.
 
 _NEWS_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "news_sentiment.json"
 _news_cache_lock = threading.Lock()
@@ -783,15 +785,51 @@ _NEWS_SENTIMENT_SCHEMA = {
 }
 
 
-def _news_cache_ttl_hours() -> float:
-    """Hours a scored ticker stays cached. 12h means at most one scoring call
-    per ticker per day even with a morning + afternoon run (they're 6.5h apart,
-    so a 6h TTL made the second run re-score everything). Lower it only if
-    intraday news needs to move the verdict the same session."""
+def _news_cache_mode() -> tuple[str, float]:
+    """How long a scored ticker stays cached, from NEWS_CACHE_TTL_HOURS:
+
+      unset / "day" / "daily"  -> ("day", 0)    re-score on the first run of a
+                                                 new calendar day (America/New_York)
+      a positive number N      -> ("hours", N)  rolling N-hour window
+      "0"                      -> ("off", 0)     never cache; re-score every run
+
+    Calendar-day is the default: news moves the verdict by a bounded ±6 nudge,
+    so one fresh read per day is plenty, and "first run of the day" is a simpler
+    mental model than a window that drifts by a few minutes each day. Multiple
+    runs the same day are all cache hits."""
+    raw = os.environ.get("NEWS_CACHE_TTL_HOURS", "").strip().lower()
+    if raw in ("", "day", "daily"):
+        return ("day", 0.0)
     try:
-        return float(os.environ.get("NEWS_CACHE_TTL_HOURS", "12"))
+        hours = float(raw)
     except ValueError:
-        return 12.0
+        return ("day", 0.0)
+    if hours <= 0:
+        return ("off", 0.0)
+    return ("hours", hours)
+
+
+def _news_caching_enabled() -> bool:
+    return _news_cache_mode()[0] != "off"
+
+
+def _news_entry_fresh(entry: Optional[dict]) -> bool:
+    """True when a cache entry is fresh enough to reuse without re-scoring.
+    Keyed on the entry's write time (`ts`) so it works for both real scores and
+    cached negatives (no-headline tickers, whose sentiment is None)."""
+    if not entry:
+        return False
+    mode, hours = _news_cache_mode()
+    if mode == "off":
+        return False
+    ts = entry.get("ts", 0)
+    if not ts:
+        return False
+    if mode == "hours":
+        return (time.time() - ts) < hours * 3600
+    ny = ZoneInfo("America/New_York")
+    return (datetime.fromtimestamp(ts, ny).date()
+            == datetime.now(ny).date())
 
 
 def _load_news_cache() -> dict:
@@ -990,8 +1028,13 @@ def _lexicon_sentiment(headlines: list[str]) -> Optional[dict]:
     }
 
 
+def _is_claude_sentiment(sentiment: Optional[dict]) -> bool:
+    """A real model read, as opposed to the free lexicon fallback."""
+    return bool(sentiment and sentiment.get("method") != "lexicon")
+
+
 def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[dict]:
-    """Score a ticker's recent news, cached on disk (TTL). Uses Claude when
+    """Score a ticker's recent news, cached on disk. Uses Claude when
     ANTHROPIC_API_KEY is set, otherwise a FREE headline lexicon — both return
     {score, label, rationale, headlines, as_of}. Returns None when disabled
     (NEWS_SIGNAL=0) or there's no news. Never raises; disk write is batched by
@@ -999,29 +1042,39 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
     global _news_cache_dirty, _news_hits, _news_misses
     if os.environ.get("NEWS_SIGNAL", "1") == "0":
         return None
-    ttl = _news_cache_ttl_hours()
-    if ttl > 0:
+
+    with _news_cache_lock:
+        entry = _load_news_cache().get(ticker)
+    prior = (entry or {}).get("sentiment")
+    if entry is not None and _news_entry_fresh(entry):
         with _news_cache_lock:
-            entry = _load_news_cache().get(ticker)
-        if entry and (time.time() - entry.get("ts", 0)) < ttl * 3600:
-            with _news_cache_lock:
-                _news_hits += 1
-            return entry.get("sentiment")
+            _news_hits += 1
+        return prior
 
     headlines = fetch_recent_headlines(ticker)
     result = None
     if headlines:
         # A ticker already in flight in a batch must NOT be re-scored in real
         # time — that would pay full price for an answer we've already bought at
-        # half. Use the free lexicon this run; the batch result lands in the
-        # cache on a later run (see _harvest_pending_news_batches).
+        # half. The batch result lands in the cache on a later run (see
+        # _harvest_pending_news_batches).
         client = None if ticker in _news_batch_inflight else _anthropic_client()
         if client is not None:
             result = _call_claude_sentiment(client, ticker, name, headlines)
         if result is None:                 # no key, in-flight, or LLM failed
+            # Stale-while-revalidate: a prior Claude read — even a day old —
+            # beats a fresh lexicon read for a bounded ±6 nudge. Keep serving it
+            # and leave the cache entry untouched (so it stays "stale" and the
+            # pending batch's harvest, or the next real-time attempt, replaces
+            # it). Only fall back to the lexicon when there's no Claude score to
+            # carry forward.
+            if _is_claude_sentiment(prior):
+                with _news_cache_lock:
+                    _news_hits += 1
+                return prior
             result = _lexicon_sentiment(headlines)
 
-    if ttl > 0:
+    if _news_caching_enabled():
         with _news_cache_lock:
             _load_news_cache()[ticker] = {"ts": time.time(), "sentiment": result}
             _news_cache_dirty = True
@@ -1056,9 +1109,8 @@ def _news_batch_wait_seconds() -> float:
         return 300.0
 
 
-def _news_cache_fresh(cache: dict, ticker: str, ttl: float) -> bool:
-    entry = cache.get(ticker)
-    return bool(entry and (time.time() - entry.get("ts", 0)) < ttl * 3600)
+def _news_cache_fresh(cache: dict, ticker: str) -> bool:
+    return _news_entry_fresh(cache.get(ticker))
 
 
 def _store_batch_results(client, batch_id: str, id_map: dict,
@@ -1174,13 +1226,16 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
     except Exception as e:
         print(f"[news-batch] harvest failed ({type(e).__name__}: {e})")
 
-    ttl = _news_cache_ttl_hours()
     with _news_cache_lock:
         cache = _load_news_cache()
+        # A stale ticker is re-batched to refresh it even when it has a prior
+        # Claude score — stale-while-revalidate keeps that old score visible in
+        # this run's report while the batch lands, rather than blocking the
+        # refresh (see score_news_sentiment).
         todo = [r for r in rows
                 if r.get("ticker")
                 and r["ticker"] not in _news_batch_inflight
-                and not _news_cache_fresh(cache, r["ticker"], ttl)
+                and not _news_cache_fresh(cache, r["ticker"])
                 # ETFs and thematic plays never reach the news scorer in the
                 # analysis loop (compounders only), so batching them would buy
                 # answers nothing reads. Static sets only — quoteType detection
@@ -1226,8 +1281,9 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
     wait = _news_batch_wait_seconds()
     deadline = time.time() + wait
     # wait=0 is the "always one run behind" mode: submit, don't block, and let
-    # the next run harvest. Sensible here because the scores carry a 12h TTL
-    # anyway, so waiting for same-run freshness buys very little.
+    # the next run harvest. Sensible because scores refresh only once a day and
+    # a prior Claude read stays visible meanwhile (stale-while-revalidate), so
+    # waiting for same-run freshness buys very little.
     print(f"[news-batch] submitted {len(requests)} ticker(s) as {batch.id}; "
           + ("not waiting (harvest on next run)" if wait <= 0
              else f"waiting up to {wait:.0f}s"))

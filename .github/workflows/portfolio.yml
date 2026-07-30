@@ -85,10 +85,16 @@ jobs:
           RH_MFA_SECRET:      ${{ secrets.RH_MFA_SECRET }}   # authenticator-app TOTP secret → fully automatic login
           RH_SESSION_B64:     ${{ secrets.RH_SESSION_B64 }}
           RH_DEVICE_APPROVAL: ${{ inputs.device_approval }}
+          # Lets the run write its rotated session back to the RH_SESSION_B64
+          # secret. The Actions cache alone isn't durable — GitHub evicts
+          # entries after 7 days without a read — so the secret is what keeps
+          # the session alive across long gaps between manual dispatches.
+          GH_TOKEN:           ${{ secrets.GH_TOKEN }}
+          GH_REPO:            ${{ github.repository }}
           FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}   # enables news-sentiment scoring (optional)
           NEWS_MODEL:         ${{ vars.NEWS_MODEL }}              # optional override; defaults to claude-haiku-4-5 (cheapest fit)
-          NEWS_CACHE_TTL_HOURS: ${{ vars.NEWS_CACHE_TTL_HOURS }}  # optional; defaults to 12h = at most one scoring call/ticker/day
+          NEWS_CACHE_TTL_HOURS: ${{ vars.NEWS_CACHE_TTL_HOURS }}  # optional; unset = refresh once/calendar-day. A number = rolling N-hour window; 0 = no cache
           NEWS_BATCH_WAIT_SECONDS: ${{ vars.NEWS_BATCH_WAIT_SECONDS }}  # optional; defaults to 300s before falling back to lexicon
           # NEWS_BATCH: '0'                                       # set to disable the 50%-off Batches API pre-pass
           TAX_FILING_STATUS:  ${{ secrets.TAX_FILING_STATUS }}
