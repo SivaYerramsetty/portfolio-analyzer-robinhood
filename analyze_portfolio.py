@@ -4872,6 +4872,14 @@ MISSED_OPP_GAIN_PCT = 5.0
 # ...AND we still hold less than this share of the portfolio (0% = never added;
 # a small position counts too — we under-allocated relative to the conviction).
 MISSED_OPP_ALLOC_THRESHOLD = 2.0
+# Buy-grade verdicts — the ones that ARE an action signal (unlike WATCH, which
+# is a "not yet"). Used to classify a miss as a model gap (never rated a buy) vs
+# an execution gap (rated a buy, but we didn't size up), and to flag names still
+# rated buy-grade today with a token allocation.
+BUY_GRADE_VERDICTS = {"ADD", "BUY", "BUY MORE"}
+# A name still rated buy-grade today counts as "still actionable" only while our
+# allocation is under this — i.e. the call is live and we still haven't acted.
+STILL_ACTIONABLE_ALLOC_PCT = 1.0
 
 
 def _fmt_short_date(iso: Optional[str]) -> str:
@@ -5242,6 +5250,105 @@ def save_recs_history(history: dict, path: str = RECS_HISTORY_FILE) -> None:
         print(f"[history] Could not save {path}: {e}")
 
 
+def _missed_reason_diagnosis(
+    *, gain_pct: float, first_verdict: Optional[str], last_verdict: Optional[str],
+    first_score: Optional[float], last_score: Optional[float],
+    first_factors: dict, last_factors: dict,
+    first_why: str, last_why: str, last_alloc: float,
+) -> str:
+    """The insight core of a miss reason. Answers three questions the flat prose
+    couldn't, using the logged score/factor trajectory:
+
+      1. Did the model ever catch on? — score (or, absent that, composite)
+         movement vs the price move. A score that sat flat while the price ran
+         double digits is the real indictment; one that climbed to buy-grade
+         "only after the run" is a timing problem, not a blindness problem.
+      2. Where does it stand now? — distance to the buy bar, or a live-call flag
+         when it's buy-grade today with token allocation.
+      3. What capped it, and was it a value entry? — the persistent drag plus a
+         52-week-low note (the setup the trend rule discounts).
+
+    Returns HTML beginning with <br> (possibly empty-ish fallback). Degrades
+    gracefully: entries logged before factor capture fall back to drag prose."""
+    esc = _miss_esc
+    BUY = BUY_GRADE_VERDICTS
+    # Buy bar depends on vocabulary: holdings cross into ADD at 78, watchlist
+    # names into BUY at 75. Infer which from the current verdict's family.
+    holding_vocab = {"ADD", "HOLD", "TRIM", "SELL"}
+    is_holding = (last_verdict in holding_vocab) or (first_verdict in holding_vocab)
+    bar, buy_label = (78.0, "ADD") if is_holding else (75.0, "BUY")
+
+    clauses: list[str] = []
+
+    # ---- 1. Did the model catch on? (prefer verdict score, else composite) ----
+    fc = first_factors.get("composite_score")
+    lc = last_factors.get("composite_score")
+    traj = ""
+    if first_score is not None and last_score is not None:
+        move = last_score - first_score
+        if last_score >= bar:
+            traj = (f"Its score climbed <strong>{first_verdict} {first_score:.0f} → "
+                    f"{last_verdict} {last_score:.0f}</strong>, clearing the {buy_label} "
+                    f"bar — but only after the {_fmt_pct(gain_pct, 0, True)} run.")
+        elif abs(move) < 4:
+            traj = (f"Its verdict score barely moved (<strong>{first_score:.0f} → "
+                    f"{last_score:.0f}</strong>) while the price ran "
+                    f"{_fmt_pct(gain_pct, 0, True)} — the model never registered the move.")
+        elif move >= 4:
+            traj = (f"Its score firmed <strong>{first_score:.0f} → {last_score:.0f}</strong> "
+                    f"but stayed under the {bar:.0f} {buy_label} bar — it warmed up, "
+                    f"late and not enough.")
+        else:
+            traj = (f"Its score actually slipped <strong>{first_score:.0f} → "
+                    f"{last_score:.0f}</strong> as the price ran "
+                    f"{_fmt_pct(gain_pct, 0, True)}.")
+    elif fc is not None and lc is not None:
+        cmove = lc - fc
+        if abs(cmove) < 3:
+            traj = (f"Its composite score held flat (~<strong>{lc:.0f}</strong>) while the "
+                    f"price ran {_fmt_pct(gain_pct, 0, True)} — the fundamentals read "
+                    f"never caught the move.")
+        elif cmove >= 3:
+            traj = (f"Its composite firmed <strong>{fc:.0f} → {lc:.0f}</strong>, but the "
+                    f"read lagged the {_fmt_pct(gain_pct, 0, True)} price move.")
+        else:
+            traj = (f"Its composite eased <strong>{fc:.0f} → {lc:.0f}</strong> even as the "
+                    f"price ran {_fmt_pct(gain_pct, 0, True)}.")
+    elif lc is not None:
+        traj = (f"Its composite score sits at <strong>{lc:.0f}</strong> — mid-pack, never "
+                f"into conviction — while the price ran {_fmt_pct(gain_pct, 0, True)}.")
+    if traj:
+        clauses.append("<strong>Did the model catch it?</strong> " + traj)
+
+    # ---- 2. Where it stands now: live call, or distance to the bar ----
+    if last_verdict in BUY and last_alloc < STILL_ACTIONABLE_ALLOC_PCT:
+        alloc_txt = ("no position" if last_alloc <= 0
+                     else f"just {last_alloc:.1f}%")
+        clauses.append(f"<strong>Live now:</strong> rated <strong>{esc(last_verdict)}</strong> "
+                       f"today with {alloc_txt} — the call is current, not hindsight.")
+    elif last_score is not None and last_score < bar:
+        gap = bar - last_score
+        clauses.append(f"<strong>Standing:</strong> {esc(last_verdict or '—')} "
+                       f"{last_score:.0f}, still {gap:.0f} short of the {bar:.0f} "
+                       f"{buy_label} bar.")
+
+    # ---- 3. What capped it + value-entry note ----
+    w52f = first_factors.get("week52_position")
+    if w52f is not None and w52f <= 25:
+        clauses.append(f"Entered near its 52-week low (<strong>{w52f:.0f}%</strong> of range) "
+                       f"— a value setup the trend rule discounts.")
+    elif w52f is not None and w52f >= 92:
+        clauses.append(f"Was already near its 52-week high (<strong>{w52f:.0f}%</strong>) when "
+                       f"flagged, which capped the score.")
+    drag = last_why or first_why
+    if drag and not traj:
+        # Only fall back to raw drag prose when we produced no trajectory insight
+        # (older entries with no logged scores/factors) — otherwise it's noise.
+        clauses.append(f"<strong>Held back by</strong> {esc(drag)}.")
+
+    return ("<br>" + "<br>".join(clauses)) if clauses else ""
+
+
 def compute_missed_opportunities(history: dict) -> list[dict]:
     """From the ledger, return tickers that ran up >= MISSED_OPP_GAIN_PCT since
     they were first seen while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
@@ -5286,35 +5393,22 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
         if peak_gain_pct - gain_pct >= 5:
             reason += f" Was up as much as {_fmt_pct(peak_gain_pct, 0, True)} at its peak."
 
-        # --- Why it wasn't a BUY/ADD (the core of the column). The analyzer's
-        #     verdict breakdown already names the factors that held the score
-        #     below the buy bar; surface them, distinguishing the original
-        #     sighting ("initially") from now. ---
-        BUY_TYPES = {"ADD", "BUY", "BUY MORE"}
+        # --- The core diagnosis: did the model ever catch on? Built from the
+        #     logged score/factor trajectory (first sight → now), not just the
+        #     current drag prose — this is what turns "why it wasn't a buy" from
+        #     a snapshot into an insight. ---
         last_verdict = e.get("last_verdict")
-        first_why = (e.get("first_why") or "").strip()
-        last_why = (e.get("last_why") or "").strip()
-        if last_verdict in BUY_TYPES:
-            # The analyzer rates it a buy NOW — so the miss is that it only
-            # turned bullish after the move while we stayed under-allocated.
-            extra = ("<strong>Why we under-acted:</strong> the analyzer rates it "
-                     f"<strong>{_esc_txt(last_verdict)}</strong> only now — it turned "
-                     f"bullish after the run-up")
-            if verdict and verdict not in BUY_TYPES:
-                lim = f" held back by {_esc_txt(first_why)}" if first_why else ""
-                extra += (f"; at first sight it was <strong>{_esc_txt(verdict)}</strong>"
-                          f"{(',' + lim) if lim else ''}")
-            extra += ", so you stayed under-allocated as it climbed."
-        else:
-            drag = last_why or first_why
-            extra = ("<strong>Why it wasn't a buy:</strong> rated "
-                     f"<strong>{_esc_txt(last_verdict or '—')}</strong>")
-            extra += (f" — held back by {_esc_txt(drag)}" if drag
-                      else " — no single strong buy signal scored high enough")
-            if verdict and last_verdict and verdict != last_verdict:
-                extra += f" (was <strong>{_esc_txt(verdict)}</strong> at first sight)"
-            extra += "."
-        reason += "<br>" + extra
+        reason += _missed_reason_diagnosis(
+            gain_pct=gain_pct,
+            first_verdict=verdict, last_verdict=last_verdict,
+            first_score=e.get("first_verdict_score"),
+            last_score=e.get("last_verdict_score"),
+            first_factors=e.get("first_factors") or {},
+            last_factors=e.get("last_factors") or {},
+            first_why=(e.get("first_why") or "").strip(),
+            last_why=(e.get("last_why") or "").strip(),
+            last_alloc=last_alloc,
+        )
 
         # --- News catalyst (the "check the news and compile" part). Pulled from
         #     the ledger's stored sentiment, refreshed each run by
@@ -5336,6 +5430,30 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
                 head = f"📰 News{(' ' + lbl) if lbl else ''}:"
                 reason += f"<br><strong>{head}</strong> {body}"
 
+        # --- Classification for "further analysis" (all derivable from the
+        #     ledger, no re-derivation): split a model gap (never rated a buy —
+        #     the score genuinely missed it) from an execution gap (rated a buy
+        #     at some point, but allocation never followed). These are different
+        #     failures with different fixes, so the report shouldn't conflate
+        #     them. `still_actionable` marks a call that is STILL live today. ---
+        ever_buy_graded = (verdict in BUY_GRADE_VERDICTS
+                           or last_verdict in BUY_GRADE_VERDICTS)
+        miss_type = "execution" if ever_buy_graded else "model"
+        still_actionable = (last_verdict in BUY_GRADE_VERDICTS
+                            and last_alloc < STILL_ACTIONABLE_ALLOC_PCT)
+
+        # --- Numeric factors as of first sight (populated by _rec_factors on
+        #     runs after that logging landed; older entries fall back to the
+        #     latest snapshot, then to None so the cell renders "—"). Surfacing
+        #     these as sortable columns is what makes the table analysable
+        #     rather than just readable. ---
+        ff = e.get("first_factors") or {}
+        lf = e.get("last_factors") or {}
+
+        def _factor(key):
+            v = ff.get(key)
+            return v if v is not None else lf.get(key)
+
         out.append({
             "ticker": ticker,
             "name": e.get("name") or ticker,
@@ -5349,20 +5467,299 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
             "current_price": last_price,
             "gain_pct": gain_pct,
             "peak_gain_pct": peak_gain_pct,
+            "gave_back_pct": max(0.0, peak_gain_pct - gain_pct),
             "last_alloc": last_alloc,
             "reason": reason,
+            "miss_type": miss_type,
+            "still_actionable": still_actionable,
+            "w52_first": _factor("week52_position"),
+            "trend_first": _factor("trend"),
+            "composite_first": _factor("composite_score"),
         })
     out.sort(key=lambda d: d["gain_pct"], reverse=True)
     return out
 
 
-def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> str:
-    """Render the 'Missed Opportunities' section. When there are no qualifying
-    misses, render an empty-state note so the section is still discoverable and
-    shows that tracking is live (option 2)."""
+def compute_avoided_losses(history: dict) -> list[dict]:
+    """The symmetric companion to compute_missed_opportunities: tracked names
+    that FELL >= MISSED_OPP_GAIN_PCT since first seen while we stayed under the
+    allocation bar. Without this the Missed-Opportunities section only ever
+    shows the upside tail of a two-sided market and reads as pure model failure;
+    the same low-allocation discipline that "missed" the winners also sidestepped
+    these. Sorted by biggest drop first.
 
-    def _esc(s: str) -> str:
-        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    Each row is tagged `dodge_type`: 'caution' when the analyzer was already wary
+    at first sight (a correct call), or 'lucky' when it actually rated the name a
+    buy and only low allocation saved us (a call that was wrong, surfaced honestly
+    rather than hidden)."""
+    def _esc_txt(s: object) -> str:
+        return (str(s).replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+
+    out: list[dict] = []
+    for ticker, e in (history.get("tickers") or {}).items():
+        first_price = e.get("first_price")
+        last_price = e.get("last_price")
+        if not first_price or not last_price or first_price <= 0:
+            continue
+        move_pct = (last_price - first_price) / first_price * 100
+        if move_pct > -MISSED_OPP_GAIN_PCT:      # only real drops qualify
+            continue
+        last_alloc = e.get("last_alloc") or 0.0
+        if last_alloc >= MISSED_OPP_ALLOC_THRESHOLD:
+            continue
+        verdict = e.get("first_verdict")
+        last_verdict = e.get("last_verdict")
+        trough_price = e.get("trough_price")     # optional; may not be tracked
+        date_str = _fmt_short_date(e.get("first_date"))
+        when = f" on {date_str}" if date_str else ""
+
+        was_buy = verdict in BUY_GRADE_VERDICTS
+        dodge_type = "lucky" if was_buy else "caution"
+        if verdict in REC_VERDICT_LABELS:
+            lead = f"Flagged <strong>{verdict}</strong>{when}"
+        elif verdict:
+            lead = f"First seen{when} (verdict: {verdict})"
+        else:
+            lead = f"First seen{when}"
+        reason = (f"{lead} at {_fmt_money(first_price)}; now "
+                  f"{_fmt_pct(move_pct, 0, True)} "
+                  f"(${first_price:,.2f} → ${last_price:,.2f}).")
+        if was_buy:
+            reason += ("<br><strong>Wrong call, dodged anyway:</strong> the "
+                       "analyzer rated this a buy — only staying under-allocated "
+                       "avoided the loss.")
+        else:
+            drag = (e.get("last_why") or e.get("first_why") or "").strip()
+            reason += ("<br><strong>Caution held up:</strong> never a buy signal"
+                       + (f" — flagged {_esc_txt(drag)}" if drag else "") + ".")
+
+        ff = e.get("first_factors") or {}
+        lf = e.get("last_factors") or {}
+
+        def _factor(key):
+            v = ff.get(key)
+            return v if v is not None else lf.get(key)
+
+        out.append({
+            "ticker": ticker,
+            "name": e.get("name") or ticker,
+            "sector": e.get("sector"),
+            "first_date": e.get("first_date"),
+            "first_verdict": verdict,
+            "first_verdict_score": e.get("first_verdict_score"),
+            "last_verdict": last_verdict,
+            "last_verdict_score": e.get("last_verdict_score"),
+            "first_price": first_price,
+            "current_price": last_price,
+            "loss_pct": move_pct,
+            "last_alloc": last_alloc,
+            "dodge_type": dodge_type,
+            "reason": reason,
+            "w52_first": _factor("week52_position"),
+            "trend_first": _factor("trend"),
+            "composite_first": _factor("composite_score"),
+        })
+    out.sort(key=lambda d: d["loss_pct"])
+    return out
+
+
+def compute_missed_opp_insights(
+    history: dict, missed: list[dict], avoided: list[dict]
+) -> dict:
+    """Summary statistics for the Missed-Opportunities header strip.
+
+    The point is context the raw table can't give: a "miss" only means something
+    against a base rate. If 27% of everything we track rose >=5% and 17% fell
+    >=5%, then a handful of missed winners is roughly what a two-sided market
+    hands out — not proof the model is broken. This computes that base rate over
+    the whole tracked universe, plus the model-gap / execution-gap split and the
+    still-actionable count, so the reader can size the signal before reading
+    a single row."""
+    tickers = (history.get("tickers") or {})
+    valid = up5 = down5 = 0
+    first_dates: list[str] = []
+    last_dates: list[str] = []
+    for e in tickers.values():
+        fp, lp = e.get("first_price"), e.get("last_price")
+        if not fp or not lp or fp <= 0:
+            continue
+        valid += 1
+        g = (lp - fp) / fp * 100
+        if g >= MISSED_OPP_GAIN_PCT:
+            up5 += 1
+        elif g <= -MISSED_OPP_GAIN_PCT:
+            down5 += 1
+        if e.get("first_date"):
+            first_dates.append(e["first_date"][:10])
+        if e.get("last_date"):
+            last_dates.append(e["last_date"][:10])
+
+    gains = sorted(m["gain_pct"] for m in missed)
+    n = len(gains)
+    mean_gain = sum(gains) / n if n else 0.0
+    median_gain = (gains[n // 2] if n % 2 else
+                   (gains[n // 2 - 1] + gains[n // 2]) / 2) if n else 0.0
+
+    model_gap = sum(1 for m in missed if m.get("miss_type") == "model")
+    exec_gap = sum(1 for m in missed if m.get("miss_type") == "execution")
+    actionable = [m for m in missed if m.get("still_actionable")]
+
+    return {
+        "tracked_valid": valid,
+        "up5": up5, "down5": down5,
+        "up5_pct": (up5 / valid * 100) if valid else 0.0,
+        "down5_pct": (down5 / valid * 100) if valid else 0.0,
+        "missed_count": n,
+        "avoided_count": len(avoided),
+        "mean_gain": mean_gain,
+        "median_gain": median_gain,
+        "model_gap": model_gap,
+        "execution_gap": exec_gap,
+        "still_actionable": [m["ticker"] for m in actionable],
+        "window_start": min(first_dates) if first_dates else None,
+        "window_end": max(last_dates) if last_dates else None,
+    }
+
+
+_MISS_VERDICT_COLORS = {
+    "ADD": "#27ae60", "BUY": "#27ae60", "BUY MORE": "#27ae60",
+    "WATCH": "#2980b9", "HOLD": "#2c3e50", "TRIM": "#e67e22", "SELL": "#c0392b",
+}
+
+
+def _miss_esc(s: object) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _miss_reason_attr(reason_html: str) -> str:
+    """Escape pre-built reason HTML for a double-quoted data-reason attribute.
+    Straight double quotes must become &quot;; apostrophes are attr-safe."""
+    return (reason_html.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _miss_verdict_chip(v_label: str, v_score: Optional[float]) -> str:
+    color = _MISS_VERDICT_COLORS.get(v_label, "#7f8c8d")
+    score_str = (f"<span class='vscore' style='color:var(--fg-body);font-size:11px;"
+                 f"font-weight:700;margin-left:4px;font-variant-numeric:tabular-nums;'>"
+                 f"{int(round(v_score))}</span>") if v_score is not None else ""
+    return (f"<span class='verdict' style='background:{color};'>"
+            f"{_miss_esc(v_label)}</span>{score_str}")
+
+
+def _miss_factor_cell(row: dict) -> str:
+    """Compact 'as of first sight' cell: composite score, 52-week position, and
+    trend arrow — the numeric factors now logged per ledger entry. Renders '—'
+    for entries first seen before factor logging landed. data-sort keys off the
+    composite so the column sorts by conviction-at-sighting."""
+    comp = row.get("composite_first")
+    w52 = row.get("w52_first")
+    trend = row.get("trend_first")
+    if comp is None and w52 is None and trend is None:
+        return "<td data-sort='-1'><span style='color:var(--fg-muted);'>—</span></td>"
+    bits = []
+    if comp is not None:
+        bits.append(f"<span title='Composite score at first sight' "
+                    f"style='font-weight:700;font-variant-numeric:tabular-nums;'>"
+                    f"{comp:.0f}</span>")
+    if w52 is not None:
+        # Low in the 52w range = value entry; high = stretched. Tint the edges.
+        c = ("var(--pos-up)" if w52 <= 20 else
+             "var(--pos-down)" if w52 >= 92 else "var(--fg-muted)")
+        bits.append(f"<span title='Position in 52-week range at first sight' "
+                    f"style='color:{c};font-size:11px;'>52w {w52:.0f}%</span>")
+    if trend:
+        arrow = {"uptrend": "↑", "downtrend": "↓", "sideways": "→"}.get(trend, "")
+        tc = ("var(--pos-up)" if trend == "uptrend" else
+              "var(--pos-down)" if trend == "downtrend" else "var(--fg-muted)")
+        bits.append(f"<span title='Trend at first sight' style='color:{tc};"
+                    f"font-size:11px;'>{arrow} {_miss_esc(trend)}</span>")
+    sort_key = comp if comp is not None else -1
+    inner = "<div style='display:flex;flex-direction:column;gap:1px;'>" + \
+            "".join(f"<span>{b}</span>" for b in bits) + "</div>"
+    return f"<td data-sort='{sort_key:.1f}'>{inner}</td>"
+
+
+def _miss_summary_strip(insights: Optional[dict]) -> str:
+    """The header band above the table: base-rate context + the two counts that
+    turn a flat list into a diagnosis. A 'miss' is only meaningful against how
+    the whole tracked universe moved, so lead with that."""
+    if not insights:
+        return ""
+    up5, down5 = insights["up5"], insights["down5"]
+    valid = insights["tracked_valid"]
+    model_gap = insights["model_gap"]
+    exec_gap = insights["execution_gap"]
+    actionable = insights["still_actionable"]
+
+    def card(big, label, tone="neutral", sub=""):
+        tone_color = {"good": "var(--pos-up)", "bad": "var(--pos-down)",
+                      "warn": "var(--fg-chip-amber)",
+                      "neutral": "var(--fg-strong)"}.get(tone, "var(--fg-strong)")
+        sub_html = (f"<div style='font-size:10px;color:var(--fg-muted);"
+                    f"margin-top:2px;'>{sub}</div>") if sub else ""
+        return (
+            "<div style='flex:1 1 130px;min-width:130px;background:var(--bg-card);"
+            "border:1px solid var(--border-medium);border-radius:8px;padding:12px 14px;'>"
+            f"<div style='font-size:22px;font-weight:700;line-height:1;color:{tone_color};"
+            f"font-variant-numeric:tabular-nums;'>{big}</div>"
+            f"<div style='font-size:11px;color:var(--fg-muted);margin-top:4px;'>{label}</div>"
+            f"{sub_html}</div>"
+        )
+
+    cards = "".join([
+        card(f"{insights['missed_count']}", "Missed (up ≥5%, under-allocated)",
+             "warn",
+             f"mean +{insights['mean_gain']:.0f}% · median +{insights['median_gain']:.0f}%"),
+        card(f"{up5}<span style='font-size:13px;color:var(--fg-muted);'> / {valid}</span>",
+             "Tracked names up ≥5%", "good",
+             f"{insights['up5_pct']:.0f}% of the universe — the base rate"),
+        card(f"{down5}<span style='font-size:13px;color:var(--fg-muted);'> / {valid}</span>",
+             "Tracked names down ≥5%", "bad",
+             f"{insights['down5_pct']:.0f}% — the misses' mirror image"),
+        card(f"{model_gap} <span style='font-size:13px;color:var(--fg-muted);'>·</span> {exec_gap}",
+             "Model gap · Execution gap", "neutral",
+             "never a buy · rated buy, under-sized"),
+    ])
+    actionable_html = ""
+    if actionable:
+        shown = ", ".join(_miss_esc(t) for t in actionable[:8])
+        more = f" +{len(actionable) - 8} more" if len(actionable) > 8 else ""
+        actionable_html = (
+            "<div style='margin-top:12px;padding:10px 14px;border-radius:8px;"
+            "background:rgba(39,174,96,0.08);border:1px solid rgba(39,174,96,0.35);"
+            "font-size:12px;color:var(--fg-body);'>"
+            "<strong style='color:var(--pos-up);'>● Still actionable:</strong> "
+            f"{len(actionable)} name{'' if len(actionable) == 1 else 's'} the "
+            f"analyzer <em>still</em> rates buy-grade today with under "
+            f"{STILL_ACTIONABLE_ALLOC_PCT:g}% allocation — "
+            f"<strong>{shown}{more}</strong>. These are live, not hindsight.</div>"
+        )
+    window = ""
+    if insights.get("window_start") and insights.get("window_end"):
+        window = (f"<span style='color:var(--fg-muted);font-size:11px;'>"
+                  f"Tracking window {insights['window_start']} → "
+                  f"{insights['window_end']}.</span>")
+    return (
+        "<div style='display:flex;flex-wrap:wrap;gap:10px;margin-bottom:6px;'>"
+        + cards + "</div>" + actionable_html
+        + (f"<div style='margin-top:8px;'>{window}</div>" if window else "")
+    )
+
+
+def _render_missed_opportunities(
+    missed: list[dict],
+    tracked_count: int = 0,
+    avoided: Optional[list[dict]] = None,
+    insights: Optional[dict] = None,
+) -> str:
+    """Render the 'Missed Opportunities' section: a base-rate summary strip, the
+    misses table (with miss-type, first-sight factors, and peak give-back), and a
+    symmetric 'Avoided Losses' table so the section measures the model rather than
+    just the market's upside tail. Empty misses still render a discoverable
+    empty-state note."""
+    _esc = _miss_esc
 
     html = ("<h2 id='missed-opps' style='margin-top:48px;'>"
             "🪟 Missed Opportunities</h2>\n")
@@ -5384,76 +5781,172 @@ def _render_missed_opportunities(missed: list[dict], tracked_count: int = 0) -> 
         )
         return html
 
-    # ----- Populated table -----
-    verdict_colors = {
-        "ADD": "#27ae60", "BUY": "#27ae60", "BUY MORE": "#27ae60",
-        "WATCH": "#2980b9",
-        "HOLD": "#2c3e50",
-        "TRIM": "#e67e22",
-        "SELL": "#c0392b",
-    }
+    # ----- Summary strip (base-rate context + gap split + still-actionable) -----
+    html += _miss_summary_strip(insights)
+
+    # ----- Misses table -----
     html += (
-        '<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:18px;">'
+        '<p style="color:#7f8c8d;font-size:12px;margin-top:16px;margin-bottom:12px;">'
         f"Stocks the analyzer has tracked (every holding and watchlist name) that "
         f"climbed <strong>≥{MISSED_OPP_GAIN_PCT:g}%</strong> since they were first "
         f"seen, yet you still hold <strong>under {MISSED_OPP_ALLOC_THRESHOLD:g}%</strong> "
-        f"of the portfolio (never bought, or under-allocated). Sorted by gain you left "
-        f"on the table.</p>\n"
+        f"of the portfolio. <strong>Type</strong> splits a <em>model gap</em> (never "
+        f"rated a buy) from an <em>execution gap</em> (rated a buy, but we didn't size "
+        f"up). <strong>At first sight</strong> shows the factors behind the original "
+        f"call. Sorted by gain left on the table.</p>\n"
     )
     html += "<div class='table-wrap'><table>\n<thead><tr>"
     html += (
         "<th>Ticker</th>"
         "<th>Name / Sector</th>"
+        "<th>Type</th>"
         "<th>First seen</th>"
         "<th>First verdict</th>"
         "<th>Current verdict</th>"
+        "<th title='Composite score · 52-week position · trend, as of first sight.' "
+        "style='cursor:help;'>At first sight &#9432;</th>"
         "<th class='num'>Gain since</th>"
         "<th title='Hover for full explanation.' style='cursor:help;'>Miss reason &#9432;</th>"
         "</tr></thead><tbody>\n"
     )
-    import re as _re
     for m in missed:
         label = m.get("first_verdict") or "—"
-        color = verdict_colors.get(label, "#7f8c8d")
         cur_verdict = m.get("last_verdict") or "—"
-        cur_color = verdict_colors.get(cur_verdict, "#7f8c8d")
         ticker = _esc(m["ticker"])
         sector = _esc(m["sector"]) if m.get("sector") else "—"
         first_date = m.get("first_date") or ""
         date_iso = first_date[:10] if first_date else ""
         date_display = _esc(_fmt_short_date(first_date)) if first_date else "—"
-        # reason is pre-built HTML (contains <strong>); store as HTML in data-reason.
-        reason_html = m.get("reason") or ""
-        # Escape for use inside a double-quoted HTML attribute.
-        # Headlines can contain apostrophes (safe in double-quoted attrs) but not
-        # straight double quotes, so only &quot; escaping is needed for ".
-        reason_attr = reason_html.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-        # Short preview text (strip tags) for the visible truncated cell.
-        reason_preview = _re.sub(r'<[^>]+>', '', reason_html).replace('&ldquo;', '"').replace('&rdquo;', '"').replace('&mdash;', '—').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').strip()
+        reason_attr = _miss_reason_attr(m.get("reason") or "")
         search_val = f"{m['ticker'].lower()} {m['name'].lower()} {(m.get('sector') or '').lower()}"
+
+        # Type badge: model gap vs execution gap.
+        if m.get("miss_type") == "execution":
+            type_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
+                          "font-size:10px;font-weight:700;background:rgba(41,128,185,0.15);"
+                          "color:#2980b9;white-space:nowrap;' title='Rated a buy at some "
+                          "point — allocation never followed'>Didn&#39;t act</span>")
+            type_sort = "execution"
+        else:
+            type_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
+                          "font-size:10px;font-weight:700;background:rgba(230,126,34,0.15);"
+                          "color:var(--fg-chip-amber);white-space:nowrap;' title='Never rated "
+                          "a buy — the score missed it'>Model gap</span>")
+            type_sort = "model"
+
+        live_pill = ""
+        if m.get("still_actionable"):
+            live_pill = ("<span title='Still rated buy-grade today with token allocation' "
+                         "style='display:inline-block;margin-left:5px;padding:1px 5px;"
+                         "border-radius:8px;font-size:9px;font-weight:700;"
+                         "background:rgba(39,174,96,0.18);color:var(--pos-up);'>● LIVE</span>")
+
+        html += f"<tr data-search='{_esc(search_val)}'>"
+        html += (f"<td class='ticker' data-sort='{ticker}'>"
+                 f"<a class='miss-ticker-link' data-ticker='{ticker}' href='#' "
+                 f"style='font-weight:700;color:inherit;text-decoration:underline;"
+                 f"text-decoration-style:dotted;cursor:pointer;'>{ticker}</a>{live_pill}</td>")
+        html += (f"<td data-sort='{_esc(m['name'])}'><div style='font-weight:500'>{_esc(m['name'])}</div>"
+                 f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
+        html += f"<td data-sort='{type_sort}'>{type_badge}</td>"
+        html += (f"<td data-sort='{date_iso}'>"
+                 f"<span style='color:var(--fg-muted);font-size:11px;'>{date_display}</span></td>")
+        html += f"<td data-sort='{label}'>{_miss_verdict_chip(label, m.get('first_verdict_score'))}</td>"
+        html += f"<td data-sort='{cur_verdict}'>{_miss_verdict_chip(cur_verdict, m.get('last_verdict_score'))}</td>"
+        html += _miss_factor_cell(m)
+        # Gain cell, with a muted peak give-back sub-line when the name has
+        # round-tripped meaningfully off its high (invisible when sorted by
+        # current gain alone).
+        gave = m.get("gave_back_pct") or 0.0
+        peak_sub = ""
+        if gave >= 5:
+            peak_sub = (f"<div style='font-size:10px;color:var(--fg-muted);font-weight:400;'>"
+                        f"peak +{m['peak_gain_pct']:.0f}%, gave back {gave:.0f}</div>")
+        html += (f"<td class='num pos-up' data-sort='{m['gain_pct']:.2f}' style='font-weight:600;'>"
+                 f"{_fmt_pct(m['gain_pct'], 1, True)}{peak_sub}</td>")
+        html += f'<td class=\'miss-reason\' data-reason="{reason_attr}"></td>'
+        html += "</tr>\n"
+    html += "</tbody></table></div>\n"
+
+    # ----- Avoided Losses (symmetric companion) -----
+    html += _render_avoided_losses(avoided or [])
+    return html
+
+
+def _render_avoided_losses(avoided: list[dict]) -> str:
+    """The downside mirror of the misses table: names that fell ≥5% while we
+    stayed under-allocated. Same low-allocation discipline that 'missed' the
+    winners sidestepped these — showing both is what keeps the section an
+    honest scorecard instead of a highlight reel of regrets."""
+    if not avoided:
+        return ""
+    _esc = _miss_esc
+    correct = sum(1 for a in avoided if a.get("dodge_type") == "caution")
+    lucky = len(avoided) - correct
+    html = (
+        "<h3 style='margin-top:34px;margin-bottom:4px;font-size:15px;'>"
+        "🛡️ Avoided Losses <span style='font-weight:400;color:var(--fg-muted);"
+        "font-size:12px;'>— the same discipline, other direction</span></h3>\n"
+        '<p style="color:#7f8c8d;font-size:12px;margin-top:0;margin-bottom:12px;">'
+        f"Tracked names that <strong>fell ≥{MISSED_OPP_GAIN_PCT:g}%</strong> since "
+        f"first seen while you stayed under {MISSED_OPP_ALLOC_THRESHOLD:g}% — losses the "
+        f"low-allocation calls sidestepped. <strong>{correct}</strong> were correct "
+        f"caution (never a buy); <strong>{lucky}</strong> were dodged despite a buy "
+        f"rating. Sorted by biggest drop.</p>\n"
+    )
+    html += "<div class='table-wrap'><table>\n<thead><tr>"
+    html += (
+        "<th>Ticker</th>"
+        "<th>Name / Sector</th>"
+        "<th>Dodge</th>"
+        "<th>First seen</th>"
+        "<th>First verdict</th>"
+        "<th>Current verdict</th>"
+        "<th title='Composite score · 52-week position · trend, as of first sight.' "
+        "style='cursor:help;'>At first sight &#9432;</th>"
+        "<th class='num'>Drop since</th>"
+        "<th title='Hover for full explanation.' style='cursor:help;'>Detail &#9432;</th>"
+        "</tr></thead><tbody>\n"
+    )
+    for a in avoided:
+        label = a.get("first_verdict") or "—"
+        cur_verdict = a.get("last_verdict") or "—"
+        ticker = _esc(a["ticker"])
+        sector = _esc(a["sector"]) if a.get("sector") else "—"
+        first_date = a.get("first_date") or ""
+        date_iso = first_date[:10] if first_date else ""
+        date_display = _esc(_fmt_short_date(first_date)) if first_date else "—"
+        reason_attr = _miss_reason_attr(a.get("reason") or "")
+        search_val = f"{a['ticker'].lower()} {a['name'].lower()} {(a.get('sector') or '').lower()}"
+
+        if a.get("dodge_type") == "lucky":
+            dodge_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
+                           "font-size:10px;font-weight:700;background:rgba(230,126,34,0.15);"
+                           "color:var(--fg-chip-amber);white-space:nowrap;' title='Rated a buy "
+                           "— only low allocation avoided the loss'>Lucky dodge</span>")
+            dodge_sort = "lucky"
+        else:
+            dodge_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
+                           "font-size:10px;font-weight:700;background:rgba(39,174,96,0.15);"
+                           "color:var(--pos-up);white-space:nowrap;' title='Never a buy signal "
+                           "— the caution was right'>Correct caution</span>")
+            dodge_sort = "caution"
+
         html += f"<tr data-search='{_esc(search_val)}'>"
         html += (f"<td class='ticker' data-sort='{ticker}'>"
                  f"<a class='miss-ticker-link' data-ticker='{ticker}' href='#' "
                  f"style='font-weight:700;color:inherit;text-decoration:underline;"
                  f"text-decoration-style:dotted;cursor:pointer;'>{ticker}</a></td>")
-        html += (f"<td data-sort='{_esc(m['name'])}'><div style='font-weight:500'>{_esc(m['name'])}</div>"
+        html += (f"<td data-sort='{_esc(a['name'])}'><div style='font-weight:500'>{_esc(a['name'])}</div>"
                  f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
+        html += f"<td data-sort='{dodge_sort}'>{dodge_badge}</td>"
         html += (f"<td data-sort='{date_iso}'>"
                  f"<span style='color:var(--fg-muted);font-size:11px;'>{date_display}</span></td>")
-        def _verdict_chip(v_label, v_color, v_score):
-            score_str = (f"<span class='vscore' style='color:var(--fg-body);font-size:11px;"
-                         f"font-weight:700;margin-left:4px;font-variant-numeric:tabular-nums;'>"
-                         f"{int(round(v_score))}</span>") if v_score is not None else ""
-            return (f"<span class='verdict' style='background:{v_color};'>{v_label}</span>"
-                    f"{score_str}")
-        first_score = m.get("first_verdict_score")
-        cur_score   = m.get("last_verdict_score")
-        html += f"<td data-sort='{label}'>{_verdict_chip(label, color, first_score)}</td>"
-        html += f"<td data-sort='{cur_verdict}'>{_verdict_chip(_esc(cur_verdict), cur_color, cur_score)}</td>"
-        html += (f"<td class='num pos-up' data-sort='{m['gain_pct']:.2f}' style='font-weight:600;'>"
-                 f"{_fmt_pct(m['gain_pct'], 1, True)}</td>")
-        # miss-reason cell: JS (at page load) converts this into a vcell+vcard
-        # hover card identical to the verdict-score tooltip system.
+        html += f"<td data-sort='{label}'>{_miss_verdict_chip(label, a.get('first_verdict_score'))}</td>"
+        html += f"<td data-sort='{cur_verdict}'>{_miss_verdict_chip(cur_verdict, a.get('last_verdict_score'))}</td>"
+        html += _miss_factor_cell(a)
+        html += (f"<td class='num pos-down' data-sort='{a['loss_pct']:.2f}' style='font-weight:600;'>"
+                 f"{_fmt_pct(a['loss_pct'], 1, True)}</td>")
         html += f'<td class=\'miss-reason\' data-reason="{reason_attr}"></td>'
         html += "</tr>\n"
     html += "</tbody></table></div>\n"
@@ -5542,6 +6035,8 @@ def generate_html_report(
     realized_ytd: Optional[dict] = None,
     missed_opportunities: Optional[list[dict]] = None,
     recs_tracked_count: int = 0,
+    avoided_losses: Optional[list[dict]] = None,
+    missed_insights: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -6728,7 +7223,9 @@ def generate_html_report(
     # active (main portfolio run) — render even when empty so the section is
     # discoverable. Ad-hoc/lookup mode passes None and the section is omitted.
     if missed_opportunities is not None:
-        html += _render_missed_opportunities(missed_opportunities, recs_tracked_count)
+        html += _render_missed_opportunities(
+            missed_opportunities, recs_tracked_count,
+            avoided=avoided_losses, insights=missed_insights)
 
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
@@ -8012,6 +8509,8 @@ def main():
     # recommendations we under-acted on while the stock ran up. Best-effort: any
     # failure here must not block the report.
     missed_opportunities: list[dict] = []
+    avoided_losses: list[dict] = []
+    missed_insights: dict = {}
     recs_tracked_count = 0
     try:
         recs_history = load_recs_history()
@@ -8028,9 +8527,13 @@ def main():
         save_recs_history(recs_history)
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
+        avoided_losses = compute_avoided_losses(recs_history)
+        missed_insights = compute_missed_opp_insights(
+            recs_history, missed_opportunities, avoided_losses)
         print(f"[history] Tracking {recs_tracked_count} "
               f"stock(s); {len(missed_opportunities)} missed "
-              f"opportunit{'y' if len(missed_opportunities) == 1 else 'ies'}.")
+              f"opportunit{'y' if len(missed_opportunities) == 1 else 'ies'}, "
+              f"{len(avoided_losses)} avoided loss(es).")
     except Exception as e:
         print(f"[history] Skipped missed-opportunity tracking: {e}")
 
@@ -8160,6 +8663,8 @@ def main():
         realized_ytd=realized_ytd,   # None unless --tax populated it
         missed_opportunities=missed_opportunities,
         recs_tracked_count=recs_tracked_count,
+        avoided_losses=avoided_losses,
+        missed_insights=missed_insights,
     )
 
     out = Path(args.out)
