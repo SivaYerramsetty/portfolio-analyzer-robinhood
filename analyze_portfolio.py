@@ -3696,8 +3696,11 @@ def _tr_open(r) -> str:
     has_tax = "1" if getattr(r, "tax", None) is not None else "0"
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
     earnings_days = "" if getattr(r, "days_to_earnings", None) is None else r.days_to_earnings
-    # News sentiment label (bullish/neutral/bearish) — drives the news filter
-    news = ((getattr(r, "news_sentiment", None) or {}).get("label") or "").lower()
+    # News sentiment — label (bullish/neutral/bearish) drives the news facet;
+    # score (-1.0 very bearish … +1.0 very bullish) drives the news-score slider.
+    _ns = getattr(r, "news_sentiment", None) or {}
+    news = (_ns.get("label") or "").lower()
+    news_score = "" if _ns.get("score") is None else _ns.get("score")
     # Combined search text — lowercased for case-insensitive contains() matching
     search_text = f"{r.ticker} {r.name} {r.sector or ''}".lower()
     return (
@@ -3711,7 +3714,7 @@ def _tr_open(r) -> str:
         f"data-sector-mom='{sector_mom_label}' data-sector='{sector_raw}' "
         f"data-pos52='{pos52}' data-score='{score}' "
         f"data-insider='{insider}' data-has-insider='{has_insider_data}' "
-        f"data-news='{news}' "
+        f"data-news='{news}' data-news-score='{news_score}' "
         f"data-trend='{trend}' data-ma-pct='{ma_pct}' "
         f"data-port-pct='{port_pct}' "
         f"data-days-held='{days_held}' "
@@ -7452,6 +7455,7 @@ Verdicts are framework outputs, not investment advice.
       { type:'facet', attr:'news', label:'News sentiment', short:'News', skip:[''],
         order:['bullish','neutral','bearish'],
         labels:{bullish:'📰 Bullish',neutral:'📰 Neutral',bearish:'📰 Bearish'} },
+      { type:'range', attr:'news-score', label:'News score (−1…+1)', short:'News score', step:0.1, signed:true },
       { type:'range', attr:'verdict-score', label:'Verdict score', short:'Verdict pts', integer:true },
       { type:'range', attr:'quality', label:'Quality gates', short:'Quality', integer:true },
       { type:'range', attr:'score', label:'Composite score', short:'Composite', integer:true },
@@ -7526,7 +7530,7 @@ Verdicts are framework outputs, not investment advice.
     if (!vals.length) return null;
     var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
     if (mx <= mn) return null;
-    var step = card.integer ? 1 : niceStep(mx - mn);
+    var step = card.step || (card.integer ? 1 : niceStep(mx - mn));
     mn = Math.floor(mn / step) * step; mx = Math.ceil(mx / step) * step;
     return { min: mn, max: mx, step: step, integer: !!card.integer };
   }
@@ -7555,8 +7559,10 @@ Verdicts are framework outputs, not investment advice.
       if (a >= 1000) return s + '$' + (a / 1000).toFixed(a >= 100000 ? 0 : 1) + 'k';
       return s + '$' + a.toFixed(0);
     }
-    var d = (domains[card.attr] && domains[card.attr].step < 1) ? 1 : 0;
-    return v.toFixed(d) + (card.unit || '');
+    var step = domains[card.attr] && domains[card.attr].step;
+    var d = (step && step < 1) ? (step < 0.1 ? 2 : 1) : 0;
+    var s = (card.signed && v > 0) ? '+' : '';
+    return s + v.toFixed(d) + (card.unit || '');
   }
 
   // ---------- Matching ----------
