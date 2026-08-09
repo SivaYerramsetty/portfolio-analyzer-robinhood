@@ -119,8 +119,12 @@ COMMAND REFERENCE — every way to run this script
 --- HTML REPORT FEATURES (no flags needed; always on) ---------------------
 
     • Click any column header to sort; click again to reverse.
-    • Filter bar at top: search box (ticker/name) + quick-filter pills:
-        All · Action items · Buy signals · High quality (7+) · Winners · Losers
+    • Filter bar at top: search box + one-click Quick screens + an expandable
+      faceted panel. Facets (verdict, sector, analyst, insider, trend, …) OR
+      within a group and AND across groups; every numeric metric (upside, gain,
+      composite/verdict/quality score, position size, days held, …) has a
+      min/max range slider. Active filters show as removable chips with live
+      per-option counts.
     • Live prices via yfinance; analyst ratings via Robinhood/Finnhub/yfinance.
 
 --- GITHUB ACTIONS (manual trigger, see portfolio.yml) --------------------
@@ -1855,7 +1859,7 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
 
 # A holding/watchlist name is flagged "earnings soon" (header stat + filter)
 # when its next report is within this many calendar days. Kept in sync with the
-# hardcoded threshold in the rowMatchesFilter() 'earnings-soon' case (plain-JS
+# hardcoded threshold in the filter bar's 'earnings-soon' quick screen (plain-JS
 # string, can't interpolate Python there).
 EARNINGS_SOON_DAYS = 7
 
@@ -3692,6 +3696,8 @@ def _tr_open(r) -> str:
     has_tax = "1" if getattr(r, "tax", None) is not None else "0"
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
     earnings_days = "" if getattr(r, "days_to_earnings", None) is None else r.days_to_earnings
+    # News sentiment label (bullish/neutral/bearish) — drives the news filter
+    news = ((getattr(r, "news_sentiment", None) or {}).get("label") or "").lower()
     # Combined search text — lowercased for case-insensitive contains() matching
     search_text = f"{r.ticker} {r.name} {r.sector or ''}".lower()
     return (
@@ -3705,6 +3711,7 @@ def _tr_open(r) -> str:
         f"data-sector-mom='{sector_mom_label}' data-sector='{sector_raw}' "
         f"data-pos52='{pos52}' data-score='{score}' "
         f"data-insider='{insider}' data-has-insider='{has_insider_data}' "
+        f"data-news='{news}' "
         f"data-trend='{trend}' data-ma-pct='{ma_pct}' "
         f"data-port-pct='{port_pct}' "
         f"data-days-held='{days_held}' "
@@ -6669,65 +6676,141 @@ def generate_html_report(
      don't reliably work in Safari. The simpler, working behavior: h2 section
      headers are always sticky (so you know which section you're reading);
      filters live at the top of the page and you scroll back up to use them. */
-  .filter-bar {{ background: var(--bg-card); border: 1px solid var(--border-medium);
-                 border-radius: 10px;
-                 padding: 10px 14px; margin-bottom: 18px;
-                 box-shadow: var(--shadow-card); }}
-  .filter-bar-top {{ display: flex; align-items: center; gap: 8px;
-                     flex-wrap: wrap; }}
-  .filter-bar input[type="text"] {{ padding: 6px 10px;
-                                    border: 1px solid var(--border-strong);
-                                    border-radius: 6px; font-size: 13px;
-                                    min-width: 240px; outline: none;
-                                    background: var(--bg-input);
-                                    color: var(--fg-body);
-                                    transition: border-color 0.15s; }}
-  .filter-bar input[type="text"]:focus {{ border-color: var(--fg-table-header);
-                                          box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.15); }}
-  .filter-pill {{ background: var(--bg-pill); border: 1px solid var(--border-strong);
-                  border-radius: 14px; padding: 3px 11px;
-                  font-size: 12px; cursor: pointer; color: var(--fg-pill);
-                  transition: all 0.15s; user-select: none;
-                  font-weight: 500; white-space: nowrap; }}
-  .filter-pill:hover {{ background: var(--bg-pill-hover); border-color: var(--fg-faint); }}
-  .filter-pill.active {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
-                         border-color: var(--bg-pill-active);
-                         box-shadow: 0 1px 3px rgba(15, 23, 42, 0.15); }}
-  .clear-pill {{ color: var(--fg-faint); font-size: 11px;
-                 background: var(--bg-page); }}
-  .clear-pill:hover {{ background: var(--bg-chip-red); color: var(--fg-chip-red);
-                       border-color: var(--fg-chip-red); }}
-  /* Frequent-combo pills live in #freqFilters; display:contents lets the
-     buttons flow directly in the filter-bar-top flex row. The ★ marks them
-     as your recently-used combos vs. the regular pills in More filters. */
-  #freqFilters {{ display: contents; }}
-  .freq-pill::before {{ content: "★ "; color: var(--accent, #e6a817);
-                        font-size: 10px; }}
-  .more-toggle {{ background: var(--bg-table-header); color: var(--fg-pill);
-                  border: 1px solid var(--border-strong);
-                  border-radius: 14px; padding: 3px 11px;
-                  font-size: 12px; cursor: pointer;
-                  font-weight: 500; user-select: none;
-                  transition: all 0.15s; }}
-  .more-toggle:hover {{ background: var(--bg-table-header-hover); }}
-  .more-toggle.expanded {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
-                           border-color: var(--bg-pill-active); }}
-  .filter-more {{ display: none; margin-top: 10px;
-                  padding-top: 10px;
-                  border-top: 1px solid var(--border-soft); }}
-  .filter-more.show {{ display: block; }}
-  .filter-group {{ display: flex; align-items: center;
-                   gap: 6px; flex-wrap: wrap;
-                   margin-bottom: 6px; }}
-  .filter-group:last-child {{ margin-bottom: 0; }}
-  .filter-group-label {{ font-size: 10px; color: var(--fg-faint);
-                         font-weight: 700;
-                         text-transform: uppercase; letter-spacing: 0.6px;
-                         min-width: 110px; }}
-  .filter-status {{ font-size: 12px; color: var(--fg-muted);
-                    margin-left: auto;
-                    font-variant-numeric: tabular-nums;
-                    white-space: nowrap; }}
+  /* ===================== Redesigned filter bar (flt-*) ===================== */
+  .flt-bar {{ background: var(--bg-card); border: 1px solid var(--border-medium);
+             border-radius: 10px; padding: 10px 14px; margin-bottom: 18px;
+             box-shadow: var(--shadow-card); }}
+  .flt-top {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .flt-search {{ position: relative; flex: 1 1 240px; min-width: 200px; display: flex; }}
+  .flt-search input {{ width: 100%; padding: 7px 30px 7px 12px;
+                      border: 1px solid var(--border-strong); border-radius: 8px;
+                      font-size: 13px; outline: none; background: var(--bg-input);
+                      color: var(--fg-body); transition: border-color .15s, box-shadow .15s; }}
+  .flt-search input:focus {{ border-color: var(--fg-table-header);
+                            box-shadow: 0 0 0 3px rgba(74,144,226,.15); }}
+  .flt-search .flt-x {{ position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+                       border: 0; background: none; color: var(--fg-faint); cursor: pointer;
+                       font-size: 15px; line-height: 1; padding: 2px; display: none; }}
+  .flt-search.has-val .flt-x {{ display: block; }}
+
+  .flt-btn {{ background: var(--bg-table-header); color: var(--fg-pill);
+             border: 1px solid var(--border-strong); border-radius: 8px;
+             padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+             user-select: none; white-space: nowrap; transition: all .15s; }}
+  .flt-btn:hover {{ background: var(--bg-table-header-hover); }}
+  .flt-btn.on {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
+                border-color: var(--bg-pill-active); }}
+  .flt-btn .flt-badge {{ display: inline-block; min-width: 16px; margin-left: 5px;
+                        padding: 0 5px; border-radius: 9px; font-size: 10px; font-weight: 700;
+                        background: var(--bg-pill-active); color: #fff; line-height: 16px; }}
+  .flt-btn.on .flt-badge {{ background: rgba(255,255,255,.25); }}
+  .flt-clear {{ color: var(--fg-faint); background: var(--bg-page); }}
+  .flt-clear:hover {{ background: var(--bg-chip-red); color: var(--fg-chip-red);
+                     border-color: var(--fg-chip-red); }}
+  .flt-count {{ font-size: 12px; color: var(--fg-muted); margin-left: auto;
+               font-variant-numeric: tabular-nums; white-space: nowrap; }}
+
+  /* ---- Most-used combos (learned from your usage; seeded with suggestions) ---- */
+  .flt-used {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+              margin-top: 9px; }}
+  .flt-used-label {{ font-size: 10px; color: var(--fg-faint); font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .6px; }}
+  .flt-combo {{ background: var(--bg-pill); border: 1px solid var(--border-strong);
+               border-radius: 14px; padding: 3px 11px; font-size: 12px; cursor: pointer;
+               color: var(--fg-pill); font-weight: 500; white-space: nowrap; transition: all .15s; }}
+  .flt-combo::before {{ content: "★ "; color: var(--accent, #e6a817); font-size: 10px; }}
+  .flt-combo:hover {{ background: var(--bg-pill-hover); border-color: var(--fg-faint); }}
+  .flt-combo.on {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
+                  border-color: var(--bg-pill-active); }}
+  .flt-combo.on::before {{ color: rgba(255,255,255,.9); }}
+
+  /* ---- Active-filter chips ---- */
+  .flt-chips {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 9px; }}
+  .flt-chips:empty {{ display: none; }}
+  .flt-chip {{ display: inline-flex; align-items: center; gap: 5px;
+              background: var(--bg-chip-blue); color: var(--fg-chip-blue);
+              border: 1px solid transparent; border-radius: 13px;
+              padding: 3px 5px 3px 10px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }}
+  .flt-chip b {{ font-weight: 700; }}
+  .flt-chip .flt-chip-x {{ display: inline-flex; align-items: center; justify-content: center;
+                          width: 15px; height: 15px; border-radius: 50%; cursor: pointer;
+                          font-size: 12px; line-height: 1; color: inherit; opacity: .65; }}
+  .flt-chip .flt-chip-x:hover {{ opacity: 1; background: rgba(0,0,0,.12); }}
+
+  /* ---- Expandable panel ---- */
+  .flt-panel {{ display: none; margin-top: 12px; padding-top: 12px;
+               border-top: 1px solid var(--border-soft); }}
+  .flt-panel.show {{ display: block; }}
+  .flt-section {{ margin-bottom: 6px; }}
+  .flt-section-head {{ display: flex; align-items: center; gap: 7px; cursor: pointer;
+                      padding: 5px 2px; user-select: none; }}
+  .flt-section-head .flt-caret {{ color: var(--fg-faint); font-size: 10px; width: 10px;
+                                 transition: transform .15s; }}
+  .flt-section.collapsed .flt-caret {{ transform: rotate(-90deg); }}
+  .flt-section-title {{ font-size: 11px; color: var(--fg-table-header); font-weight: 700;
+                       text-transform: uppercase; letter-spacing: .5px; }}
+  .flt-section-active {{ font-size: 10px; font-weight: 700; color: #fff;
+                        background: var(--bg-pill-active); border-radius: 9px;
+                        padding: 0 6px; line-height: 15px; }}
+  .flt-section-active:empty {{ display: none; }}
+  .flt-cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+               gap: 8px 12px; padding: 2px 2px 8px; }}
+  .flt-section.collapsed .flt-cards {{ display: none; }}
+  .flt-card {{ background: var(--bg-page); border: 1px solid var(--border-soft);
+              border-radius: 8px; padding: 8px 10px; }}
+  .flt-card-label {{ font-size: 10.5px; color: var(--fg-muted); font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .4px; margin-bottom: 7px;
+                    display: flex; justify-content: space-between; align-items: baseline; }}
+  .flt-card-reset {{ font-weight: 600; font-size: 10px; color: var(--fg-faint);
+                    cursor: pointer; text-transform: none; letter-spacing: 0; display: none; }}
+  .flt-card.narrowed .flt-card-reset {{ display: inline; }}
+  .flt-card-reset:hover {{ color: var(--fg-chip-red); }}
+
+  /* ---- Facet option pills ---- */
+  .flt-opts {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+  .flt-opt {{ display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+             background: var(--bg-pill); border: 1px solid var(--border-strong);
+             border-radius: 12px; padding: 2px 8px; font-size: 11.5px; color: var(--fg-pill);
+             font-weight: 500; white-space: nowrap; transition: all .12s; }}
+  .flt-opt:hover {{ background: var(--bg-pill-hover); border-color: var(--fg-faint); }}
+  .flt-opt.on {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
+                border-color: var(--bg-pill-active); }}
+  .flt-opt .flt-n {{ font-size: 10px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }}
+  .flt-opt.on .flt-n {{ color: rgba(255,255,255,.75); }}
+  .flt-opt.zero {{ opacity: .38; cursor: default; }}
+  .flt-opt.zero:hover {{ background: var(--bg-pill); border-color: var(--border-strong); }}
+
+  /* ---- Dual-range slider ---- */
+  .flt-range-vals {{ display: flex; justify-content: space-between; align-items: center;
+                    font-size: 11.5px; color: var(--fg-body); font-weight: 600;
+                    font-variant-numeric: tabular-nums; margin-bottom: 8px; }}
+  .flt-range-vals .flt-range-n {{ font-size: 10px; color: var(--fg-faint); font-weight: 500; }}
+  .flt-slider {{ position: relative; height: 20px; }}
+  .flt-slider .flt-track {{ position: absolute; top: 8px; left: 0; right: 0; height: 4px;
+                           background: var(--border-medium); border-radius: 2px; }}
+  .flt-slider .flt-fill {{ position: absolute; top: 8px; height: 4px;
+                          background: var(--bg-pill-active); border-radius: 2px; }}
+  [data-theme="dark"] .flt-slider .flt-fill {{ background: #4a90e2; }}
+  .flt-slider input[type=range] {{ position: absolute; top: 0; left: 0; width: 100%;
+                                  height: 20px; margin: 0; background: none; pointer-events: none;
+                                  -webkit-appearance: none; appearance: none; }}
+  .flt-slider input[type=range]::-webkit-slider-thumb {{ -webkit-appearance: none; appearance: none;
+       width: 15px; height: 15px; border-radius: 50%; background: var(--bg-card);
+       border: 2px solid var(--bg-pill-active); cursor: pointer; pointer-events: auto;
+       box-shadow: 0 1px 3px rgba(15,23,42,.25); margin-top: 0; }}
+  .flt-slider input[type=range]::-moz-range-thumb {{ width: 15px; height: 15px; border-radius: 50%;
+       background: var(--bg-card); border: 2px solid var(--bg-pill-active); cursor: pointer;
+       pointer-events: auto; box-shadow: 0 1px 3px rgba(15,23,42,.25); }}
+  [data-theme="dark"] .flt-slider input[type=range]::-webkit-slider-thumb {{ border-color: #4a90e2; }}
+  [data-theme="dark"] .flt-slider input[type=range]::-moz-range-thumb {{ border-color: #4a90e2; }}
+
+  @media (max-width: 900px) {{
+    .flt-cards {{ grid-template-columns: 1fr 1fr; }}
+    .flt-count {{ margin-left: 0; }}
+  }}
+  @media (max-width: 560px) {{
+    .flt-cards {{ grid-template-columns: 1fr; }}
+  }}
 
   /* ---------- Theme toggle button (in the header controls cluster) ---------- */
   .theme-toggle {{ width: 34px; height: 34px; flex: 0 0 auto;
@@ -6930,150 +7013,21 @@ def generate_html_report(
   </div>
 </div>
 
-<div class="filter-bar">
-  <div class="filter-bar-top">
-    <input type="text" id="searchInput" placeholder="🔍 Search ticker or name…" autocomplete="off">
-    <!-- Your 10 most recently-used filter combos, populated from localStorage
-         by JS (persists across regenerated reports — same Pages origin). Seeds
-         with the Quick-picks defaults below until usage history builds up. -->
-    <span id="freqFilters"></span>
-    <button class="more-toggle" id="moreToggle">More filters ▾</button>
-    <button class="filter-pill clear-pill" id="clearFilters">✕ Clear</button>
-    <span class="filter-status" id="filterStatus"></span>
+<div class="flt-bar" id="fltBar">
+  <div class="flt-top">
+    <span class="flt-search" id="fltSearchWrap">
+      <input type="text" id="searchInput" placeholder="🔍 Search ticker, name or sector…" autocomplete="off">
+      <button class="flt-x" id="fltSearchX" title="Clear search" aria-label="Clear search">✕</button>
+    </span>
+    <button class="flt-btn" id="fltToggle" aria-expanded="false">Filters ▾</button>
+    <button class="flt-btn flt-clear" id="clearFilters">✕ Clear all</button>
+    <span class="flt-count" id="filterStatus"></span>
   </div>
-  <div class="filter-more" id="filterMore">
-    <div class="filter-group">
-      <span class="filter-group-label">Quick picks</span>
-      <button class="filter-pill" data-filter="buy">Buy signals</button>
-      <button class="filter-pill" data-filter="action">Action (SELL/TRIM)</button>
-      <button class="filter-pill" data-filter="high-quality">Quality 7+</button>
-      <button class="filter-pill" data-filter="hot-sector">🔥 Hot</button>
-      <button class="filter-pill" data-filter="insider-buy">✓ Insider buying</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Verdict</span>
-      <button class="filter-pill" data-filter="verdict-add">ADD only</button>
-      <button class="filter-pill" data-filter="verdict-hold">HOLD only</button>
-      <button class="filter-pill" data-filter="verdict-trim">TRIM only</button>
-      <button class="filter-pill" data-filter="verdict-sell">SELL only</button>
-      <button class="filter-pill" data-filter="verdict-buy">BUY (watchlist) only</button>
-      <button class="filter-pill" data-filter="verdict-watch">WATCH only</button>
-      <button class="filter-pill" data-filter="verdict-score-high">Verdict score 75+</button>
-      <button class="filter-pill" data-filter="verdict-score-85">Verdict score 85+</button>
-      <button class="filter-pill" data-filter="verdict-score-90">Verdict score 90+</button>
-      <button class="filter-pill" data-filter="verdict-score-low">Verdict score &lt;40</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Quality</span>
-      <button class="filter-pill" data-filter="high-score">Composite 70+</button>
-      <button class="filter-pill" data-filter="mid-score">Composite 50–70</button>
-      <button class="filter-pill" data-filter="weak-score">Composite &lt;40</button>
-      <button class="filter-pill" data-filter="passes-9">Passes 9/9 filters</button>
-      <button class="filter-pill" data-filter="passes-8">Passes 8+ filters</button>
-      <button class="filter-pill" data-filter="quality-6">Quality 6 (borderline)</button>
-      <button class="filter-pill" data-filter="low-quality">Quality &lt;5</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Sector momentum</span>
-      <button class="filter-pill" data-filter="cool-sector">❄️ Cool sector</button>
-      <button class="filter-pill" data-filter="neutral-sector">Neutral sector</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">By sector</span>
-      <button class="filter-pill" data-filter="sector-technology">Technology</button>
-      <button class="filter-pill" data-filter="sector-healthcare">Healthcare</button>
-      <button class="filter-pill" data-filter="sector-financial">Financials</button>
-      <button class="filter-pill" data-filter="sector-comm">Communication</button>
-      <button class="filter-pill" data-filter="sector-consumer-cyclical">Consumer Cyclical</button>
-      <button class="filter-pill" data-filter="sector-consumer-defensive">Consumer Defensive</button>
-      <button class="filter-pill" data-filter="sector-energy">Energy</button>
-      <button class="filter-pill" data-filter="sector-industrials">Industrials</button>
-      <button class="filter-pill" data-filter="sector-utilities">Utilities</button>
-      <button class="filter-pill" data-filter="sector-real-estate">Real Estate</button>
-      <button class="filter-pill" data-filter="sector-basic-materials">Basic Materials</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Trend</span>
-      <button class="filter-pill" data-filter="uptrend">↑ Uptrend</button>
-      <button class="filter-pill" data-filter="sideways">→ Sideways</button>
-      <button class="filter-pill" data-filter="downtrend">↓ Downtrend</button>
-      <button class="filter-pill" data-filter="far-above-ma">Far above 200d MA (+25%)</button>
-      <button class="filter-pill" data-filter="far-below-ma">Far below 200d MA (-15%)</button>
-      <button class="filter-pill" data-filter="near-200d-ma">Near 200d MA (±5%)</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Price action</span>
-      <button class="filter-pill" data-filter="winners">Winners</button>
-      <button class="filter-pill" data-filter="big-winners">Big winners (+25%)</button>
-      <button class="filter-pill" data-filter="huge-winners">Huge winners (+100%)</button>
-      <button class="filter-pill" data-filter="losers">Losers</button>
-      <button class="filter-pill" data-filter="beaten-down">Beaten down (-15%)</button>
-      <button class="filter-pill" data-filter="deep-losers">Deep losers (-30%)</button>
-      <button class="filter-pill" data-filter="near-low">Near 52w low</button>
-      <button class="filter-pill" data-filter="mid-range">Mid-range (40–70%)</button>
-      <button class="filter-pill" data-filter="near-high">Near 52w high</button>
-      <button class="filter-pill" data-filter="big-upside">Upside &gt;20%</button>
-      <button class="filter-pill" data-filter="massive-upside">Upside &gt;40%</button>
-      <button class="filter-pill" data-filter="overvalued">Above target</button>
-      <button class="filter-pill" data-filter="very-overvalued">Above target by 15%+</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Today</span>
-      <button class="filter-pill" data-filter="up-today">▲ Up today</button>
-      <button class="filter-pill" data-filter="down-today">▼ Down today</button>
-      <button class="filter-pill" data-filter="big-up-today">▲ Movers (+3%)</button>
-      <button class="filter-pill" data-filter="big-down-today">▼ Movers (-3%)</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Rank movement</span>
-      <button class="filter-pill" data-filter="moved-up">▲ Moved up</button>
-      <button class="filter-pill" data-filter="moved-down">▼ Moved down</button>
-      <button class="filter-pill" data-filter="big-climbers">▲▲ Big climbers (3+)</button>
-      <button class="filter-pill" data-filter="big-fallers">▼▼ Big fallers (3+)</button>
-      <button class="filter-pill" data-filter="rank-new">★ New today</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Analyst rating</span>
-      <button class="filter-pill" data-filter="analyst-strong-buy">Strong Buy</button>
-      <button class="filter-pill" data-filter="analyst-buy">Buy rated</button>
-      <button class="filter-pill" data-filter="analyst-hold">Hold rated</button>
-      <button class="filter-pill" data-filter="analyst-sell">Sell rated</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Insider activity</span>
-      <button class="filter-pill" data-filter="insider-caution">⚠ Insider caution</button>
-      <button class="filter-pill" data-filter="insider-no-signal">No signal</button>
-      <button class="filter-pill" data-filter="has-insider-data">Any insider data</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Position size</span>
-      <button class="filter-pill" data-filter="very-large-position">Very large (&gt;20%)</button>
-      <button class="filter-pill" data-filter="large-position">Large (&gt;10%)</button>
-      <button class="filter-pill" data-filter="mid-position">Mid (2–10%)</button>
-      <button class="filter-pill" data-filter="small-position">Small (&lt;2%)</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Holding period</span>
-      <button class="filter-pill" data-filter="long-term">Long-term (&gt;1yr)</button>
-      <button class="filter-pill" data-filter="short-term">Short-term (≤1yr)</button>
-      <button class="filter-pill" data-filter="approaching-lt">Approaching LT (within 90d)</button>
-      <button class="filter-pill" data-filter="recent-buy">Recent (&lt;30d)</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Earnings</span>
-      <button class="filter-pill" data-filter="earnings-soon">📅 Reports within 7d</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Tax</span>
-      <button class="filter-pill" data-filter="has-tax-flag">Has tax detail</button>
-      <button class="filter-pill" data-filter="tax-loss-candidate">Loss-harvest candidate</button>
-    </div>
-    <div class="filter-group">
-      <span class="filter-group-label">Type</span>
-      <button class="filter-pill" data-filter="compounder-only">Compounders</button>
-      <button class="filter-pill" data-filter="thematic-only">Thematic/ETFs</button>
-    </div>
+  <div class="flt-used" id="fltUsed">
+    <span class="flt-used-label">Most used</span>
   </div>
+  <div class="flt-chips" id="fltChips"></div>
+  <div class="flt-panel" id="fltPanel"></div>
 </div>
 """
 
@@ -7464,428 +7418,550 @@ Verdicts are framework outputs, not investment advice.
   });
 })();
 
-/* ---------- Filter bar: multi-select pills + search + more toggle ---------- */
+/* ---------- Filter bar: faceted pills + range sliders + active chips ---------- */
 (function() {
   var searchInput = document.getElementById('searchInput');
-  var pills = document.querySelectorAll('.filter-pill[data-filter]');
-  var clearBtn = document.getElementById('clearFilters');
-  var moreToggle = document.getElementById('moreToggle');
-  var moreSection = document.getElementById('filterMore');
-  var statusEl = document.getElementById('filterStatus');
-  if (!searchInput || !pills.length) return;
+  var searchWrap  = document.getElementById('fltSearchWrap');
+  var searchX     = document.getElementById('fltSearchX');
+  var clearBtn    = document.getElementById('clearFilters');
+  var toggleBtn   = document.getElementById('fltToggle');
+  var panel       = document.getElementById('fltPanel');
+  var usedEl      = document.getElementById('fltUsed');
+  var chipsEl     = document.getElementById('fltChips');
+  var statusEl    = document.getElementById('filterStatus');
+  if (!searchInput || !panel) return;
 
-  var activeFilters = new Set();
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tbody tr'))
+               .filter(function(r) { return r.hasAttribute('data-verdict'); });
 
-  function num(s) {
-    if (s === null || s === '') return NaN;
-    var n = parseFloat(s);
-    return isNaN(n) ? NaN : n;
+  // ---- Config: every metric a row exposes, grouped into collapsible sections.
+  //      type:'facet'  -> categorical, OR within a card, AND across cards.
+  //      type:'range'  -> numeric min/max dual slider (AND).
+  //      Controls render only when the data actually varies, so reports with
+  //      no tax/watchlist/insider rows simply don't show those controls. ----
+  var SECTIONS = [
+    { id: 'verdict', title: 'Verdict & signals', cards: [
+      { type:'facet', attr:'verdict', label:'Verdict',
+        order:['ADD','BUY','HOLD','WAIT','WATCH','TRIM','SELL','PASS'] },
+      { type:'facet', attr:'recommendation', label:'Analyst rating', short:'Analyst', skip:['none',''],
+        order:['strong_buy','buy','hold','sell','strong_sell'],
+        labels:{strong_buy:'Strong Buy',buy:'Buy',hold:'Hold',sell:'Sell',strong_sell:'Strong Sell'} },
+      { type:'facet', attr:'insider', label:'Insider 90d', short:'Insider', skip:[''],
+        order:['supports_buy','no_signal','caution'],
+        labels:{supports_buy:'✓ Buying',no_signal:'No signal',caution:'⚠ Caution'} },
+      { type:'facet', attr:'news', label:'News sentiment', short:'News', skip:[''],
+        order:['bullish','neutral','bearish'],
+        labels:{bullish:'📰 Bullish',neutral:'📰 Neutral',bearish:'📰 Bearish'} },
+      { type:'range', attr:'verdict-score', label:'Verdict score', short:'Verdict pts', integer:true },
+      { type:'range', attr:'quality', label:'Quality gates', short:'Quality', integer:true },
+      { type:'range', attr:'score', label:'Composite score', short:'Composite', integer:true },
+    ]},
+    { id: 'price', title: 'Price & value', cards: [
+      { type:'range', attr:'upside', label:'Upside to target', short:'Upside', unit:'%' },
+      { type:'range', attr:'gain-pct', label:'Total gain', short:'Gain', unit:'%' },
+      { type:'range', attr:'gain', label:'Gain', short:'Gain $', money:true },
+      { type:'range', attr:'day-pct', label:'Today', short:'Today', unit:'%' },
+      { type:'range', attr:'pos52', label:'52-wk position', short:'52-wk', unit:'%' },
+      { type:'range', attr:'ma-pct', label:'vs 200-day MA', short:'vs 200d', unit:'%' },
+    ]},
+    { id: 'class', title: 'Classification', cards: [
+      { type:'facet', attr:'sector', label:'Sector', skip:[''] },
+      { type:'facet', attr:'bucket', label:'Type', skip:[''],
+        labels:{compounder:'Compounder',thematic:'Thematic',etf:'ETF'} },
+      { type:'facet', attr:'sector-mom', label:'Sector momentum', short:'Sector', skip:['Unknown',''],
+        order:['Hot','Neutral','Cool'],
+        labels:{Hot:'🔥 Hot',Neutral:'→ Neutral',Cool:'❄️ Cool'} },
+      { type:'facet', attr:'trend', label:'Price trend', short:'Trend', skip:[''],
+        order:['uptrend','sideways','downtrend'],
+        labels:{uptrend:'↑ Uptrend',sideways:'→ Sideways',downtrend:'↓ Downtrend'} },
+    ]},
+    { id: 'timing', title: 'Position & timing', cards: [
+      { type:'range', attr:'port-pct', label:'Position size', short:'Position', unit:'%' },
+      { type:'range', attr:'days-held', label:'Days held', short:'Held', unit:'d', integer:true },
+      { type:'range', attr:'earnings-days', label:'Days to earnings', short:'Earnings in', unit:'d', integer:true },
+      { type:'facet', attr:'rank-move', label:'Rank movement', short:'Rank', skip:[''],
+        order:['up','down','new'],
+        labels:{up:'▲ Moved up',down:'▼ Moved down','new':'★ New today'} },
+      { type:'range', attr:'rank-delta', label:'Rank Δ (places)', short:'Rank Δ', integer:true },
+      { type:'facet', attr:'has-tax', label:'Tax', skip:['0',''], labels:{'1':'Has tax detail'} },
+    ]},
+  ];
+
+  // Named presets. They (a) back the header summary tiles via
+  // window.applyHeaderFilter(key) and (b) seed the "Most used" bar until your
+  // own history builds up. `facets`/`ranges` describe a full target state;
+  // a null range bound means "open to the data's edge".
+  var PRESETS = [
+    { key:'verdict-add',   label:'Add candidates',       facets:{verdict:['ADD']} },
+    { key:'action',        label:'Sell / Trim',          facets:{verdict:['SELL','TRIM']} },
+    { key:'verdict-buy',   label:'Buy (watchlist)',      facets:{verdict:['BUY']} },
+    { key:'high-quality',  label:'Quality ≥7',      ranges:{quality:[7,null]} },
+    { key:'insider-buy',   label:'✓ Insider buying', facets:{insider:['supports_buy']} },
+    { key:'news-bullish',  label:'📰 Bullish news', facets:{news:['bullish']} },
+    { key:'hot-sector',    label:'🔥 Hot sector', facets:{'sector-mom':['Hot']} },
+    { key:'big-upside',    label:'Upside ≥15%',      ranges:{upside:[15,null]} },
+    { key:'earnings-soon', label:'📅 Reports ≤7d', ranges:{'earnings-days':[0,7]} },
+    { key:'tax-loss',      label:'Loss harvest',          ranges:{'gain-pct':[null,-5]} },
+  ];
+  var USAGE_KEY = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
+  var MAX_SHOWN = 12;                // most-used combos to render
+
+  // ---------- State ----------
+  var state = { facets: {}, ranges: {} };   // facets: attr->Set; ranges: attr->{min,max}
+  var domains = {};                         // attr -> {min,max,step,integer}
+  var LS = { open:'fltPanelOpen', collapsed:'fltCollapsed' };
+
+  function attrRaw(row, attr) { var v = row.getAttribute('data-' + attr); return v == null ? '' : v; }
+  function attrNum(row, attr) { var v = row.getAttribute('data-' + attr);
+    if (v == null || v === '') return NaN; var n = parseFloat(v); return isNaN(n) ? NaN : n; }
+
+  function niceStep(span) {
+    if (span <= 0) return 1;
+    var raw = span / 200, mag = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / mag;
+    return (n < 1.5 ? 1 : n < 3.5 ? 2 : n < 7.5 ? 5 : 10) * mag;
   }
-
-  function rowMatchesFilter(row, filter) {
-    var verdict = row.getAttribute('data-verdict') || '';
-    var verdictScore = num(row.getAttribute('data-verdict-score'));
-    var quality = num(row.getAttribute('data-quality'));
-    var gain = num(row.getAttribute('data-gain'));
-    var gainPct = num(row.getAttribute('data-gain-pct'));
-    var dayPct = num(row.getAttribute('data-day-pct'));
-    var upside = num(row.getAttribute('data-upside'));
-    var pos52 = num(row.getAttribute('data-pos52'));
-    var score = num(row.getAttribute('data-score'));
-    // Two sector attributes: the raw GICS name (Technology, Healthcare...)
-    // and the momentum label (Hot/Cool/Neutral). Both used by different filters.
-    var sectorRaw = (row.getAttribute('data-sector') || '').toLowerCase();
-    var sectorMom = row.getAttribute('data-sector-mom') || '';
-    var insider = row.getAttribute('data-insider') || '';
-    var hasInsider = row.getAttribute('data-has-insider') || '';
-    var trend = row.getAttribute('data-trend') || '';
-    var maPct = num(row.getAttribute('data-ma-pct'));
-    var portPct = num(row.getAttribute('data-port-pct'));
-    var daysHeld = num(row.getAttribute('data-days-held'));
-    var recommendation = row.getAttribute('data-recommendation') || '';
-    var hasTax = row.getAttribute('data-has-tax') || '0';
-    var bucket = row.getAttribute('data-bucket') || '';
-    var earningsDays = num(row.getAttribute('data-earnings-days'));
-    var rankMove = row.getAttribute('data-rank-move') || '';
-    var rankDelta = num(row.getAttribute('data-rank-delta'));
-
-    switch (filter) {
-      // ------------- Essentials (top row) -------------
-      case 'action':          return verdict === 'SELL' || verdict === 'TRIM';
-      case 'buy':             return verdict === 'BUY'  || verdict === 'ADD';
-      case 'high-quality':    return !isNaN(quality) && quality >= 7;
-      case 'hot-sector':      return sectorMom === 'Hot';
-      case 'insider-buy':     return insider === 'supports_buy';
-
-      // ------------- Verdict-specific -------------
-      case 'verdict-add':     return verdict === 'ADD';
-      case 'verdict-hold':    return verdict === 'HOLD';
-      case 'verdict-trim':    return verdict === 'TRIM';
-      case 'verdict-sell':    return verdict === 'SELL';
-      case 'verdict-buy':     return verdict === 'BUY';
-      case 'verdict-watch':   return verdict === 'WATCH';
-      case 'verdict-score-high': return !isNaN(verdictScore) && verdictScore >= 75;
-      case 'verdict-score-85':   return !isNaN(verdictScore) && verdictScore >= 85;
-      case 'verdict-score-90':   return !isNaN(verdictScore) && verdictScore >= 90;
-      case 'verdict-score-low':  return !isNaN(verdictScore) && verdictScore < 40;
-
-      // ------------- Rank movement (vs previous day) -------------
-      case 'moved-up':       return rankMove === 'up';
-      case 'moved-down':     return rankMove === 'down';
-      case 'rank-new':       return rankMove === 'new';
-      case 'big-climbers':   return rankMove === 'up'   && !isNaN(rankDelta) && rankDelta >= 3;
-      case 'big-fallers':    return rankMove === 'down' && !isNaN(rankDelta) && rankDelta <= -3;
-
-      // ------------- Quality / Composite -------------
-      case 'high-score':      return !isNaN(score) && score >= 70;
-      case 'mid-score':       return !isNaN(score) && score >= 50 && score < 70;
-      case 'weak-score':      return !isNaN(score) && score < 40;
-      case 'passes-9':        return !isNaN(quality) && quality === 9;
-      case 'passes-8':        return !isNaN(quality) && quality >= 8;
-      case 'quality-6':       return !isNaN(quality) && quality === 6;
-      case 'low-quality':     return !isNaN(quality) && quality < 5;
-
-      // ------------- Sector momentum -------------
-      case 'cool-sector':     return sectorMom === 'Cool';
-      case 'neutral-sector':  return sectorMom === 'Neutral';
-
-      // ------------- By sector (case-insensitive substring match) -------------
-      case 'sector-technology':         return sectorRaw.indexOf('technolog') !== -1;
-      case 'sector-healthcare':         return sectorRaw.indexOf('healthcare') !== -1;
-      case 'sector-financial':          return sectorRaw.indexOf('financ') !== -1;
-      case 'sector-comm':               return sectorRaw.indexOf('communication') !== -1;
-      case 'sector-consumer-cyclical':  return sectorRaw.indexOf('consumer cyclical') !== -1
-                                            || sectorRaw.indexOf('discretionary') !== -1;
-      case 'sector-consumer-defensive': return sectorRaw.indexOf('consumer defensive') !== -1
-                                            || sectorRaw.indexOf('staples') !== -1;
-      case 'sector-energy':             return sectorRaw.indexOf('energy') !== -1;
-      case 'sector-industrials':        return sectorRaw.indexOf('industrial') !== -1;
-      case 'sector-utilities':          return sectorRaw.indexOf('utilit') !== -1;
-      case 'sector-real-estate':        return sectorRaw.indexOf('real estate') !== -1;
-      case 'sector-basic-materials':    return sectorRaw.indexOf('basic material') !== -1
-                                            || sectorRaw.indexOf('materials') !== -1;
-
-      // ------------- Trend -------------
-      case 'uptrend':         return trend === 'uptrend';
-      case 'sideways':        return trend === 'sideways';
-      case 'downtrend':       return trend === 'downtrend';
-      case 'far-above-ma':    return !isNaN(maPct) && maPct >= 25;
-      case 'far-below-ma':    return !isNaN(maPct) && maPct <= -15;
-      case 'near-200d-ma':    return !isNaN(maPct) && Math.abs(maPct) <= 5;
-
-      // ------------- Price action -------------
-      case 'winners':
-        if (!isNaN(gain))   return gain > 0;
-        if (!isNaN(upside)) return upside > 0;
-        return false;
-      case 'big-winners':     return !isNaN(gainPct) && gainPct >= 25;
-      case 'huge-winners':    return !isNaN(gainPct) && gainPct >= 100;
-      case 'losers':
-        if (!isNaN(gain))   return gain < 0;
-        if (!isNaN(upside)) return upside < 0;
-        return false;
-      case 'beaten-down':     return !isNaN(gainPct) && gainPct <= -15;
-      case 'deep-losers':     return !isNaN(gainPct) && gainPct <= -30;
-      case 'near-low':        return !isNaN(pos52) && pos52 <= 25;
-      case 'mid-range':       return !isNaN(pos52) && pos52 >= 40 && pos52 <= 70;
-      case 'near-high':       return !isNaN(pos52) && pos52 >= 90;
-      case 'big-upside':      return !isNaN(upside) && upside >= 20;
-      case 'massive-upside':  return !isNaN(upside) && upside >= 40;
-      case 'overvalued':      return !isNaN(upside) && upside < 0;
-      case 'very-overvalued': return !isNaN(upside) && upside <= -15;
-
-      // ------------- Today's move -------------
-      case 'up-today':        return !isNaN(dayPct) && dayPct > 0;
-      case 'down-today':      return !isNaN(dayPct) && dayPct < 0;
-      case 'big-up-today':    return !isNaN(dayPct) && dayPct >= 3;
-      case 'big-down-today':  return !isNaN(dayPct) && dayPct <= -3;
-
-      // ------------- Analyst rating -------------
-      case 'analyst-strong-buy': return recommendation === 'strong_buy';
-      case 'analyst-buy':        return recommendation === 'buy';
-      case 'analyst-hold':       return recommendation === 'hold';
-      case 'analyst-sell':       return recommendation === 'sell' || recommendation === 'strong_sell';
-
-      // ------------- Insider -------------
-      case 'insider-caution':   return insider === 'caution';
-      case 'insider-no-signal': return insider === 'no_signal';
-      case 'has-insider-data':  return hasInsider === '1';
-
-      // ------------- Position size -------------
-      case 'very-large-position': return !isNaN(portPct) && portPct >= 20;
-      case 'large-position':      return !isNaN(portPct) && portPct >= 10;
-      case 'mid-position':        return !isNaN(portPct) && portPct >= 2 && portPct < 10;
-      case 'small-position':      return !isNaN(portPct) && portPct > 0 && portPct < 2;
-
-      // ------------- Holding period -------------
-      case 'long-term':       return !isNaN(daysHeld) && daysHeld > 365;
-      case 'short-term':      return !isNaN(daysHeld) && daysHeld <= 365;
-      case 'approaching-lt':  return !isNaN(daysHeld) && daysHeld >= 275 && daysHeld <= 365;
-      case 'recent-buy':      return !isNaN(daysHeld) && daysHeld < 30;
-
-      // ------------- Earnings -------------
-      // "Soon" = reports within 7 days (forward-only). Keep this threshold in
-      // sync with EARNINGS_SOON_DAYS in the Python side.
-      case 'earnings-soon':      return !isNaN(earningsDays) && earningsDays >= 0 && earningsDays <= 7;
-
-      // ------------- Tax -------------
-      case 'has-tax-flag':       return hasTax === '1';
-      case 'tax-loss-candidate': return !isNaN(gainPct) && gainPct <= -5;
-
-      // ------------- Type -------------
-      case 'compounder-only': return bucket === 'compounder';
-      case 'thematic-only':   return bucket === 'thematic' || bucket === 'etf';
-
-      default: return true;
+  function computeDomain(card) {
+    var vals = [];
+    for (var i = 0; i < rows.length; i++) { var v = attrNum(rows[i], card.attr); if (!isNaN(v)) vals.push(v); }
+    if (!vals.length) return null;
+    var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
+    if (mx <= mn) return null;
+    var step = card.integer ? 1 : niceStep(mx - mn);
+    mn = Math.floor(mn / step) * step; mx = Math.ceil(mx / step) * step;
+    return { min: mn, max: mx, step: step, integer: !!card.integer };
+  }
+  function presentValues(card) {
+    var seen = {}, skip = card.skip || [];
+    for (var i = 0; i < rows.length; i++) {
+      var v = attrRaw(rows[i], card.attr);
+      if (skip.indexOf(v) !== -1) continue;
+      seen[v] = (seen[v] || 0) + 1;
     }
+    var keys = Object.keys(seen);
+    var ord = card.order || [];
+    keys.sort(function(a, b) {
+      var ia = ord.indexOf(a), ib = ord.indexOf(b);
+      if (ia !== -1 || ib !== -1) { if (ia === -1) ia = 99; if (ib === -1) ib = 99; return ia - ib; }
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    return keys;
+  }
+  function cardFor(attr) { return cardEls[attr] ? cardEls[attr].card : null; }
+  function optLabel(card, v) { return (card && card.labels && card.labels[v]) || v; }
+
+  function fmtNum(v, card) {
+    if (card.money) {
+      var a = Math.abs(v), s = v < 0 ? '-' : '';
+      if (a >= 1000) return s + '$' + (a / 1000).toFixed(a >= 100000 ? 0 : 1) + 'k';
+      return s + '$' + a.toFixed(0);
+    }
+    var d = (domains[card.attr] && domains[card.attr].step < 1) ? 1 : 0;
+    return v.toFixed(d) + (card.unit || '');
   }
 
-  function applyFilters() {
-    var searchTerm = searchInput.value.trim().toLowerCase();
-    var visible = 0, total = 0;
+  // ---------- Matching ----------
+  function passSearch(row) {
+    var t = searchInput.value.trim().toLowerCase();
+    if (!t) return true;
+    return (row.getAttribute('data-search') || '').indexOf(t) !== -1;
+  }
+  function passFacet(row, attr) {
+    var set = state.facets[attr]; if (!set || !set.size) return true;
+    return set.has(attrRaw(row, attr));
+  }
+  function passRange(row, attr) {
+    var r = state.ranges[attr]; if (!r) return true;
+    var v = attrNum(row, attr); if (isNaN(v)) return false;
+    return v >= r.min - 1e-9 && v <= r.max + 1e-9;
+  }
+  function passAll(row, skipAttr) {
+    if (!passSearch(row)) return false;
+    for (var a in state.facets) if (a !== skipAttr && !passFacet(row, a)) return false;
+    for (var b in state.ranges) if (b !== skipAttr && !passRange(row, b)) return false;
+    return true;
+  }
 
-    document.querySelectorAll('tbody tr').forEach(function(row) {
-      total++;
-      var searchData = row.getAttribute('data-search') || '';
-      var matches = !searchTerm || searchData.indexOf(searchTerm) !== -1;
-      if (matches && activeFilters.size > 0) {
-        for (var f of activeFilters) {
-          if (!rowMatchesFilter(row, f)) { matches = false; break; }
-        }
-      }
-      row.style.display = matches ? '' : 'none';
-      if (matches) visible++;
-    });
+  // ---------- Rendering: build the panel from config ----------
+  var cardEls = {};   // attr -> {el, kind, card, ...}
+  function loadCollapsed() { try { return JSON.parse(localStorage.getItem(LS.collapsed)) || {}; } catch (e) { return {}; } }
+  function saveCollapsed(c) { try { localStorage.setItem(LS.collapsed, JSON.stringify(c)); } catch (e) {} }
 
-    // Hide empty tables (and their .table-wrap + preceding h3 sub-heading)
-    document.querySelectorAll('.table-wrap').forEach(function(wrap) {
-      var anyVisible = false;
-      wrap.querySelectorAll('tbody tr').forEach(function(r) {
-        if (r.style.display !== 'none') anyVisible = true;
+  function buildPanel() {
+    var collapsed = loadCollapsed();
+    SECTIONS.forEach(function(sec) {
+      var live = sec.cards.filter(function(card) {
+        if (card.type === 'range') { var d = computeDomain(card); if (!d) return false; domains[card.attr] = d; return true; }
+        return presentValues(card).length >= 2;   // a facet needs a real choice
       });
-      wrap.style.display = anyVisible ? '' : 'none';
-      var prev = wrap.previousElementSibling;
-      while (prev && prev.tagName !== 'H2' && prev.tagName !== 'H3') {
-        prev = prev.previousElementSibling;
-      }
-      if (prev && prev.tagName === 'H3') {
-        prev.style.display = anyVisible ? '' : 'none';
-      }
-    });
+      if (!live.length) return;
 
-    if (statusEl) {
-      if (visible === total && !searchTerm && activeFilters.size === 0) {
-        statusEl.textContent = 'Showing all ' + total;
-      } else {
-        var bits = [];
-        if (activeFilters.size) bits.push(activeFilters.size + ' filter' + (activeFilters.size > 1 ? 's' : ''));
-        if (searchTerm) bits.push('search');
-        var suffix = bits.length ? ' (' + bits.join(' + ') + ')' : '';
-        statusEl.textContent = 'Showing ' + visible + ' of ' + total + suffix;
-      }
-    }
-    if (clearBtn) {
-      var hasAny = activeFilters.size > 0 || !!searchTerm;
-      clearBtn.style.opacity = hasAny ? '1' : '0.4';
-      clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
-    }
-    // Highlight the More-filters button when advanced filters are active,
-    // WITHOUT force-opening — the panel is hover/scroll controlled below, so
-    // it stays hidden until hovered even while an advanced filter is on.
-    if (moreSection && moreToggle) {
-      var anyMoreActive =
-        moreSection.querySelectorAll('.filter-pill.active').length > 0;
-      moreToggle.classList.toggle('expanded', anyMoreActive);
-    }
-  }
+      var secEl = document.createElement('div');
+      secEl.className = 'flt-section' + (collapsed[sec.id] ? ' collapsed' : '');
+      secEl.setAttribute('data-sec', sec.id);
+      var head = document.createElement('div');
+      head.className = 'flt-section-head';
+      head.innerHTML = '<span class="flt-caret">▼</span>' +
+                       '<span class="flt-section-title">' + sec.title + '</span>' +
+                       '<span class="flt-section-active" data-sec-active="' + sec.id + '"></span>';
+      head.addEventListener('click', function() {
+        secEl.classList.toggle('collapsed');
+        var c = loadCollapsed(); c[sec.id] = secEl.classList.contains('collapsed'); saveCollapsed(c);
+      });
+      secEl.appendChild(head);
 
-  // Pills toggle on click (multi-select)
-  pills.forEach(function(pill) {
-    pill.addEventListener('click', function() {
-      var f = pill.getAttribute('data-filter');
-      if (activeFilters.has(f)) {
-        activeFilters.delete(f);
-        pill.classList.remove('active');
-      } else {
-        activeFilters.add(f);
-        pill.classList.add('active');
-      }
-      applyFilters();
-      recordUsageDebounced();   // learn the user's combos over time
-      renderFreqActive();
-    });
-  });
-
-  // Clear-all
-  if (clearBtn) {
-    clearBtn.addEventListener('click', function() {
-      activeFilters.clear();
-      pills.forEach(function(p) { p.classList.remove('active'); });
-      searchInput.value = '';
-      applyFilters();
-      renderFreqActive();
+      var grid = document.createElement('div');
+      grid.className = 'flt-cards';
+      live.forEach(function(card) {
+        grid.appendChild(card.type === 'range' ? buildRangeCard(card) : buildFacetCard(card));
+      });
+      secEl.appendChild(grid);
+      panel.appendChild(secEl);
     });
   }
 
-  // More-filters: hover the button to open; auto-hide when the pointer
-  // leaves the filter bar or the page scrolls. Click still toggles — needed
-  // on touch devices, where hover/mouseleave don't fire. The 'expanded'
-  // highlight (active advanced filters) is managed separately in applyFilters,
-  // so only the arrow + .show reflect open/closed here.
-  if (moreToggle && moreSection) {
-    function openMore() {
-      moreSection.classList.add('show');
-      moreToggle.textContent = 'More filters ▴';
-    }
-    function closeMore() {
-      if (!moreSection.classList.contains('show')) return;
-      moreSection.classList.remove('show');
-      moreToggle.textContent = 'More filters ▾';
-    }
-    moreToggle.addEventListener('mouseenter', openMore);
-    moreToggle.addEventListener('click', function() {
-      moreSection.classList.contains('show') ? closeMore() : openMore();
-    });
-    var filterBar = moreToggle.closest('.filter-bar');
-    if (filterBar) filterBar.addEventListener('mouseleave', closeMore);
-    window.addEventListener('scroll', closeMore, { passive: true });
-  }
-
-  // ----- Recently-used filter combos -----
-  // The most RECENTLY used filter combinations, persisted in localStorage and
-  // shown as ★ pills at the top — adapting to how you actually filter.
-  // localStorage is per-origin, so this history survives every
-  // regenerated/republished report.
-  var freqEl = document.getElementById('freqFilters');
-  var USAGE_KEY = 'filterComboUsage';   // { comboKey: lastUsedEpochMs }
-  var FREQ_MAX = 10;   // how many ★ combo pills to show (latest N)
-  // Seed (and fallback) combos = the former fixed quick-picks.
-  var DEFAULT_COMBOS = [['buy'], ['action'], ['high-quality'],
-                        ['hot-sector'], ['insider-buy']];
-
-  function loadUsage() {
-    try { return JSON.parse(localStorage.getItem(USAGE_KEY)) || {}; }
-    catch (e) { return {}; }
-  }
-  function saveUsage(u) {
-    try { localStorage.setItem(USAGE_KEY, JSON.stringify(u)); } catch (e) {}
-  }
-  function comboKey(keys) { return keys.slice().sort().join('+'); }
-  function currentKey() { return Array.from(activeFilters).sort().join('+'); }
-
-  var recordTimer = null;
-  function recordUsageDebounced() {
-    // Record the combo the user settles on (not every intermediate toggle),
-    // stamped with when it was last used so the bar shows most-recent combos.
-    clearTimeout(recordTimer);
-    recordTimer = setTimeout(function() {
-      if (!activeFilters.size) return;        // never record the empty set
-      var u = loadUsage();
-      u[currentKey()] = Date.now();           // last-used timestamp (ms)
-      var keys = Object.keys(u);
-      if (keys.length > 40) {                 // cap growth: keep the 40 most recent
-        keys.sort(function(a, b) { return u[b] - u[a]; });
-        var t = {}; keys.slice(0, 40).forEach(function(x) { t[x] = u[x]; });
-        u = t;
-      }
-      saveUsage(u);
-    }, 1500);
-  }
-
-  function comboLabel(keys) {
-    var out = [];
-    for (var i = 0; i < keys.length; i++) {
-      var p = document.querySelector('.filter-pill[data-filter="' + keys[i] + '"]');
-      if (!p) return null;                    // key absent in this report version
-      out.push(p.textContent.trim());
-    }
-    return out.join(' + ');
-  }
-
-  function setCombo(keys) {
-    activeFilters.clear();
-    // Activate every requested key directly — not just ones with a matching
-    // pill — so header-stat filters (e.g. 'earnings-soon') still work even if
-    // no pill is rendered for them.
-    keys.forEach(function(k) { if (k) activeFilters.add(k); });
-    pills.forEach(function(p) {
-      p.classList.toggle('active', keys.indexOf(p.getAttribute('data-filter')) >= 0);
-    });
-    applyFilters();
-    renderFreqActive();
-  }
-
-  function renderFreqActive() {
-    if (!freqEl) return;
-    var cur = currentKey();
-    freqEl.querySelectorAll('.freq-pill').forEach(function(b) {
-      b.classList.toggle('active', b.dataset.combo === cur);
-    });
-  }
-
-  function renderFrequent() {
-    if (!freqEl) return;
-    var u = loadUsage();
-    // Most-recent first (values are last-used timestamps).
-    var combos = Object.keys(u)
-      .sort(function(a, b) { return u[b] - u[a]; })
-      .map(function(k) { return k.split('+'); });
-    // Pad with default quick-picks not already present so the bar is never empty.
-    var seen = {};
-    combos.forEach(function(c) { seen[comboKey(c)] = 1; });
-    DEFAULT_COMBOS.forEach(function(c) {
-      if (!seen[comboKey(c)]) { combos.push(c); seen[comboKey(c)] = 1; }
-    });
-    freqEl.innerHTML = '';
-    var shown = 0;
-    for (var i = 0; i < combos.length && shown < FREQ_MAX; i++) {
-      var label = comboLabel(combos[i]);
-      if (!label) continue;                   // skip combos with stale keys
+  function buildFacetCard(card) {
+    var el = document.createElement('div');
+    el.className = 'flt-card'; el.setAttribute('data-attr', card.attr);
+    var reset = '<span class="flt-card-reset" data-reset="' + card.attr + '">reset</span>';
+    el.innerHTML = '<div class="flt-card-label"><span>' + card.label + '</span>' + reset + '</div>';
+    var opts = document.createElement('div'); opts.className = 'flt-opts';
+    presentValues(card).forEach(function(v) {
       var b = document.createElement('button');
-      b.className = 'filter-pill freq-pill';
-      b.textContent = label;
-      b.dataset.combo = comboKey(combos[i]);
-      b.title = 'Saved filter combo — click to apply, click again to clear';
-      (function(keys) {
-        b.addEventListener('click', function() {
-          if (currentKey() === comboKey(keys)) { setCombo([]); }   // toggle off
-          else { setCombo(keys); recordUsageDebounced(); }
-        });
-      })(combos[i]);
-      freqEl.appendChild(b);
-      shown++;
-    }
-    renderFreqActive();
+      b.className = 'flt-opt'; b.setAttribute('data-val', v);
+      b.innerHTML = '<span>' + optLabel(card, v) + '</span><span class="flt-n"></span>';
+      b.addEventListener('click', function() {
+        var set = state.facets[card.attr] || (state.facets[card.attr] = new Set());
+        if (set.has(v)) set.delete(v); else set.add(v);
+        if (!set.size) delete state.facets[card.attr];
+        refresh();
+      });
+      opts.appendChild(b);
+    });
+    el.appendChild(opts);
+    el.querySelector('[data-reset]').addEventListener('click', function() {
+      delete state.facets[card.attr]; refresh();
+    });
+    cardEls[card.attr] = { el: el, kind: 'facet', card: card };
+    return el;
   }
 
-  // Header summary tiles: apply a single filter (toggle off if it's already the
-  // only active one) and scroll to the first non-empty results table so the
-  // effect is visible even when the matching rows live in a lower section.
+  function buildRangeCard(card) {
+    var d = domains[card.attr];
+    var el = document.createElement('div');
+    el.className = 'flt-card'; el.setAttribute('data-attr', card.attr);
+    el.innerHTML =
+      '<div class="flt-card-label"><span>' + card.label + '</span>' +
+        '<span class="flt-card-reset" data-reset="' + card.attr + '">reset</span></div>' +
+      '<div class="flt-range-vals"><span class="flt-lo"></span>' +
+        '<span class="flt-range-n"></span><span class="flt-hi"></span></div>' +
+      '<div class="flt-slider"><div class="flt-track"></div><div class="flt-fill"></div>' +
+        '<input type="range" class="flt-in-lo" min="' + d.min + '" max="' + d.max + '" step="' + d.step + '" value="' + d.min + '">' +
+        '<input type="range" class="flt-in-hi" min="' + d.min + '" max="' + d.max + '" step="' + d.step + '" value="' + d.max + '"></div>';
+    var lo = el.querySelector('.flt-in-lo'), hi = el.querySelector('.flt-in-hi');
+    function onInput() {
+      var l = +lo.value, h = +hi.value;
+      if (l > h) { if (this === lo) { h = l; hi.value = h; } else { l = h; lo.value = l; } }
+      if (l <= d.min && h >= d.max) delete state.ranges[card.attr];
+      else state.ranges[card.attr] = { min: l, max: h };
+      refresh();
+    }
+    lo.addEventListener('input', onInput); hi.addEventListener('input', onInput);
+    el.querySelector('[data-reset]').addEventListener('click', function() {
+      delete state.ranges[card.attr]; refresh();
+    });
+    var entry = { el: el, kind: 'range', card: card, lo: lo, hi: hi,
+                  fill: el.querySelector('.flt-fill'),
+                  loLbl: el.querySelector('.flt-lo'), hiLbl: el.querySelector('.flt-hi'),
+                  nLbl: el.querySelector('.flt-range-n') };
+    cardEls[card.attr] = entry;
+    return el;
+  }
+
+  function syncRange(entry) {
+    var card = entry.card, d = domains[card.attr], r = state.ranges[card.attr];
+    var lo = r ? r.min : d.min, hi = r ? r.max : d.max;
+    entry.lo.value = lo; entry.hi.value = hi;
+    var span = d.max - d.min || 1;
+    var lp = (lo - d.min) / span * 100, hp = (hi - d.min) / span * 100;
+    entry.fill.style.left = lp + '%'; entry.fill.style.width = (hp - lp) + '%';
+    entry.loLbl.textContent = fmtNum(lo, card); entry.hiLbl.textContent = fmtNum(hi, card);
+    entry.lo.style.zIndex = (lo > (d.min + d.max) / 2) ? 5 : 3;
+    entry.el.classList.toggle('narrowed', !!r);
+  }
+
+  // ---------- State signatures + (de)serialization ----------
+  // A "combo" is a full facets+ranges state (search excluded). Ranges use '~'
+  // between the bounds so negative numbers survive the round-trip.
+  function signature(st) {
+    var parts = [];
+    Object.keys(st.facets).sort().forEach(function(a) {
+      if (st.facets[a] && st.facets[a].size) parts.push('f:' + a + '=' + Array.from(st.facets[a]).sort().join(','));
+    });
+    Object.keys(st.ranges).sort().forEach(function(a) {
+      parts.push('r:' + a + '=' + st.ranges[a].min + '~' + st.ranges[a].max);
+    });
+    return parts.join('|');
+  }
+  function parseSignature(sig) {
+    var st = { facets: {}, ranges: {} };
+    if (!sig) return st;
+    sig.split('|').forEach(function(part) {
+      var kind = part.charAt(0), body = part.slice(2), eq = body.indexOf('=');
+      if (eq < 0) return;
+      var attr = body.slice(0, eq), val = body.slice(eq + 1);
+      if (kind === 'f') st.facets[attr] = new Set(val.split(','));
+      else { var mm = val.split('~'); if (mm.length === 2) st.ranges[attr] = { min: parseFloat(mm[0]), max: parseFloat(mm[1]) }; }
+    });
+    return st;
+  }
+  function resolveScreen(s) {
+    var st = { facets: {}, ranges: {} };
+    if (s.facets) for (var f in s.facets) st.facets[f] = new Set(s.facets[f]);
+    if (s.ranges) for (var a in s.ranges) {
+      var d = domains[a]; if (!d) continue;
+      var lo = s.ranges[a][0], hi = s.ranges[a][1];
+      lo = (lo == null) ? d.min : Math.max(d.min, lo);
+      hi = (hi == null) ? d.max : Math.min(d.max, hi);
+      if (lo > d.min || hi < d.max) st.ranges[a] = { min: lo, max: hi };
+    }
+    return st;
+  }
+  function applyState(st) {
+    state.facets = {}; state.ranges = {};
+    for (var f in st.facets) if (st.facets[f].size) state.facets[f] = new Set(st.facets[f]);
+    for (var r in st.ranges) state.ranges[r] = { min: st.ranges[r].min, max: st.ranges[r].max };
+    refresh();
+  }
+
+  // Short human label for a combo (used by the "Most used" pills).
+  function comboLabel(st) {
+    var toks = [];
+    Object.keys(st.facets).forEach(function(a) {
+      var card = cardFor(a);
+      st.facets[a].forEach(function(v) { toks.push(card ? optLabel(card, v) : v); });
+    });
+    Object.keys(st.ranges).forEach(function(a) {
+      var card = cardFor(a), d = domains[a], r = st.ranges[a];
+      if (!card || !d) { toks.push(a); return; }
+      var nm = card.short || card.label;
+      var loOpen = r.min <= d.min + 1e-9, hiOpen = r.max >= d.max - 1e-9;
+      if (loOpen) toks.push(nm + ' ≤' + fmtNum(r.max, card));
+      else if (hiOpen) toks.push(nm + ' ≥' + fmtNum(r.min, card));
+      else toks.push(nm + ' ' + fmtNum(r.min, card) + '–' + fmtNum(r.max, card));
+    });
+    if (!toks.length) return '';
+    return toks.length > 3 ? toks.slice(0, 3).join(' · ') + ' +' + (toks.length - 3) : toks.join(' · ');
+  }
+
+  // ---------- "Most used" combos ----------
+  var seedSigs = [], seedLabel = {};
+  function buildSeeds() {
+    PRESETS.forEach(function(p) {
+      var usable = (!p.ranges) || Object.keys(p.ranges).every(function(a) { return domains[a]; });
+      if (!usable) return;
+      var sig = signature(resolveScreen(p));
+      if (!sig || seedLabel[sig]) return;
+      seedSigs.push(sig); seedLabel[sig] = p.label;
+    });
+  }
+  function loadUsage() { try { return JSON.parse(localStorage.getItem(USAGE_KEY)) || {}; } catch (e) { return {}; } }
+  function saveUsage(u) { try { localStorage.setItem(USAGE_KEY, JSON.stringify(u)); } catch (e) {} }
+
+  var recTimer = null, lastRecSig = '';
+  function scheduleRecord() {
+    clearTimeout(recTimer);
+    recTimer = setTimeout(function() {
+      var sig = signature(state);
+      if (!sig) return;                      // never record the empty state
+      var u = loadUsage();
+      var e = u[sig] || (u[sig] = { c: 0, t: 0 });
+      e.c += 1; e.t = Date.now();
+      var keys = Object.keys(u);
+      if (keys.length > 40) {                // cap growth: keep 40 most-used
+        keys.sort(function(a, b) { return (u[b].c - u[a].c) || (u[b].t - u[a].t); });
+        var t = {}; keys.slice(0, 40).forEach(function(k) { t[k] = u[k]; }); u = t;
+      }
+      saveUsage(u); renderUsed();
+    }, 1200);
+  }
+
+  function renderUsed() {
+    var u = loadUsage();
+    var combos = Object.keys(u).map(function(sig) { return { sig: sig, c: u[sig].c, t: u[sig].t }; })
+      .sort(function(a, b) { return (b.c - a.c) || (b.t - a.t); });
+    var seen = {}; combos.forEach(function(c) { seen[c.sig] = 1; });
+    seedSigs.forEach(function(sig) { if (!seen[sig]) { combos.push({ sig: sig, c: 0, t: 0 }); seen[sig] = 1; } });
+
+    // rebuild (keep the label span, drop old pills)
+    usedEl.querySelectorAll('.flt-combo').forEach(function(b) { b.remove(); });
+    var cur = signature(state), shown = 0;
+    combos.forEach(function(c) {
+      if (shown >= MAX_SHOWN) return;
+      var label = seedLabel[c.sig] || comboLabel(parseSignature(c.sig));
+      if (!label) return;
+      var b = document.createElement('button');
+      b.className = 'flt-combo' + (c.sig === cur && cur !== '' ? ' on' : '');
+      b.setAttribute('data-sig', c.sig);
+      b.textContent = label;
+      b.title = c.c ? ('Used ' + c.c + '× — click to apply, click again to clear')
+                    : 'Suggested combo — click to apply';
+      b.addEventListener('click', function() {
+        var target = parseSignature(c.sig);
+        applyState(signature(state) === c.sig ? { facets:{}, ranges:{} } : target);
+      });
+      usedEl.appendChild(b);
+      shown++;
+    });
+  }
+
+  // ---------- Refresh everything ----------
+  function refresh() {
+    var visible = 0, total = rows.length;
+    rows.forEach(function(row) {
+      var ok = passAll(row);
+      row.style.display = ok ? '' : 'none';
+      if (ok) visible++;
+    });
+
+    document.querySelectorAll('.table-wrap').forEach(function(wrap) {
+      var any = false;
+      wrap.querySelectorAll('tbody tr').forEach(function(r) { if (r.style.display !== 'none') any = true; });
+      wrap.style.display = any ? '' : 'none';
+      var prev = wrap.previousElementSibling;
+      while (prev && prev.tagName !== 'H2' && prev.tagName !== 'H3') prev = prev.previousElementSibling;
+      if (prev && prev.tagName === 'H3') prev.style.display = any ? '' : 'none';
+    });
+
+    // facet option counts (faceted: count excludes the option's own facet)
+    var cache = {};
+    function poolFor(attr) { if (!cache[attr]) cache[attr] = rows.filter(function(r) { return passAll(r, attr); }); return cache[attr]; }
+    for (var attr in cardEls) {
+      var entry = cardEls[attr];
+      if (entry.kind !== 'facet') { syncRange(entry); continue; }
+      var pool = poolFor(attr), counts = {};
+      pool.forEach(function(r) { var v = attrRaw(r, attr); counts[v] = (counts[v] || 0) + 1; });
+      var set = state.facets[attr];
+      entry.el.querySelectorAll('.flt-opt').forEach(function(b) {
+        var v = b.getAttribute('data-val'), n = counts[v] || 0;
+        b.querySelector('.flt-n').textContent = n;
+        b.classList.toggle('on', !!(set && set.has(v)));
+        b.classList.toggle('zero', n === 0 && !(set && set.has(v)));
+      });
+      entry.el.classList.toggle('narrowed', !!(set && set.size));
+    }
+
+    document.querySelectorAll('[data-sec-active]').forEach(function(badge) {
+      var sec = SECTIONS.filter(function(s) { return s.id === badge.getAttribute('data-sec-active'); })[0];
+      var n = 0;
+      sec.cards.forEach(function(c) {
+        if (state.facets[c.attr] && state.facets[c.attr].size) n += state.facets[c.attr].size;
+        if (state.ranges[c.attr]) n += 1;
+      });
+      badge.textContent = n ? n : '';
+    });
+
+    renderChips();
+
+    // highlight the active "most used" combo (if the current state is one)
+    var sig = signature(state);
+    usedEl.querySelectorAll('.flt-combo').forEach(function(b) {
+      b.classList.toggle('on', b.getAttribute('data-sig') === sig && sig !== '');
+    });
+
+    var activeN = 0;
+    for (var f in state.facets) activeN += state.facets[f].size;
+    activeN += Object.keys(state.ranges).length;
+    var searchOn = !!searchInput.value.trim();
+    if (statusEl) {
+      if (visible === total && !activeN && !searchOn) statusEl.textContent = 'Showing all ' + total;
+      else {
+        var bits = [];
+        if (activeN) bits.push(activeN + ' filter' + (activeN > 1 ? 's' : ''));
+        if (searchOn) bits.push('search');
+        statusEl.textContent = 'Showing ' + visible + ' of ' + total + (bits.length ? ' (' + bits.join(' + ') + ')' : '');
+      }
+    }
+    toggleBtn.innerHTML = 'Filters ' + (panel.classList.contains('show') ? '▴' : '▾') +
+      (activeN ? '<span class="flt-badge">' + activeN + '</span>' : '');
+    var hasAny = activeN > 0 || searchOn;
+    clearBtn.style.opacity = hasAny ? '1' : '.4';
+    clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
+    if (searchWrap) searchWrap.classList.toggle('has-val', searchOn);
+
+    // learn the combos you actually settle on
+    if (sig !== lastRecSig) { lastRecSig = sig; scheduleRecord(); }
+  }
+
+  function renderChips() {
+    var chips = [];
+    for (var attr in state.facets) {
+      (function(attr) {
+        var card = cardFor(attr), lbl = card ? card.label : attr;
+        state.facets[attr].forEach(function(v) {
+          chips.push({ text: lbl + ': <b>' + (card ? optLabel(card, v) : v) + '</b>',
+            remove: function() { state.facets[attr].delete(v); if (!state.facets[attr].size) delete state.facets[attr]; refresh(); } });
+        });
+      })(attr);
+    }
+    for (var a in state.ranges) {
+      (function(a) {
+        var card = cardFor(a), d = domains[a], r = state.ranges[a];
+        var loOpen = r.min <= d.min + 1e-9, hiOpen = r.max >= d.max - 1e-9, txt;
+        if (loOpen) txt = card.label + ' ≤ <b>' + fmtNum(r.max, card) + '</b>';
+        else if (hiOpen) txt = card.label + ' ≥ <b>' + fmtNum(r.min, card) + '</b>';
+        else txt = card.label + ': <b>' + fmtNum(r.min, card) + '–' + fmtNum(r.max, card) + '</b>';
+        chips.push({ text: txt, remove: function() { delete state.ranges[a]; refresh(); } });
+      })(a);
+    }
+    chipsEl.innerHTML = '';
+    chips.forEach(function(c) {
+      var el = document.createElement('span');
+      el.className = 'flt-chip';
+      el.innerHTML = '<span>' + c.text + '</span><span class="flt-chip-x" title="Remove">✕</span>';
+      el.querySelector('.flt-chip-x').addEventListener('click', c.remove);
+      chipsEl.appendChild(el);
+    });
+  }
+
+  // ---------- Wire up ----------
+  buildPanel();
+  buildSeeds();
+  renderUsed();
+
+  searchInput.addEventListener('input', refresh);
+  searchX.addEventListener('click', function() { searchInput.value = ''; refresh(); searchInput.focus(); });
+  clearBtn.addEventListener('click', function() { searchInput.value = ''; applyState({ facets:{}, ranges:{} }); });
+
+  function setOpen(open) {
+    panel.classList.toggle('show', open);
+    toggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    try { localStorage.setItem(LS.open, open ? '1' : '0'); } catch (e) {}
+    refresh();
+  }
+  toggleBtn.addEventListener('click', function() { setOpen(!panel.classList.contains('show')); });
+  try { if (localStorage.getItem(LS.open) === '1') panel.classList.add('show'); } catch (e) {}
+
+  // Public API used by header summary tiles + other sections (unchanged contract).
   window.applyHeaderFilter = function(key) {
-    var off = (currentKey() === key);
-    setCombo(off ? [] : [key]);
+    var s = PRESETS.filter(function(x) { return x.key === key; })[0];
+    if (!s) return;
+    var target = resolveScreen(s);
+    var off = signature(state) === signature(target);
+    applyState(off ? { facets:{}, ranges:{} } : target);
     if (off) return;
     var wraps = document.querySelectorAll('.table-wrap');
     for (var i = 0; i < wraps.length; i++) {
       if (wraps[i].style.display !== 'none') {
         var prev = wraps[i].previousElementSibling, tgt = wraps[i];
-        while (prev) {
-          if (prev.tagName === 'H2' || prev.tagName === 'H3') { tgt = prev; break; }
-          prev = prev.previousElementSibling;
-        }
+        while (prev) { if (prev.tagName === 'H2' || prev.tagName === 'H3') { tgt = prev; break; } prev = prev.previousElementSibling; }
         tgt.scrollIntoView({ behavior: 'smooth', block: 'start' });
         break;
       }
     }
   };
+  window.applySearchFilter = function(term) { searchInput.value = term; refresh(); };
 
-  renderFrequent();
-  searchInput.addEventListener('input', applyFilters);
-  applyFilters();
-  window.applySearchFilter = function(term) {
-    searchInput.value = term;
-    applyFilters();
-  };
+  refresh();
 })();
 
 // Smooth-scroll a header summary tile to its section (no-ops if the section
