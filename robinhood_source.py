@@ -198,6 +198,7 @@ def _refresh_session(pickle_path: Path, verbose: bool = True) -> bool:
     at least once every ~2 weeks keeps its session alive indefinitely with
     zero human steps. Returns True only if the renewed session actually works.
     """
+    global _SESSION_ROTATED
     if requests is None or not pickle_path.exists():
         return False
     try:
@@ -242,10 +243,11 @@ def _refresh_session(pickle_path: Path, verbose: bool = True) -> bool:
     token_type = body.get("token_type", "Bearer")
     new_refresh = body.get("refresh_token", refresh_token)
 
-    rh.helper.set_login_state(True)
-    rh.helper.update_session(
-        "Authorization", f"{token_type} {access_token}")
-    # Persist rotated tokens so the next run (and the CI cache) inherits them.
+    # Persist the rotated tokens BEFORE touching anything that can raise.
+    # Robinhood invalidates the old refresh_token the instant this call
+    # succeeds, so any failure between the 200 response and this write burns
+    # the rotation permanently: the pickle keeps a refresh_token that will
+    # 401 forever, and the only way back is a full interactive login.
     try:
         pickle_path.parent.mkdir(exist_ok=True)
         with open(pickle_path, "wb") as f:
@@ -255,14 +257,143 @@ def _refresh_session(pickle_path: Path, verbose: bool = True) -> bool:
                 "refresh_token": new_refresh,
                 "device_token": device_token,
             }, f)
+        _SESSION_ROTATED = True
     except Exception:
         pass  # in-memory session still works for this run
+
+    rh.helper.set_login_state(True)
+    rh.helper.update_session(
+        "Authorization", f"{token_type} {access_token}")
 
     return _session_is_valid()
 
 
 # Module-level so tests can point it at a temp dir instead of the real one.
 SESSION_PICKLE_PATH = Path.home() / ".tokens" / "robinhood.pickle"
+
+SESSION_SECRET_NAME = "RH_SESSION_B64"
+
+# Robinhood only rotates the refresh_token when it is actually used, and the
+# access token outlives it in practice — so every run that authenticates
+# straight from a valid cached access token leaves the refresh_token sitting
+# untouched, ageing, never renewed. It then fails on the one day it's finally
+# needed. Refreshing proactively once the session crosses this age keeps the
+# refresh_token perpetually young instead of saving it for an emergency.
+ROTATE_AFTER_HOURS = float(os.environ.get("RH_ROTATE_AFTER_HOURS", "12"))
+
+# Set when this process mints new tokens, so the secret write-back only fires
+# when there is genuinely something new to store.
+_SESSION_ROTATED = False
+
+
+def _maybe_rotate(pickle_path: Path, verbose: bool = True) -> None:
+    """Renew an ageing but still-working session so its refresh_token rotates.
+
+    Only ever called after the cached session has already been validated, so
+    this is pure maintenance: if the rotation fails for any reason we restore
+    the previous pickle and carry on with the session we know works. A
+    maintenance step must never be able to cost us an otherwise-good run.
+    """
+    global _SESSION_ROTATED
+    try:
+        age_h = (time.time() - pickle_path.stat().st_mtime) / 3600.0
+    except OSError:
+        return
+    if age_h < ROTATE_AFTER_HOURS:
+        return
+
+    try:
+        previous = pickle_path.read_bytes()
+    except OSError:
+        return
+
+    if verbose:
+        print(f"[robinhood] Session is {age_h:.0f}h old — rotating refresh "
+              f"token proactively.", flush=True)
+    if _refresh_session(pickle_path, verbose=verbose):
+        if verbose:
+            print("[robinhood] Refresh token rotated.", flush=True)
+        return
+
+    try:
+        pickle_path.write_bytes(previous)
+    except OSError:
+        pass
+    _SESSION_ROTATED = False   # rolled back — nothing new worth persisting
+    _try_pickle_session(pickle_path)
+    if verbose:
+        print("[robinhood] Proactive rotation failed — continuing on the "
+              "existing session.", flush=True)
+
+
+def push_session_secret(pickle_path: Optional[Path] = None, repo: str = "",
+                        token: str = "", verbose: bool = True) -> bool:
+    """Store the current session pickle as the RH_SESSION_B64 repo secret.
+
+    The Actions cache is not durable storage: GitHub evicts entries that go
+    7 days without a read, and a workflow that only runs on manual dispatch
+    crosses that line easily. A repo secret has no expiry, so writing the
+    rotated session back after a run gives CI a seed that survives cache
+    eviction. Best-effort — it never fails the caller's run.
+    """
+    path = pickle_path or SESSION_PICKLE_PATH
+    if requests is None or not path.exists():
+        return False
+    repo = repo or os.environ.get("GH_REPO", "").strip() or \
+        os.environ.get("GITHUB_REPOSITORY", "").strip()
+    token = token or os.environ.get("GH_TOKEN", "").strip()
+    if not repo or not token:
+        if verbose:
+            print("[robinhood] Skipping session write-back "
+                  "(GH_TOKEN/GH_REPO not set).", flush=True)
+        return False
+    try:
+        from nacl import encoding, public
+    except ImportError:
+        if verbose:
+            print("[robinhood] Skipping session write-back (PyNaCl not "
+                  "installed).", flush=True)
+        return False
+
+    headers = {"Authorization": f"token {token}",
+               "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
+            headers=headers, timeout=15)
+        r.raise_for_status()
+        key = r.json()
+        sealed = public.SealedBox(
+            public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
+        ).encrypt(base64.b64encode(path.read_bytes()))
+        r = requests.put(
+            f"https://api.github.com/repos/{repo}/actions/secrets/"
+            f"{SESSION_SECRET_NAME}",
+            headers=headers, timeout=15,
+            json={"encrypted_value": base64.b64encode(sealed).decode(),
+                  "key_id": key["key_id"]})
+        r.raise_for_status()
+    except Exception as e:
+        if verbose:
+            print(f"[robinhood] Session write-back failed: {e}", flush=True)
+        return False
+    if verbose:
+        print(f"[robinhood] Session written back to {SESSION_SECRET_NAME} "
+              f"(survives cache eviction).", flush=True)
+    return True
+
+
+def _writeback_if_rotated(verbose: bool = True) -> None:
+    """Persist newly-minted tokens to the repo secret, in CI only.
+
+    Locally, uploading your session stays a deliberate act — that's what
+    update_rh_session_secret.py is for.
+    """
+    if not _SESSION_ROTATED:
+        return
+    if not (os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")):
+        return
+    push_session_secret(verbose=verbose)
 
 _REAUTH_HELP = """\
 ============================================================
@@ -306,6 +437,7 @@ def login(verbose: bool = True) -> None:
     ever lapses. A successful login persists rotated tokens to the pickle,
     which CI caches, compounding the effect.
     """
+    global _SESSION_ROTATED
     _require_rh()
 
     username = os.environ.get("RH_USERNAME")
@@ -345,6 +477,8 @@ def login(verbose: bool = True) -> None:
         if _try_pickle_session(cached_session):
             if verbose:
                 print("[robinhood] Authenticated (cached session).", flush=True)
+            _maybe_rotate(cached_session, verbose=verbose)
+            _writeback_if_rotated(verbose=verbose)
             return
 
         # Fast path 2: silently renew the access token from the cached
@@ -354,6 +488,7 @@ def login(verbose: bool = True) -> None:
             if verbose:
                 print("[robinhood] Authenticated (refreshed access token).",
                       flush=True)
+            _writeback_if_rotated(verbose=verbose)
             return
 
         # Fast path 3: seed the session from the RH_SESSION_B64 secret, then
@@ -371,11 +506,14 @@ def login(verbose: bool = True) -> None:
                     if verbose:
                         print("[robinhood] Authenticated (session seeded from "
                               "RH_SESSION_B64).", flush=True)
+                    _maybe_rotate(cached_session, verbose=verbose)
+                    _writeback_if_rotated(verbose=verbose)
                     return
                 if _refresh_session(cached_session, verbose=verbose):
                     if verbose:
                         print("[robinhood] Authenticated (seed refreshed).",
                               flush=True)
+                    _writeback_if_rotated(verbose=verbose)
                     return
                 print("[robinhood] RH_SESSION_B64 seed is stale (refresh token "
                       "expired too).", flush=True)
@@ -421,6 +559,11 @@ def login(verbose: bool = True) -> None:
         raise RuntimeError(
             "Robinhood login did not produce a valid session — the challenge "
             "was not completed. Try again and approve promptly in the app.")
+
+    # A fresh login is the most expensive session to obtain (it needed a human),
+    # so it's the one most worth persisting beyond the cache.
+    _SESSION_ROTATED = True
+    _writeback_if_rotated(verbose=verbose)
 
     if verbose:
         print("[robinhood] Authenticated.", flush=True)
@@ -500,6 +643,71 @@ def fetch_positions() -> list[dict]:
             print(f"[robinhood] Skipping {ticker}: {e}")
 
     return positions
+
+
+def fetch_account_summary() -> Optional[dict]:
+    """Account-level equity / cash / margin snapshot for the default account.
+
+    fetch_positions() only returns the *gross* value of each holding (price ×
+    shares). On a margin account that gross figure overstates what the account
+    is actually worth, because part of it was bought with a margin loan. This
+    returns the pieces needed to turn gross position value into true net value:
+
+        {
+            "equity":       55066.0,   # net liquidation value (positions + cash - loan)
+            "market_value": 61469.0,   # gross value of security positions
+            "cash":         -6404.92,  # net cash; NEGATIVE => margin loan outstanding
+            "margin_used":  6404.92,   # size of the margin loan (0 if none)
+            "extended":     False,     # True if figures came from extended-hours fields
+        }
+
+    or None if the portfolio profile can't be read (callers then fall back to
+    the gross figure — same as before this existed).
+
+    'cash' is derived as equity - market_value from a single Robinhood
+    portfolio snapshot, so it already nets out any margin borrow (Robinhood's
+    portfolio equity = positions + cash - loan) and stays internally
+    consistent. Cash is price-independent, so a caller can add it to a live,
+    freshly-priced gross total to get an accurate live net value. During
+    extended hours the extended-hours equity/market_value pair is used when
+    Robinhood populates both.
+    """
+    _require_rh()
+    try:
+        pp = rh.profiles.load_portfolio_profile()
+    except Exception as e:
+        print(f"[robinhood] account summary fetch failed: {e}")
+        return None
+    if not pp:
+        return None
+
+    def _f(key: str) -> Optional[float]:
+        try:
+            v = pp.get(key)
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    # Extended-hours equity/market_value move together; only trust them when
+    # BOTH are present (i.e. the market is closed and RH has published them).
+    eh_eq, eh_mv = _f("extended_hours_equity"), _f("extended_hours_market_value")
+    reg_eq, reg_mv = _f("equity"), _f("market_value")
+    if eh_eq is not None and eh_mv is not None:
+        equity, market_value, extended = eh_eq, eh_mv, True
+    else:
+        equity, market_value, extended = reg_eq, reg_mv, False
+
+    if equity is None or market_value is None:
+        return None
+
+    cash = equity - market_value
+    return {
+        "equity": equity,
+        "market_value": market_value,
+        "cash": cash,
+        "margin_used": max(0.0, -cash),
+        "extended": extended,
+    }
 
 
 def fetch_latest_prices(tickers: list[str],
