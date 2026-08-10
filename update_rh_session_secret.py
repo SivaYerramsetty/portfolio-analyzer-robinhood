@@ -18,14 +18,11 @@ Auth: uses GH_TOKEN env var, or the token embedded in `git remote origin`.
 
 from __future__ import annotations
 
-import base64
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-
-import requests
 
 SECRET_NAME = "RH_SESSION_B64"
 PICKLE_PATH = Path.home() / ".tokens" / "robinhood.pickle"
@@ -51,46 +48,24 @@ def _repo_and_token() -> tuple[str, str]:
 
 
 def main() -> None:
-    try:
-        from nacl import encoding, public
-    except ImportError:
-        sys.exit("ERROR: PyNaCl is required to encrypt the secret.\n"
-                 "Run: pip install pynacl")
-
     # Ensure the local session is valid (logs in / refreshes if needed,
     # which may prompt for device approval ON YOUR PHONE — that's fine here).
-    print("[1/3] Validating local Robinhood session...")
+    print("[1/2] Validating local Robinhood session...")
     import robinhood_source as rhs
     rhs.login(verbose=True)
     if not PICKLE_PATH.exists():
         sys.exit(f"ERROR: {PICKLE_PATH} not found even after login.")
 
-    payload = base64.b64encode(PICKLE_PATH.read_bytes()).decode()
     repo, token = _repo_and_token()
-    headers = {"Authorization": f"token {token}",
-               "Accept": "application/vnd.github+json"}
-
-    print(f"[2/3] Fetching public key for {repo}...")
-    r = requests.get(
-        f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
-        headers=headers, timeout=15)
-    r.raise_for_status()
-    key = r.json()
-
-    sealed = public.SealedBox(
-        public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
-    ).encrypt(payload.encode())
-
-    print(f"[3/3] Uploading secret {SECRET_NAME}...")
-    r = requests.put(
-        f"https://api.github.com/repos/{repo}/actions/secrets/{SECRET_NAME}",
-        headers=headers, timeout=15,
-        json={"encrypted_value": base64.b64encode(sealed).decode(),
-              "key_id": key["key_id"]})
-    r.raise_for_status()
-    print(f"✓ {SECRET_NAME} updated for {repo} "
-          f"(HTTP {r.status_code}). Re-run the workflow — CI will seed its "
-          f"session from this secret whenever its cache is stale.")
+    print(f"[2/2] Uploading secret {SECRET_NAME} to {repo}...")
+    # Same encrypt-and-upload path CI uses to write back its rotated session,
+    # so there's one implementation to keep correct.
+    if not rhs.push_session_secret(PICKLE_PATH, repo=repo, token=token,
+                                   verbose=True):
+        sys.exit(f"ERROR: could not upload {SECRET_NAME} — see the message "
+                 f"above.")
+    print(f"✓ {SECRET_NAME} updated for {repo}. Re-run the workflow — CI will "
+          f"seed its session from this secret whenever its cache is stale.")
 
 
 if __name__ == "__main__":

@@ -554,18 +554,22 @@ def _compute_holdings_ytd_return(results) -> Optional[float]:
 def _render_benchmark_stat(port_today_pct: Optional[float],
                            port_ytd_pct: Optional[float],
                            bench: Optional[dict]) -> str:
-    """Two standalone summary tiles — 'vs S&P 500 · Today' and 'vs S&P 500 ·
-    YTD' — matching the single-value layout of the other stats in the row. Each
-    shows the portfolio's return as the big figure (green when it beats the
-    index for that horizon, red when it lags) with the S&P's own return in the
-    label. A tile appears only when both sides have data; nothing renders if the
-    benchmark is unavailable or no horizon can be shown."""
+    """Two standalone summary tiles — 'Today · your holdings' and 'YTD · your
+    holdings' — matching the single-value layout of the other stats in the row.
+    The big figure is YOUR holdings' return (green when it beats the index for
+    that horizon, red when it lags); the S&P 500's own return sits on a muted
+    sub-line so the two can't be confused. A tile appears only when both sides
+    have data; nothing renders if the benchmark is unavailable or no horizon
+    can be shown."""
     if not bench:
         return ""
-    tip = ("Your current holdings' price return vs the S&P 500 (^GSPC). "
-           "Today = vs prior close; YTD = vs the first close of the year. "
-           "Green = beating the index. YTD is value-weighted over holdings "
-           "with available history (ignores intra-year trades).")
+    tip = ("The big figure is your current holdings' price return; the S&P 500 "
+           "(^GSPC) return is shown below it for comparison. Today = vs prior "
+           "close; YTD = vs the first close of the year. Green = your holdings "
+           "beat the index. YTD is value-weighted over holdings with available "
+           "history (ignores intra-year trades).")
+    cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
+                 "text-transform:none;letter-spacing:0;margin-top:2px;")
     blocks = []
     for label, port_val, spx in (
         ("Today", port_today_pct, bench.get("today_pct")),
@@ -577,7 +581,9 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
         blocks.append(
             f'<div class="stat" title="{tip}">'
             f'<strong style="color:{color};">{_fmt_pct(port_val, 2, True)}</strong>'
-            f'vs S&amp;P 500 · {label} ({_fmt_pct(spx, 2, True)})</div>'
+            f'{label} · your holdings'
+            f'<div style="{cap_style}">S&amp;P 500: {_fmt_pct(spx, 2, True)}</div>'
+            f'</div>'
         )
     return "".join(blocks)
 
@@ -6047,6 +6053,7 @@ def generate_html_report(
     recs_tracked_count: int = 0,
     avoided_losses: Optional[list[dict]] = None,
     missed_insights: Optional[dict] = None,
+    account_summary: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -6278,8 +6285,41 @@ def generate_html_report(
                 f'{ah_label}</div>')
         else:
             after_hours_stat = ""
+        # Portfolio value tile. Default is the gross sum of live position
+        # values. When we have an account snapshot AND it carries a margin
+        # loan (or uninvested cash), that gross figure isn't what the account
+        # is actually worth, so show the true net value (gross + net cash,
+        # where cash is negative for a margin loan) with a breakdown caption.
+        pv_cash = account_summary.get("cash") if account_summary else None
+        _cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
+                      "text-transform:none;letter-spacing:0;margin-top:2px;")
+        if pv_cash is not None and pv_cash < -0.5:      # margin loan outstanding
+            net_value = live_total + pv_cash
+            pv_caption = (f"<div style='{_cap_style}'>{_fmt_money(live_total)} "
+                          f"positions &minus; {_fmt_money(-pv_cash)} margin</div>")
+            pv_tip = ("Net account value: live position value minus the "
+                      "outstanding margin loan (money borrowed to buy positions, "
+                      "so it is subtracted to get what the account is worth).")
+            portfolio_value_stat = (
+                f'<div class="stat" title="{pv_tip}">'
+                f'<strong>{_fmt_money(net_value)}</strong>'
+                f'Portfolio value (live){pv_caption}</div>')
+        elif pv_cash is not None and pv_cash > 0.5:     # uninvested cash on top
+            net_value = live_total + pv_cash
+            pv_caption = (f"<div style='{_cap_style}'>{_fmt_money(live_total)} "
+                          f"positions + {_fmt_money(pv_cash)} cash</div>")
+            pv_tip = ("Net account value: live position value plus uninvested "
+                      "cash.")
+            portfolio_value_stat = (
+                f'<div class="stat" title="{pv_tip}">'
+                f'<strong>{_fmt_money(net_value)}</strong>'
+                f'Portfolio value (live){pv_caption}</div>')
+        else:
+            portfolio_value_stat = (
+                f'<div class="stat"><strong>{_fmt_money(live_total)}</strong>'
+                f'Portfolio value (live)</div>')
         holdings_summary = f"""
-    <div class="stat"><strong>{_fmt_money(live_total)}</strong>Portfolio value (live)</div>
+    {portfolio_value_stat}
     {today_stat}
     {after_hours_stat}
     <a class="stat clickable" href="#compounders" onclick="scrollToSection('compounders');return false;"><strong>{len(compounders)}</strong>Compounder positions</a>
@@ -8440,6 +8480,7 @@ def main():
     watchlist_lookup: dict[str, list[dict]] = {}
     tax_lots_lookup: dict[str, list[dict]] = {}
     realized_ytd = None   # populated only when --tax is set
+    account_summary = None  # cash/margin snapshot; only the robinhood source has it
 
     # Optional lot-level purchase history (CSV mode). Builds the same
     # ticker -> [{date, shares, price, cost}] structure that the Robinhood
@@ -8475,6 +8516,17 @@ def main():
         print("[robinhood] Fetching positions...")
         rows = rhs.fetch_positions()
         print(f"[robinhood] Got {len(rows)} positions.")
+        # Account-level cash/margin snapshot — lets the header show true net
+        # portfolio value instead of the gross sum of positions (which
+        # overstates value when the account carries a margin loan).
+        try:
+            account_summary = rhs.fetch_account_summary()
+            if account_summary and account_summary.get("margin_used", 0) > 0:
+                print(f"[robinhood] Margin loan outstanding: "
+                      f"${account_summary['margin_used']:,.2f}")
+        except Exception as e:
+            print(f"[robinhood] Account summary fetch skipped: {e}")
+            account_summary = None
         use_rh_ratings = True
         if args.include_watchlists:
             print("[robinhood] Fetching watchlists...")
@@ -8747,6 +8799,7 @@ def main():
         recs_tracked_count=recs_tracked_count,
         avoided_losses=avoided_losses,
         missed_insights=missed_insights,
+        account_summary=account_summary,
     )
 
     out = Path(args.out)
