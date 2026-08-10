@@ -554,18 +554,22 @@ def _compute_holdings_ytd_return(results) -> Optional[float]:
 def _render_benchmark_stat(port_today_pct: Optional[float],
                            port_ytd_pct: Optional[float],
                            bench: Optional[dict]) -> str:
-    """Two standalone summary tiles — 'vs S&P 500 · Today' and 'vs S&P 500 ·
-    YTD' — matching the single-value layout of the other stats in the row. Each
-    shows the portfolio's return as the big figure (green when it beats the
-    index for that horizon, red when it lags) with the S&P's own return in the
-    label. A tile appears only when both sides have data; nothing renders if the
-    benchmark is unavailable or no horizon can be shown."""
+    """Two standalone summary tiles — 'Today · your holdings' and 'YTD · your
+    holdings' — matching the single-value layout of the other stats in the row.
+    The big figure is YOUR holdings' return (green when it beats the index for
+    that horizon, red when it lags); the S&P 500's own return sits on a muted
+    sub-line so the two can't be confused. A tile appears only when both sides
+    have data; nothing renders if the benchmark is unavailable or no horizon
+    can be shown."""
     if not bench:
         return ""
-    tip = ("Your current holdings' price return vs the S&P 500 (^GSPC). "
-           "Today = vs prior close; YTD = vs the first close of the year. "
-           "Green = beating the index. YTD is value-weighted over holdings "
-           "with available history (ignores intra-year trades).")
+    tip = ("The big figure is your current holdings' price return; the S&P 500 "
+           "(^GSPC) return is shown below it for comparison. Today = vs prior "
+           "close; YTD = vs the first close of the year. Green = your holdings "
+           "beat the index. YTD is value-weighted over holdings with available "
+           "history (ignores intra-year trades).")
+    cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
+                 "text-transform:none;letter-spacing:0;margin-top:2px;")
     blocks = []
     for label, port_val, spx in (
         ("Today", port_today_pct, bench.get("today_pct")),
@@ -577,7 +581,9 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
         blocks.append(
             f'<div class="stat" title="{tip}">'
             f'<strong style="color:{color};">{_fmt_pct(port_val, 2, True)}</strong>'
-            f'vs S&amp;P 500 · {label} ({_fmt_pct(spx, 2, True)})</div>'
+            f'{label} · your holdings'
+            f'<div style="{cap_style}">S&amp;P 500: {_fmt_pct(spx, 2, True)}</div>'
+            f'</div>'
         )
     return "".join(blocks)
 
