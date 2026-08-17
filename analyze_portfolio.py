@@ -3352,6 +3352,11 @@ def _build_refresh_widget() -> tuple[str, str]:
               'title="Include the Tax-Aware Trim Guidance section in the '
               'next data refresh">'
               '&#129534; Tax</button>'
+              '<button id="missAnalysisToggle" class="refresh-btn miss-toggle" '
+              'aria-pressed="false" '
+              'title="Include a Claude AI post-mortem of the Missed '
+              'Opportunities in the next data refresh">'
+              '&#128269; Analyze with AI</button>'
               '<button id="ghRefreshBtn" class="refresh-btn" '
               'onclick="ghTriggerRefresh()" '
               'title="Trigger the GitHub Actions workflow to regenerate this report">'
@@ -3366,10 +3371,15 @@ def _build_refresh_widget() -> tuple[str, str]:
   var REF = "main";
   var TOKEN_KEY = "gh-dispatch-token";
   var TAX_KEY = "tax-section-enabled";
+  var MISS_KEY = "miss-analysis-enabled";
   var pollTimer = null, startedAt = null;
 
   function taxEnabled() {
     try { return localStorage.getItem(TAX_KEY) === "1"; }
+    catch (e) { return false; }
+  }
+  function missEnabled() {
+    try { return localStorage.getItem(MISS_KEY) === "1"; }
     catch (e) { return false; }
   }
   // Tax section toggle: persisted per-browser; honored by every dispatch
@@ -3389,6 +3399,29 @@ def _build_refresh_widget() -> tuple[str, str]:
     }
     tb.addEventListener("click", function() {
       try { localStorage.setItem(TAX_KEY, taxEnabled() ? "0" : "1"); }
+      catch (e) {}
+      paint();
+    });
+    paint();
+  })();
+  // Analyze-with-AI toggle: same pattern as Tax. When on, the dispatch sends
+  // analyze_misses=true and the regenerated report embeds a Claude post-mortem
+  // of the Missed Opportunities.
+  (function() {
+    var mb = document.getElementById("missAnalysisToggle");
+    if (!mb) return;
+    function paint() {
+      var on = missEnabled();
+      mb.classList.toggle("active", on);
+      mb.setAttribute("aria-pressed", on ? "true" : "false");
+      mb.title = on
+        ? "AI analysis ON \\u2014 the next data refresh will embed a Claude " +
+          "post-mortem of the Missed Opportunities. Click to turn off."
+        : "Include a Claude AI post-mortem of the Missed Opportunities in the " +
+          "next data refresh.";
+    }
+    mb.addEventListener("click", function() {
+      try { localStorage.setItem(MISS_KEY, missEnabled() ? "0" : "1"); }
       catch (e) {}
       paint();
     });
@@ -3437,7 +3470,10 @@ def _build_refresh_widget() -> tuple[str, str]:
     try {
       var payload = {ref: REF};
       // workflow_dispatch inputs must be strings, even for boolean-typed ones.
-      if (taxEnabled()) payload.inputs = {include_tax: "true"};
+      var inputs = {};
+      if (taxEnabled()) inputs.include_tax = "true";
+      if (missEnabled()) inputs.analyze_misses = "true";
+      if (Object.keys(inputs).length) payload.inputs = inputs;
       var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
         method: "POST", headers: headers(tok),
         body: JSON.stringify(payload)
@@ -3446,6 +3482,7 @@ def _build_refresh_widget() -> tuple[str, str]:
         startedAt = Date.now();
         setStatus("Workflow queued" +
                   (taxEnabled() ? " with tax section" : "") +
+                  (missEnabled() ? " with AI analysis" : "") +
                   " \\u2014 a fresh report usually takes a few minutes\\u2026");
         pollTimer = setInterval(pollRun, 12000);
       } else if (r.status === 401 || r.status === 403) {
@@ -6068,11 +6105,70 @@ def _miss_summary_strip(insights: Optional[dict]) -> str:
     )
 
 
+def _miss_md_to_html(md: str) -> str:
+    """Minimal, safe Markdown → HTML for the embedded AI panel: escape first, then
+    render only headings, **bold**, and bullet / numbered lists."""
+    import re as _re
+    import html as _html
+    out: list[str] = []
+    in_list = False
+
+    def _close():
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    for raw in (md or "").splitlines():
+        if not raw.strip():
+            _close()
+            continue
+        esc = _html.escape(raw.strip())
+        esc = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc)
+        h = _re.match(r"^(#{1,6})\s+(.*)$", esc)
+        if h:
+            _close()
+            out.append(f"<h4 style='margin:16px 0 6px;font-size:15px;"
+                       f"color:var(--fg-strong);'>{h.group(2)}</h4>")
+            continue
+        li = _re.match(r"^(?:[-*]|\d+\.)\s+(.*)$", esc)
+        if li:
+            if not in_list:
+                out.append("<ul style='margin:6px 0;padding-left:22px;'>")
+                in_list = True
+            out.append(f"<li style='margin:4px 0;'>{li.group(1)}</li>")
+            continue
+        _close()
+        out.append(f"<p style='margin:9px 0;'>{esc}</p>")
+    _close()
+    return "\n".join(out)
+
+
+def _render_miss_analysis_panel(md: str) -> str:
+    """Styled panel wrapping the embedded AI post-mortem — present only when the
+    run used --analyze-misses (i.e. the header toggle was on for this refresh)."""
+    return (
+        "<div style='margin:16px 0 20px;max-width:900px;border:1px solid "
+        "var(--border-medium);border-radius:12px;background:var(--bg-card);"
+        "overflow:hidden;'>"
+        "<div style='padding:10px 16px;font-size:12px;font-weight:700;"
+        "color:var(--fg-muted);border-bottom:1px solid var(--border-medium);'>"
+        "🔍 AI Post-Mortem</div>"
+        "<div style='padding:6px 20px 8px;color:var(--fg-body);font-size:14px;"
+        "line-height:1.65;'>" + _miss_md_to_html(md) + "</div>"
+        "<div style='padding:0 20px 14px;font-size:11px;color:var(--fg-muted);"
+        "font-style:italic;'>Retrospective model-improvement analysis, not "
+        "investment advice.</div>"
+        "</div>\n"
+    )
+
+
 def _render_missed_opportunities(
     missed: list[dict],
     tracked_count: int = 0,
     avoided: Optional[list[dict]] = None,
     insights: Optional[dict] = None,
+    analysis_md: Optional[str] = None,
 ) -> str:
     """Render the 'Missed Opportunities' section: a base-rate summary strip, the
     misses table (with miss-type, first-sight factors, and peak give-back), and a
@@ -6103,6 +6199,10 @@ def _render_missed_opportunities(
 
     # ----- Summary strip (base-rate context + gap split + still-actionable) -----
     html += _miss_summary_strip(insights)
+
+    # ----- Embedded AI post-mortem (only when this run used --analyze-misses) -----
+    if analysis_md:
+        html += _render_miss_analysis_panel(analysis_md)
 
     # ----- Misses table -----
     html += (
@@ -6357,6 +6457,7 @@ def generate_html_report(
     recs_tracked_count: int = 0,
     avoided_losses: Optional[list[dict]] = None,
     missed_insights: Optional[dict] = None,
+    missed_analysis_md: Optional[str] = None,
     account_summary: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
@@ -6768,7 +6869,8 @@ def generate_html_report(
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
   .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
   .auto-toggle.active,
-  .tax-toggle.active {{ background: var(--bg-chip-green);
+  .tax-toggle.active,
+  .miss-toggle.active {{ background: var(--bg-chip-green);
                         color: var(--fg-chip-green);
                         border-color: var(--pos-up); }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);
@@ -7526,7 +7628,8 @@ def generate_html_report(
     if missed_opportunities is not None:
         html += _render_missed_opportunities(
             missed_opportunities, recs_tracked_count,
-            avoided=avoided_losses, insights=missed_insights)
+            avoided=avoided_losses, insights=missed_insights,
+            analysis_md=missed_analysis_md)
 
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
@@ -8990,11 +9093,13 @@ def main():
     # On-demand AI post-mortem of the misses (opt-in via --analyze-misses; never
     # part of the normal report). Writes a dated Markdown file and echoes it to
     # stdout. Best-effort: any failure here must not block the report.
+    _miss_analysis_md = None   # embedded into the report below when produced
     if args.analyze_misses:
         try:
             _miss_md = analyze_missed_opportunities_ai(
                 missed_opportunities, avoided_losses, missed_insights)
             if _miss_md:
+                _miss_analysis_md = _miss_md
                 _adate = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
                 _apath = f"missed_opp_analysis_{_adate}.md"
                 try:
@@ -9008,6 +9113,16 @@ def main():
                 except OSError as _ae:
                     print(f"[miss-analysis] Could not write {_apath}: {_ae}")
                 print("\n" + "=" * 72 + "\n" + _miss_md + "\n" + "=" * 72)
+            elif missed_opportunities:
+                # Toggle was on but no analysis came back (no/blocked key, model
+                # access, or a refusal). Say so in-report rather than silently
+                # dropping the panel the reader asked for.
+                _miss_analysis_md = (
+                    "**AI analysis unavailable for this run.** The post-mortem "
+                    "couldn't be generated — most often a missing or mismatched "
+                    "ANTHROPIC_API_KEY, or a model the key can't access (set the "
+                    "MISSED_OPP_MODEL repo variable to one it can). See the Actions "
+                    "log for the exact reason.")
         except Exception as e:
             print(f"[miss-analysis] Skipped: {e}")
 
@@ -9139,6 +9254,7 @@ def main():
         recs_tracked_count=recs_tracked_count,
         avoided_losses=avoided_losses,
         missed_insights=missed_insights,
+        missed_analysis_md=_miss_analysis_md,
         account_summary=account_summary,
     )
 

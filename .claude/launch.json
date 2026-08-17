@@ -6,12 +6,6 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "8765"],
       "port": 8765
-    },
-    {
-      "name": "portfolio-flask",
-      "runtimeExecutable": "venv/bin/python",
-      "runtimeArgs": ["server.py", "5057"],
-      "port": 5057
     }
   ]
 }

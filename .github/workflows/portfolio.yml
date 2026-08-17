@@ -13,6 +13,10 @@ on:
         description: "Include the Tax-Aware Trim Guidance section (fetches full order history; off by default)"
         type: boolean
         default: false
+      analyze_misses:
+        description: "Embed a Claude AI post-mortem of the Missed Opportunities (uses ANTHROPIC_API_KEY; off by default)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,6 +98,7 @@ jobs:
           FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}   # enables news-sentiment scoring (optional)
           NEWS_MODEL:         ${{ vars.NEWS_MODEL }}              # optional override; defaults to claude-haiku-4-5 (cheapest fit)
+          MISSED_OPP_MODEL:   ${{ vars.MISSED_OPP_MODEL }}        # optional; missed-opp post-mortem model, defaults to claude-opus-5 (set to a model your key can use)
           NEWS_CACHE_TTL_HOURS: ${{ vars.NEWS_CACHE_TTL_HOURS }}  # optional; unset = refresh once/calendar-day. A number = rolling N-hour window; 0 = no cache
           NEWS_BATCH_WAIT_SECONDS: ${{ vars.NEWS_BATCH_WAIT_SECONDS }}  # optional; defaults to 300s before falling back to lexicon
           # NEWS_BATCH: '0'                                       # set to disable the 50%-off Batches API pre-pass
@@ -108,14 +113,17 @@ jobs:
           SMTP_PASS:          ${{ secrets.SMTP_PASS }}
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
         run: |
-          # --tax only when the dispatch checkbox is set (empty on schedule).
+          # --tax / --analyze-misses only when their dispatch checkboxes are set.
           TAX_FLAG=""
           if [ "${{ inputs.include_tax }}" = "true" ]; then TAX_FLAG="--tax"; fi
+          MISS_FLAG=""
+          if [ "${{ inputs.analyze_misses }}" = "true" ]; then MISS_FLAG="--analyze-misses"; fi
           python analyze_portfolio.py \
             --source robinhood \
             --include-watchlists \
             --prune-watchlists \
             $TAX_FLAG \
+            $MISS_FLAG \
             --save-positions positions.csv \
             --out report.html
 
