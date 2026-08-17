@@ -177,6 +177,13 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 # NEWS_MODEL=claude-opus-5 if a sharper read is ever worth the 5x.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 NEWS_MODEL = os.environ.get("NEWS_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
+# Model for the ON-DEMAND missed-opportunity post-mortem (analyze_missed_
+# opportunities_ai, run only via --analyze-misses — never on the twice-daily
+# report). Unlike news scoring (per-ticker, high volume → Haiku), this is a
+# single reasoning-heavy call over the whole tracked set, so it defaults to a
+# capable model. Override with MISSED_OPP_MODEL (e.g. a model your key can access).
+MISSED_OPP_MODEL = (os.environ.get("MISSED_OPP_MODEL", "claude-opus-5").strip()
+                    or "claude-opus-5")
 
 
 # ============================================================
@@ -488,6 +495,10 @@ def fetch_benchmark_returns() -> Optional[dict]:
         data = {
             "today_pct": ((last - prev) / prev * 100) if prev else None,
             "ytd_pct": ((last - first) / first * 100) if first else None,
+            # Raw index level (last close). Frozen per ticker at first sight in
+            # the recs ledger so a missed opportunity can be scored on excess
+            # return (alpha) — its gain vs the S&P over the same window.
+            "level": last,
             "fetched_at": time.time(),
         }
         try:
@@ -5158,18 +5169,74 @@ def _attach_rank_moves(
                 seen.add(r.ticker)
 
 
+# Fixed return horizons (calendar days from first sight) captured for durability
+# grading, with a grace window that still counts as "the ~N-day mark" when run
+# cadence or market holidays mean no run lands exactly on day N. An entry already
+# older than N + grace when this shipped never gets that horizon: we lack the
+# data, and a null is honest where a mislabelled longer return would not be.
+_RETURN_HORIZONS_D = (30, 90, 180)
+_HORIZON_GRACE_D = 7
+
+
+def _refresh_outcome_fields(
+    entry: dict, price: Optional[float], run_date: str, sp_level: Optional[float],
+) -> None:
+    """Update an existing ledger entry's outcome-tracking fields, in place: the
+    latest S&P level (for alpha), the peak and the post-peak trough (a new high
+    restarts the give-back window, so peak→trough is the round-trip depth), and
+    the fixed-horizon returns stamped by the first run landing in each horizon's
+    window. Self-contained (no PositionAnalysis) so it unit-tests directly.
+
+    sp_last is refreshed only for entries that already carry a first-sight level,
+    so a pre-existing entry can't gain a level mid-window and mis-state its alpha
+    (we can't recover the index level as of a first sight that predates capture)."""
+    if sp_level is not None and entry.get("sp_at_first") is not None:
+        entry["sp_last"] = sp_level
+    if price is None:
+        return
+    # Peak, and the lowest price since the most recent peak.
+    if price > entry.get("peak_price", 0):
+        entry["peak_price"] = price
+        entry["peak_date"] = run_date
+        entry["trough_after_peak"] = price       # new high → give-back resets
+        entry["trough_date"] = run_date
+    else:
+        tap = entry.get("trough_after_peak")
+        if tap is None or price < tap:
+            entry["trough_after_peak"] = price
+            entry["trough_date"] = run_date
+    # Fixed-horizon returns from first sight (stamped once, in-window only).
+    fp, fd = entry.get("first_price"), entry.get("first_date")
+    if not fp or fp <= 0 or not fd:
+        return
+    try:
+        age = (datetime.strptime(run_date[:10], "%Y-%m-%d")
+               - datetime.strptime(fd[:10], "%Y-%m-%d")).days
+    except (ValueError, TypeError):
+        return
+    ret_now = (price - fp) / fp * 100
+    for h in _RETURN_HORIZONS_D:
+        key = f"ret_{h}d"
+        if entry.get(key) is None and h <= age <= h + _HORIZON_GRACE_D:
+            entry[key] = round(ret_now, 2)
+            entry[f"{key}_asof"] = run_date
+
+
 def update_recs_history(
     history: dict,
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     run_date: Optional[str] = None,
     ranks: Optional[dict[str, dict]] = None,
+    sp_level: Optional[float] = None,
 ) -> dict:
     """Record the first sighting of every ticker we see (any verdict) and refresh
     latest price/alloc for already-tracked tickers. Mutates and returns
     `history`. `ranks` (from compute_run_ranks) is persisted per ticker, rolling
     a prior-DAY baseline forward on the first run of each new day so the next run
-    can render rank-movement badges relative to yesterday."""
+    can render rank-movement badges relative to yesterday. `sp_level` (current
+    ^GSPC close) is frozen per ticker at first sight and refreshed after, so a
+    miss can later be scored on excess return (alpha) rather than raw gain."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     if ranks is None:
@@ -5203,6 +5270,16 @@ def update_recs_history(
                 "last_factors": cur.get("factors") or {},
                 "peak_price": cur["price"],
                 "peak_date": run_date,
+                # Outcome tracking (durability + alpha). trough_after_peak is the
+                # lowest price since the most recent peak; sp_at_first freezes the
+                # index level at first sight so alpha is a query, not a re-fetch.
+                "trough_after_peak": cur["price"],
+                "trough_date": run_date,
+                "sp_at_first": sp_level,
+                "sp_last": sp_level,
+                "ret_30d": None, "ret_30d_asof": None,
+                "ret_90d": None, "ret_90d_asof": None,
+                "ret_180d": None, "ret_180d_asof": None,
                 "last_rank": cur_rank.get("rank"),
                 "last_rank_group": cur_rank.get("group"),
                 "last_rank_date": run_date,
@@ -5238,9 +5315,9 @@ def update_recs_history(
         # can't be mistaken for a genuine reading from the original sighting.
         if not entry.get("first_factors") and entry.get("first_verdict") == cur["verdict"]:
             entry["first_factors"] = cur.get("factors") or {}
-        if cur["price"] is not None and cur["price"] > entry.get("peak_price", 0):
-            entry["peak_price"] = cur["price"]
-            entry["peak_date"] = run_date
+        # Peak/trough (round-trip depth), fixed-horizon returns, and the latest
+        # S&P level for alpha — all derived from the entry itself.
+        _refresh_outcome_fields(entry, cur["price"], run_date, sp_level)
         # Rank: on the first run of a new day, roll the daily baseline forward
         # (the prior run — yesterday's last — becomes what today diffs against).
         # Same-day re-runs keep the baseline so both runs compare to yesterday.
@@ -5363,6 +5440,36 @@ def _missed_reason_diagnosis(
         clauses.append(f"<strong>Held back by</strong> {esc(drag)}.")
 
     return ("<br>" + "<br>".join(clauses)) if clauses else ""
+
+
+def _alpha_fields(e: dict, move_pct: float) -> dict:
+    """Derived outcome metrics shared by the missed / avoided rows, all computed
+    from the ledger's captured levels — every one is None when the entry predates
+    the capture (older ledger) or the benchmark was unavailable:
+
+      • sp_return_pct          — the S&P's own move over the same window
+                                 (sp_at_first → sp_last)
+      • alpha_pct              — the name's move minus the S&P's: the real "left
+                                 on the table". A +8% miss in a +10% tape is
+                                 NEGATIVE alpha — market beta, not a miss.
+      • max_drawdown_from_peak — peak → post-peak trough give-back: the durability
+                                 read (did the run hold, or round-trip?).
+      • ret_30d/90d/180d       — fixed-horizon returns from first sight.
+
+    These are what let step 2's grade rank misses by signal (alpha, durability)
+    instead of by raw, unbenchmarked gain."""
+    spf, spl = e.get("sp_at_first"), e.get("sp_last")
+    sp_ret = ((spl - spf) / spf * 100) if (spf and spl and spf > 0) else None
+    peak, trough = e.get("peak_price"), e.get("trough_after_peak")
+    dd = ((peak - trough) / peak * 100) if (peak and trough and peak > 0) else None
+    return {
+        "sp_return_pct": sp_ret,
+        "alpha_pct": (move_pct - sp_ret) if sp_ret is not None else None,
+        "max_drawdown_from_peak": dd,
+        "ret_30d": e.get("ret_30d"),
+        "ret_90d": e.get("ret_90d"),
+        "ret_180d": e.get("ret_180d"),
+    }
 
 
 def compute_missed_opportunities(history: dict) -> list[dict]:
@@ -5491,6 +5598,7 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
             "w52_first": _factor("week52_position"),
             "trend_first": _factor("trend"),
             "composite_first": _factor("composite_score"),
+            **_alpha_fields(e, gain_pct),
         })
     out.sort(key=lambda d: d["gain_pct"], reverse=True)
     return out
@@ -5575,6 +5683,7 @@ def compute_avoided_losses(history: dict) -> list[dict]:
             "w52_first": _factor("week52_position"),
             "trend_first": _factor("trend"),
             "composite_first": _factor("composite_score"),
+            **_alpha_fields(e, move_pct),
         })
     out.sort(key=lambda d: d["loss_pct"])
     return out
@@ -5636,6 +5745,201 @@ def compute_missed_opp_insights(
         "window_start": min(first_dates) if first_dates else None,
         "window_end": max(last_dates) if last_dates else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# On-demand AI post-mortem
+# ---------------------------------------------------------------------------
+# The narrative layer that sits ON TOP of the deterministic scorecard: it feeds
+# the ALREADY-COMPUTED miss rows (alpha, horizon returns, factor snapshots, the
+# why-not-a-buy reasoning) to Claude and asks for the cross-cutting patterns and
+# model-improvement hypotheses that per-row stats can't express. It is triggered
+# explicitly (--analyze-misses / a direct call), NOT on the twice-daily CI run —
+# so the report stays deterministic and key-free, and the AI never produces the
+# grade/numbers, only reasons over them. Mirrors score_news_sentiment's "Claude
+# when keyed, graceful skip otherwise" shape.
+
+_MISS_ANALYSIS_SYSTEM = (
+    "You are a quantitative post-mortem analyst reviewing a personal stock-"
+    "screening model's MISSED OPPORTUNITIES: names it tracked but rated below its "
+    "buy bar (or that the user under-allocated) which then rose. Your job is "
+    "strictly retrospective — find the systematic reasons behind the misses and "
+    "propose concrete improvements to the SCORING MODEL and the allocation "
+    "process.\n\n"
+    "Ground rules:\n"
+    "- This is analysis of a model's past decisions, not investment advice. Never "
+    "tell the user to buy, sell, or hold any specific security, and never predict "
+    "prices. Frame findings as 'the model under-weighted X' or 'consider "
+    "re-calibrating factor Y', never 'you should buy Z'.\n"
+    "- Separate MODEL gaps (the score never flagged it) from EXECUTION gaps (rated "
+    "a buy but under-sized) — different failures, different fixes.\n"
+    "- Where an alpha figure is present, judge the miss on excess return vs the "
+    "S&P, not raw gain: a gain below the market's move is beta, not a real miss — "
+    "say so when the data shows it.\n"
+    "- Be concrete and quantitative; cite tickers and the numbers you were given. "
+    "Prefer a few high-conviction findings over an exhaustive list.\n"
+    "- If the data is too thin to support a claim, say so rather than inventing one."
+)
+
+
+def _strip_html_to_text(s: str) -> str:
+    """Flatten the pre-built reason HTML (it carries <strong>/<br>/entities) into
+    one plain-text line, so the prompt reads as prose, not markup."""
+    if not s:
+        return ""
+    import re as _re
+    import html as _html
+    s = _re.sub(r"(?i)<br\s*/?>", "; ", s)
+    s = _re.sub(r"<[^>]+>", "", s)
+    s = _html.unescape(s)
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+def _build_miss_analysis_prompt(
+    missed: list[dict], avoided: list[dict], insights: dict
+) -> str:
+    """Render the computed miss/avoided rows + base-rate insights into a compact,
+    plain-text brief for the model. Sends signal (alpha, horizons, factors, the
+    reasoning), never raw prices — the model reasons over the grade, it doesn't
+    recompute it."""
+    def _n(v, dec=0, sign=False):
+        if v is None:
+            return "n/a"
+        return f"{v:+.{dec}f}" if sign else f"{v:.{dec}f}"
+
+    lines: list[str] = []
+    if insights:
+        lines.append(
+            f"Tracked universe: {insights.get('tracked_valid', 0)} names with valid "
+            f"prices. Two-sided base rate: {insights.get('up5', 0)} up ≥5% "
+            f"({_n(insights.get('up5_pct'))}%), {insights.get('down5', 0)} down ≥5% "
+            f"({_n(insights.get('down5_pct'))}%). "
+            f"Misses flagged: {insights.get('missed_count', 0)} "
+            f"(model gap {insights.get('model_gap', 0)}, execution gap "
+            f"{insights.get('execution_gap', 0)}); mean +{_n(insights.get('mean_gain'))}%, "
+            f"median +{_n(insights.get('median_gain'))}%. "
+            f"Avoided losses (dodged ≥5% drops while under-allocated): "
+            f"{insights.get('avoided_count', 0)}. "
+            f"Window {insights.get('window_start')} → {insights.get('window_end')}."
+        )
+
+    # Data-coverage calibration. The alpha/horizon/durability capture is populated
+    # only as the pipeline runs (and never back-fills for names first seen before
+    # it shipped), so tell the model how much exists — otherwise it may lean on an
+    # axis that's mostly 'n/a', or worse, infer alpha it doesn't have.
+    na = sum(1 for m in missed if m.get("alpha_pct") is not None)
+    nh = sum(1 for m in missed if any(m.get(f"ret_{h}d") is not None for h in (30, 90, 180)))
+    nd = sum(1 for m in missed if m.get("max_drawdown_from_peak") is not None)
+    if missed:
+        lines.append(
+            f"Data coverage: alpha available for {na}/{len(missed)} misses, horizon "
+            f"returns for {nh}/{len(missed)}, peak-to-trough drawdown for "
+            f"{nd}/{len(missed)}. Where a field reads 'n/a' it simply wasn't captured "
+            f"yet — lean on the base rate, factors and reasoning there, and flag any "
+            f"alpha- or durability-based claim as provisional rather than inferring it."
+        )
+
+    lines.append("\nMISSED OPPORTUNITIES:")
+    for m in missed[:60]:            # defensive cap so the prompt can't balloon
+        alpha = m.get("alpha_pct")
+        alpha_txt = (f"alpha {_n(alpha, sign=True)}% vs S&P {_n(m.get('sp_return_pct'), sign=True)}%"
+                     if alpha is not None else "alpha n/a (benchmark not yet captured)")
+        dd = m.get("max_drawdown_from_peak")
+        dd_txt = f", maxDD -{_n(dd)}% off peak" if dd is not None else ""
+        hz = [f"{h}d {_n(m.get(f'ret_{h}d'), sign=True)}%"
+              for h in (30, 90, 180) if m.get(f"ret_{h}d") is not None]
+        hz_txt = (" [horizon " + ", ".join(hz) + "]") if hz else ""
+        why = _strip_html_to_text(m.get("reason") or "")
+        if len(why) > 420:
+            why = why[:420] + "…"
+        lines.append(
+            f"- {m['ticker']} ({m.get('sector') or '—'}): {m.get('miss_type')} gap"
+            + (", STILL LIVE (buy-grade today, under-held)" if m.get("still_actionable") else "")
+            + f"; first seen {m.get('first_date')} as {m.get('first_verdict')} "
+            f"(score {_n(m.get('first_verdict_score'))}) → now {m.get('last_verdict')} "
+            f"(score {_n(m.get('last_verdict_score'))}), held {_n(m.get('last_alloc'), 1)}%; "
+            f"gain +{_n(m.get('gain_pct'))}%, "
+            f"{alpha_txt}{dd_txt}{hz_txt}; at first sight composite "
+            f"{_n(m.get('composite_first'), 1)}, 52w-pos {_n(m.get('w52_first'))}%, "
+            f"trend {m.get('trend_first') or '—'}. Why not a buy: {why}"
+        )
+
+    if avoided:
+        lines.append("\nAVOIDED LOSSES (sample — names that FELL while under-allocated, "
+                     "the mirror of the misses):")
+        for a in avoided[:8]:
+            why = _strip_html_to_text(a.get("reason") or "")
+            if len(why) > 220:
+                why = why[:220] + "…"
+            lines.append(f"- {a['ticker']} ({a.get('sector') or '—'}): "
+                         f"{a.get('dodge_type')} dodge, {_n(a.get('loss_pct'), sign=True)}%; {why}")
+
+    lines.append(
+        "\nWrite a post-mortem in Markdown with these sections:\n"
+        "1. **Headline** — 2-3 sentences: are these misses real signal or the "
+        "upside tail of a two-sided market? Judge against the base rate and, where "
+        "present, alpha.\n"
+        "2. **Systematic patterns** — the 2-4 recurring threads across the misses "
+        "(shared sectors, factor signatures, the model-vs-execution split, catalyst "
+        "types). Cite tickers.\n"
+        "3. **The single most fixable gap** — name it, and the concrete change to "
+        "the scoring model or allocation rule that would have caught it.\n"
+        "4. **Watch-outs** — where the data is too thin to conclude, or where a "
+        "'miss' is really beta rather than alpha.\n"
+        "Keep it tight and quantitative. No personalized buy/sell advice."
+    )
+    return "\n".join(lines)
+
+
+def analyze_missed_opportunities_ai(
+    missed: list[dict],
+    avoided: Optional[list[dict]] = None,
+    insights: Optional[dict] = None,
+    *,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """On-demand AI post-mortem over the captured miss data. Returns a Markdown
+    analysis, or None when no API key is configured or the call fails/declines.
+    Best-effort and side-effect-free beyond the API call — the caller decides
+    what to do with the text. NOT invoked by the normal report path."""
+    if not missed:
+        print("[miss-analysis] No missed opportunities to analyze.")
+        return None
+    client = _anthropic_client()
+    if client is None:
+        print("[miss-analysis] ANTHROPIC_API_KEY not set — skipping AI post-mortem. "
+              "The deterministic scorecard (alpha, horizons, miss-type) is already in "
+              "the report; set the key and re-run with --analyze-misses for the "
+              "written analysis.")
+        return None
+    mdl = model or MISSED_OPP_MODEL
+    prompt = _build_miss_analysis_prompt(missed, avoided or [], insights or {})
+    print(f"[miss-analysis] Analyzing {len(missed)} missed opportunit"
+          f"{'y' if len(missed) == 1 else 'ies'} with {mdl} …")
+    try:
+        # Generous timeout + max_tokens: a capable model may think before writing,
+        # and thinking counts toward max_tokens — leave room so the prose isn't
+        # truncated. No temperature (rejected by the Opus 5 family).
+        resp = client.with_options(timeout=180.0).messages.create(
+            model=mdl,
+            max_tokens=12000,
+            system=_MISS_ANALYSIS_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        print(f"[miss-analysis] AI call failed ({type(e).__name__}: {e}). "
+              f"If it's a model-access error, set MISSED_OPP_MODEL to a model your "
+              f"key can use.")
+        return None
+    if getattr(resp, "stop_reason", None) == "refusal":
+        print("[miss-analysis] Model declined to analyze (refusal).")
+        return None
+    text = "".join(getattr(b, "text", "") for b in (resp.content or [])
+                   if getattr(b, "type", None) == "text").strip()
+    if not text:
+        print("[miss-analysis] Empty analysis returned.")
+        return None
+    return text
 
 
 _MISS_VERDICT_COLORS = {
@@ -8298,6 +8602,14 @@ def main():
                     help="Opt in to the Tax-Aware Trim Guidance section. Off by "
                          "default — it's the only step that fetches your full "
                          "order history, so skipping it keeps runs fast.")
+    ap.add_argument("--analyze-misses", action="store_true",
+                    help="On-demand AI post-mortem of the Missed Opportunities: "
+                         "sends the computed miss data (alpha, horizons, factors, "
+                         "why-missed) to Claude for a written analysis of the "
+                         "systematic gaps, and saves it to "
+                         "missed_opp_analysis_<date>.md. Off by default and never "
+                         "part of the normal report (needs ANTHROPIC_API_KEY; model "
+                         "via MISSED_OPP_MODEL).")
     ap.add_argument("--lots-csv", default=None,
                     help="Optional purchase-history CSV (columns: ticker,date,"
                          "shares,price) for exact lot-level tax analysis in CSV "
@@ -8656,8 +8968,12 @@ def main():
         run_ranks = compute_run_ranks(results, watchlists_analyzed or None)
         _attach_rank_moves(recs_history, run_ranks, results,
                            watchlists_analyzed or None, run_date=_run_date)
+        # S&P level at this run — frozen per ticker at first sight, refreshed
+        # after, so each miss can be scored on excess return (alpha), not raw
+        # gain. Cheap: fetch_benchmark_returns is cached (30-min TTL).
+        _sp_level = (fetch_benchmark_returns() or {}).get("level")
         update_recs_history(recs_history, results, watchlists_analyzed or None,
-                            run_date=_run_date, ranks=run_ranks)
+                            run_date=_run_date, ranks=run_ranks, sp_level=_sp_level)
         save_recs_history(recs_history)
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
@@ -8670,6 +8986,30 @@ def main():
               f"{len(avoided_losses)} avoided loss(es).")
     except Exception as e:
         print(f"[history] Skipped missed-opportunity tracking: {e}")
+
+    # On-demand AI post-mortem of the misses (opt-in via --analyze-misses; never
+    # part of the normal report). Writes a dated Markdown file and echoes it to
+    # stdout. Best-effort: any failure here must not block the report.
+    if args.analyze_misses:
+        try:
+            _miss_md = analyze_missed_opportunities_ai(
+                missed_opportunities, avoided_losses, missed_insights)
+            if _miss_md:
+                _adate = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+                _apath = f"missed_opp_analysis_{_adate}.md"
+                try:
+                    with open(_apath, "w") as _af:
+                        _af.write(f"# Missed-Opportunity Post-Mortem — {_adate}\n\n")
+                        _af.write(f"_Model: {MISSED_OPP_MODEL}. Retrospective "
+                                  f"model-improvement analysis, not investment "
+                                  f"advice._\n\n")
+                        _af.write(_miss_md + "\n")
+                    print(f"[miss-analysis] Wrote {_apath}")
+                except OSError as _ae:
+                    print(f"[miss-analysis] Could not write {_apath}: {_ae}")
+                print("\n" + "=" * 72 + "\n" + _miss_md + "\n" + "=" * 72)
+        except Exception as e:
+            print(f"[miss-analysis] Skipped: {e}")
 
     # Tax analysis for SELL/TRIM and low-score positions (holding period +
     # trim timing).
