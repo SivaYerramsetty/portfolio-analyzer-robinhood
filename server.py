@@ -55,18 +55,6 @@ def _log(section: str, msg: str):
     print(f"[{section}] {msg}")
 
 
-# ── Missed-opportunity AI post-mortem job ─────────────────────────────────────────
-# Its own job slot (same lock/running/lines/result shape as a section). Unlike the
-# section refreshes it does NOT log into Robinhood — it reads the existing recs
-# ledger, so it's fast and works even without live credentials.
-_miss_analysis = {"lock": threading.Lock(), "running": False, "lines": [], "result": None}
-
-
-def _log_ma(msg: str):
-    _miss_analysis["lines"].append(msg)
-    print(f"[miss-analysis] {msg}")
-
-
 # ── Helpers — thin wrappers around analyze_portfolio internals ───────────────────
 
 def _rh_login():
@@ -435,108 +423,6 @@ def _run_section(section: str):
             s["running"] = False
 
 
-def _md_to_html(md: str) -> str:
-    """Minimal, safe Markdown → HTML for the analysis panel. Escapes first, then
-    renders only the constructs the post-mortem uses: headings, **bold**, and
-    bullet / numbered lists. Deliberately tiny — not a general Markdown engine."""
-    import html as _html
-    import re as _re
-    out: list[str] = []
-    in_list = False
-
-    def close_list():
-        nonlocal in_list
-        if in_list:
-            out.append("</ul>")
-            in_list = False
-
-    for raw in md.splitlines():
-        if not raw.strip():
-            close_list()
-            continue
-        esc = _html.escape(raw.strip())
-        esc = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc)
-        h = _re.match(r"^(#{1,6})\s+(.*)$", esc)
-        if h:
-            close_list()
-            lvl = min(len(h.group(1)) + 2, 6)     # "# " → h3, "## " → h4, …
-            out.append(f"<h{lvl}>{h.group(2)}</h{lvl}>")
-            continue
-        li = _re.match(r"^(?:[-*]|\d+\.)\s+(.*)$", esc)
-        if li:
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
-            out.append(f"<li>{li.group(1)}</li>")
-            continue
-        close_list()
-        out.append(f"<p>{esc}</p>")
-    close_list()
-    return "\n".join(out)
-
-
-def _run_miss_analysis():
-    """Background worker: read the ledger, compute the misses, and send them to
-    Claude for the on-demand post-mortem. Reuses analyze_portfolio's builder + call
-    so the browser button and the --analyze-misses CLI flag produce the same thing."""
-    s = _miss_analysis
-    try:
-        import analyze_portfolio as ap
-        if not ap.ANTHROPIC_API_KEY:
-            _log_ma("No ANTHROPIC_API_KEY in the server environment.")
-            s["result"] = {"success": False, "html": None,
-                           "message": ("No ANTHROPIC_API_KEY set. Stop the server, run "
-                                       "`export ANTHROPIC_API_KEY=…`, then `python "
-                                       "server.py` again.")}
-            return
-        _log_ma("Loading recommendation ledger…")
-        hist = ap.load_recs_history()
-        missed = ap.compute_missed_opportunities(hist)
-        if not missed:
-            _log_ma("No missed opportunities tracked yet.")
-            s["result"] = {"success": False, "html": None,
-                           "message": "No missed opportunities tracked yet — nothing to analyze."}
-            return
-        avoided = ap.compute_avoided_losses(hist)
-        insights = ap.compute_missed_opp_insights(hist, missed, avoided)
-        _log_ma(f"Sending {len(missed)} missed opportunit"
-                f"{'y' if len(missed) == 1 else 'ies'} to {ap.MISSED_OPP_MODEL} — "
-                f"this can take up to a minute…")
-        md = ap.analyze_missed_opportunities_ai(missed, avoided, insights)
-        if not md:
-            _log_ma("AI analysis returned nothing.")
-            s["result"] = {"success": False, "html": None,
-                           "message": ("AI analysis failed — check the server console. "
-                                       "If it's a model-access error, set MISSED_OPP_MODEL "
-                                       "to a model your key can use.")}
-            return
-        # Persist a copy, same as the CLI path, so it's keepable for study.
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        _date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-        _path = PROJECT_DIR / f"missed_opp_analysis_{_date}.md"
-        try:
-            _path.write_text(
-                f"# Missed-Opportunity Post-Mortem — {_date}\n\n"
-                f"_Model: {ap.MISSED_OPP_MODEL}. Retrospective model-improvement "
-                f"analysis, not investment advice._\n\n" + md + "\n",
-                encoding="utf-8")
-            _log_ma(f"Saved {_path.name}")
-        except OSError as e:
-            _log_ma(f"Could not save markdown file: {e}")
-        _log_ma("✓ Analysis ready.")
-        s["result"] = {"success": True, "html": _md_to_html(md),
-                       "message": f"Analyzed {len(missed)} misses · {ap.MISSED_OPP_MODEL}"}
-    except Exception as e:
-        import traceback
-        _log_ma(f"✗ ERROR: {e}")
-        _log_ma(traceback.format_exc())
-        s["result"] = {"success": False, "html": None, "message": f"Error: {e}"}
-    finally:
-        with s["lock"]:
-            s["running"] = False
-
-
 # ── API routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/section/<section>", methods=["POST"])
@@ -602,49 +488,6 @@ def section_status(section):
         })
 
 
-# ── Missed-opportunity analysis routes ────────────────────────────────────────────
-
-@app.route("/api/analyze-misses", methods=["POST"])
-def analyze_misses_start():
-    s = _miss_analysis
-    with s["lock"]:
-        if s["running"]:
-            return jsonify({"running": True,
-                            "message": "Already analyzing — please wait…"})
-        s["running"] = True
-        s["lines"]   = []
-        s["result"]  = None
-    threading.Thread(target=_run_miss_analysis, daemon=True).start()
-    return jsonify({"running": True, "message": "Started AI analysis…"})
-
-
-@app.route("/api/analyze-misses/log")
-def analyze_misses_log():
-    """SSE stream of progress lines, ending in a `done` event carrying the result
-    ({success, html, message}) — same shape the section refreshes use."""
-    def generate():
-        s = _miss_analysis
-        sent = 0
-        while True:
-            with s["lock"]:
-                new_lines = s["lines"][sent:]
-                running   = s["running"]
-                result    = dict(s["result"]) if s["result"] else None
-            for line in new_lines:
-                yield f"data: {json.dumps({'line': line})}\n\n"
-            sent += len(new_lines)
-            if not running:
-                yield f"event: done\ndata: {json.dumps(result or {})}\n\n"
-                return
-            time.sleep(0.25)
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 # ── Serve report ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -656,131 +499,8 @@ def index():
             "then reload.</p>"
         ), 404
 
-    # Section-refresh buttons are baked in by patch_section_refresh.py; the
-    # Missed-Opportunities "Analyze with AI" button is injected here (server-side)
-    # because it needs an endpoint — a static file can't call Claude.
-    html = REPORT_FILE.read_text(encoding="utf-8")
-    return _inject_miss_analysis_ui(html)
-
-
-# ── Missed-opportunity "Analyze with AI" button (injected server-side) ────────────
-
-_MISS_AI_UI = """
-<style>
-  #miss-ai-btn{margin-left:12px;padding:6px 12px;border-radius:8px;
-    background:var(--bg-card,#fff);border:1px solid var(--border-medium,#ccc);
-    cursor:pointer;font-size:13px;font-weight:600;vertical-align:middle;
-    color:var(--fg-body,#2c3e50);box-shadow:0 1px 4px rgba(0,0,0,.08);
-    transition:transform .15s,background .15s;}
-  #miss-ai-btn:hover:not(:disabled){background:var(--bg-card-hover,#f2f2f2);transform:translateY(-1px);}
-  #miss-ai-btn:disabled{cursor:wait;opacity:.65;}
-  #miss-ai-status{margin-left:10px;font-size:12px;color:var(--fg-muted,#7f8c8d);vertical-align:middle;}
-  .miss-ai-panel{display:none;margin:14px 0 8px;border:1px solid var(--border-medium,#d5d5d5);
-    border-radius:12px;background:var(--bg-card,#fff);overflow:hidden;max-width:900px;}
-  .miss-ai-panel.open{display:block;}
-  .miss-ai-head{padding:10px 16px;font-size:12px;font-weight:700;color:var(--fg-muted,#7f8c8d);
-    border-bottom:1px solid var(--border-medium,#eee);display:flex;justify-content:space-between;
-    gap:12px;align-items:center;}
-  .miss-ai-log{background:#1a2028;color:#e8eaed;font-family:"SF Mono",SFMono-Regular,Consolas,monospace;
-    font-size:11px;line-height:1.5;max-height:150px;overflow-y:auto;padding:8px 14px;}
-  .miss-ai-log p{margin:0;padding:1px 0;white-space:pre-wrap;}
-  .miss-ai-body{padding:4px 20px 16px;color:var(--fg-body,#2c3e50);font-size:14px;line-height:1.6;}
-  .miss-ai-body h3{font-size:15px;margin:18px 0 6px;color:var(--fg-strong,#1a1a1a);}
-  .miss-ai-body h4{font-size:13.5px;margin:14px 0 4px;color:var(--fg-strong,#1a1a1a);}
-  .miss-ai-body ul{margin:6px 0;padding-left:20px;}
-  .miss-ai-body li{margin:3px 0;}
-  .miss-ai-body p{margin:8px 0;}
-  .miss-ai-body strong{color:var(--fg-strong,#1a1a1a);}
-  .miss-ai-note{padding:0 20px 14px;font-size:11px;color:var(--fg-muted,#7f8c8d);font-style:italic;}
-  .miss-ai-err{padding:14px 20px;color:#c0392b;font-size:13px;}
-</style>
-<script>
-(function(){
-  var btn=document.getElementById('miss-ai-btn');
-  if(!btn) return;
-  var statusEl=document.getElementById('miss-ai-status');
-  var panel=document.getElementById('miss-ai-panel');
-  var es=null;
-  function setStatus(t){ if(statusEl) statusEl.textContent=t||''; }
-  function ensureLog(){
-    panel.classList.add('open');
-    if(!panel.querySelector('.miss-ai-head')){
-      var h=document.createElement('div'); h.className='miss-ai-head';
-      h.innerHTML="<span>🔍 AI Post-Mortem</span>"; panel.appendChild(h);
-    }
-    var log=panel.querySelector('.miss-ai-log');
-    if(!log){ log=document.createElement('div'); log.className='miss-ai-log'; panel.appendChild(log); }
-    return log;
-  }
-  function addLog(t){ var l=ensureLog(); var p=document.createElement('p'); p.textContent=t;
-    l.appendChild(p); l.scrollTop=l.scrollHeight; }
-  function render(res){
-    panel.innerHTML=''; panel.classList.add('open');
-    var head=document.createElement('div'); head.className='miss-ai-head';
-    head.innerHTML="<span>🔍 AI Post-Mortem</span><span>"+((res&&res.success&&res.message)||'')+"</span>";
-    panel.appendChild(head);
-    if(res && res.success && res.html){
-      var body=document.createElement('div'); body.className='miss-ai-body';
-      body.innerHTML=res.html; panel.appendChild(body);
-      var note=document.createElement('div'); note.className='miss-ai-note';
-      note.textContent='Retrospective model-improvement analysis, not investment advice.';
-      panel.appendChild(note);
-    } else {
-      var err=document.createElement('div'); err.className='miss-ai-err';
-      err.textContent=(res&&res.message)||'Analysis failed.'; panel.appendChild(err);
-    }
-  }
-  btn.addEventListener('click',function(){
-    if(es){ es.close(); es=null; }
-    btn.disabled=true; setStatus('Analyzing…');
-    panel.innerHTML=''; addLog('▶ Requesting AI analysis…');
-    fetch('/api/analyze-misses',{method:'POST'})
-      .then(function(r){return r.json();})
-      .then(function(d){
-        addLog((d&&d.message)||'Running…');
-        es=new EventSource('/api/analyze-misses/log');
-        es.onmessage=function(e){ try{ addLog(JSON.parse(e.data).line); }catch(_){} };
-        es.addEventListener('done',function(e){
-          es.close(); es=null; btn.disabled=false;
-          var res; try{ res=JSON.parse(e.data); }catch(_){ res={success:false,message:'Bad server response.'}; }
-          setStatus(res.success?'✓ Done':'✗ Error');
-          setTimeout(function(){ setStatus(''); },4000);
-          render(res);
-        });
-        es.onerror=function(){ es.close(); es=null; btn.disabled=false;
-          setStatus('✗ Error'); render({success:false,message:'Lost connection to server.'}); };
-      })
-      .catch(function(e){ btn.disabled=false; setStatus('✗ Error');
-        render({success:false,message:'Could not reach server: '+e}); });
-  });
-})();
-</script>
-"""
-
-
-def _inject_miss_analysis_ui(html: str) -> str:
-    """Insert the 'Analyze with AI' button + result panel next to the Missed
-    Opportunities <h2>, and the supporting CSS/JS before </body>. No-op (serves the
-    file unchanged) if that section isn't in the report."""
-    import re
-    if "miss-ai-btn" in html:            # already injected (defensive)
-        return html
-    btn = ("<button id='miss-ai-btn' type='button' title='Send the missed-"
-           "opportunity data to Claude for a written analysis'>"
-           "🔍 Analyze with AI</button><span id='miss-ai-status'></span>")
-
-    def repl(m):
-        return (m.group(1) + m.group(2) + " " + btn + m.group(3)
-                + "<div id='miss-ai-panel' class='miss-ai-panel'></div>")
-
-    new_html, n = re.subn(
-        r"(<h2[^>]*id=['\"]missed-opps['\"][^>]*>)(.*?)(</h2>)",
-        repl, html, count=1, flags=re.DOTALL)
-    if n == 0:
-        return html
-    if "</body>" in new_html:
-        return new_html.replace("</body>", _MISS_AI_UI + "</body>", 1)
-    return new_html + _MISS_AI_UI
+    # Buttons are baked in by patch_section_refresh.py — serve as-is.
+    return REPORT_FILE.read_text(encoding="utf-8")
 
 
 def _inject_section_buttons_UNUSED(html: str) -> str:
@@ -1069,23 +789,14 @@ _PLACEHOLDER = """
 # ── Entry point ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Port: $PORT, else a numeric first CLI arg, else 5000. Lets a busy-5000 box
-    # (or the preview) pick another port without changing the `python server.py`
-    # default.
-    _port = int(os.environ.get("PORT")
-                or (sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].isdigit() else 5000))
     print("=" * 60)
     print("Portfolio Analyzer — Section Refresh Server")
     print("=" * 60)
     print(f"  Report file : {REPORT_FILE.resolve()}")
-    print(f"  URL         : http://localhost:{_port}")
+    print(f"  URL         : http://localhost:5000")
     print()
     print("  Section endpoints:")
     for s in _sections:
         print(f"    POST /api/section/{s}")
-    print("    POST /api/analyze-misses   (needs ANTHROPIC_API_KEY)")
-    import analyze_portfolio as _ap
-    print(f"  Missed-opp AI : {'key set' if _ap.ANTHROPIC_API_KEY else 'NO ANTHROPIC_API_KEY — button will report it'}"
-          f" · model {_ap.MISSED_OPP_MODEL}")
     print("=" * 60)
-    app.run(host="127.0.0.1", port=_port, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
