@@ -151,7 +151,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -775,9 +775,12 @@ def _render_diversification_gauge(results: list) -> str:
 # bounded modifier in compute_verdict_v2 (see _news_signal_modifier). Scoring is
 # FREE by default via a headline lexicon; if ANTHROPIC_API_KEY is set it upgrades
 # to Claude for sharper reads, and a prior Claude read is kept visible while a
-# refresh is in flight (stale-while-revalidate). The cache lives in .cache/
-# (gitignored; carried across CI runs) so warm runs re-fetch nothing. Set
-# NEWS_SIGNAL=0 to disable entirely.
+# refresh is in flight (stale-while-revalidate). That carry is bounded: the
+# nudge halves after a trading day and stops entirely after five, so a
+# persistently failing refresh fades to "no news signal" instead of freezing a
+# stale opinion into every verdict (see _news_signal_modifier). The cache lives
+# in .cache/ (gitignored; carried across CI runs) so warm runs re-fetch nothing.
+# Set NEWS_SIGNAL=0 to disable entirely.
 
 _NEWS_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "news_sentiment.json"
 _news_cache_lock = threading.Lock()
@@ -804,6 +807,19 @@ _NEWS_SENTIMENT_SCHEMA = {
     "required": ["score", "label", "rationale"],
     "additionalProperties": False,
 }
+
+
+def _et_now(ts: Optional[float] = None) -> datetime:
+    """Market-time (America/New_York) datetime — now, or `ts` if given."""
+    tz = ZoneInfo("America/New_York")
+    return datetime.now(tz) if ts is None else datetime.fromtimestamp(ts, tz)
+
+
+def _et_date_iso(ts: Optional[float] = None) -> str:
+    """Market-time calendar date as ISO "YYYY-MM-DD" — the `as_of` stamp on a
+    news read. Takes `ts` so a batch harvested by a later run is stamped with
+    when it was scored, not when it happened to be collected."""
+    return _et_now(ts).date().isoformat()
 
 
 def _news_cache_mode() -> tuple[str, float]:
@@ -848,9 +864,7 @@ def _news_entry_fresh(entry: Optional[dict]) -> bool:
         return False
     if mode == "hours":
         return (time.time() - ts) < hours * 3600
-    ny = ZoneInfo("America/New_York")
-    return (datetime.fromtimestamp(ts, ny).date()
-            == datetime.now(ny).date())
+    return _et_now(ts).date() == _et_now().date()
 
 
 def _load_news_cache() -> dict:
@@ -970,9 +984,15 @@ def _news_request_params(ticker, name, headlines) -> dict:
     }
 
 
-def _parse_sentiment_response(content, headlines) -> Optional[dict]:
+def _parse_sentiment_response(content, headlines,
+                              as_of: Optional[str] = None) -> Optional[dict]:
     """Turn a Message's content blocks into a sentiment dict, or None if the
-    model returned something unparseable (caller falls back to the lexicon)."""
+    model returned something unparseable (caller falls back to the lexicon).
+
+    `as_of` defaults to today, which is right for a real-time score. The harvest
+    path passes the date its batch was *submitted*, because that's when the
+    headlines were pulled — stamping harvest day would make a read look a run
+    fresher than it is, and _news_signal_age_days decides weight off this."""
     text = next((b.text for b in content if b.type == "text"), "")
     data = json.loads(text)
     score = max(-1.0, min(1.0, float(data.get("score", 0) or 0)))
@@ -981,7 +1001,7 @@ def _parse_sentiment_response(content, headlines) -> Optional[dict]:
         "label": str(data.get("label", "neutral")),
         "rationale": str(data.get("rationale", "")).strip(),
         "headlines": headlines[:5],
-        "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+        "as_of": as_of or _et_date_iso(),
     }
 
 
@@ -1044,7 +1064,7 @@ def _lexicon_sentiment(headlines: list[str]) -> Optional[dict]:
         "rationale": (f"{pos} positive vs {neg} negative signal words across "
                       f"{len(headlines)} recent headlines"),
         "headlines": headlines[:5],
-        "as_of": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+        "as_of": _et_date_iso(),
         "method": "lexicon",
     }
 
@@ -1089,6 +1109,11 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
             # pending batch's harvest, or the next real-time attempt, replaces
             # it). Only fall back to the lexicon when there's no Claude score to
             # carry forward.
+            #
+            # Leaving the entry alone also preserves its `as_of`, which is what
+            # bounds this carry: _news_signal_modifier fades the nudge by the
+            # read's age, so a refresh that keeps failing decays to no signal
+            # instead of pinning old headlines to the verdict forever.
             if _is_claude_sentiment(prior):
                 with _news_cache_lock:
                     _news_hits += 1
@@ -1135,10 +1160,16 @@ def _news_cache_fresh(cache: dict, ticker: str) -> bool:
 
 
 def _store_batch_results(client, batch_id: str, id_map: dict,
-                         headlines_by_ticker: dict) -> int:
+                         headlines_by_ticker: dict,
+                         as_of: Optional[str] = None) -> int:
     """Write a finished batch's results into the news cache. Returns how many
     tickers were scored. Unparseable or errored entries are simply left out —
-    the ticker falls through to the lexicon on the next read."""
+    the ticker falls through to the lexicon on the next read.
+
+    `as_of` dates the scores (default today, for a batch submitted this run);
+    the cross-run harvest passes the submission date. The cache entry's own `ts`
+    stays the write time either way — that drives the re-score TTL, while
+    `as_of` drives how much weight the verdict gives the read."""
     global _news_cache_dirty, _news_batched
     scored = 0
     for res in client.messages.batches.results(batch_id):
@@ -1152,6 +1183,7 @@ def _store_batch_results(client, batch_id: str, id_map: dict,
             sentiment = _parse_sentiment_response(
                 res.result.message.content,
                 headlines_by_ticker.get(ticker, []),
+                as_of,
             )
         except Exception as e:
             print(f"[news-batch] {ticker}: unparseable ({type(e).__name__}: {e})")
@@ -1219,7 +1251,8 @@ def _harvest_pending_news_batches(client) -> None:
             continue
         try:
             n = _store_batch_results(client, batch_id, id_map,
-                                     rec.get("headlines") or {})
+                                     rec.get("headlines") or {},
+                                     _et_date_iso(rec.get("ts") or None))
             print(f"[news-batch] harvested {n} score(s) from prior run's batch "
                   f"{batch_id}")
         except Exception as e:
@@ -1252,7 +1285,9 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
         # A stale ticker is re-batched to refresh it even when it has a prior
         # Claude score — stale-while-revalidate keeps that old score visible in
         # this run's report while the batch lands, rather than blocking the
-        # refresh (see score_news_sentiment).
+        # refresh (see score_news_sentiment). The old score is carried at
+        # reduced weight, decaying to none, so a batch that never lands can't
+        # keep nudging verdicts (see _news_signal_modifier).
         todo = [r for r in rows
                 if r.get("ticker")
                 and r["ticker"] not in _news_batch_inflight
@@ -1337,10 +1372,72 @@ def prewarm_news_sentiment(rows: list[dict]) -> None:
     }])
 
 
+# Age decay for a carried-over news read, in TRADING days (see
+# _news_signal_age_days). A fresh read nudges at full strength; one that is only
+# still here because the refresh failed loses half its weight, then all of it.
+# Without this, a stuck news path (key pulled, Finnhub erroring, batches always
+# landing after NEWS_BATCH_WAIT_SECONDS) would ride one day's headlines into
+# every verdict indefinitely — and unlike P/E or ROE, a headline read is about a
+# specific event, so its information is mostly gone within the week.
+_NEWS_FULL_WEIGHT_DAYS = 1     # <= this many trading days old: full nudge
+_NEWS_MAX_AGE_DAYS = 5         # >= this many: no nudge at all
+
+
+def _weekdays_between(start: date, end: date) -> int:
+    """Weekdays falling after `start`, up to and including `end`. Zero when
+    `end` isn't after `start`, so a future-dated read (clock skew between the
+    scorer and this run) reads as age 0 rather than a negative age."""
+    total = (end - start).days
+    if total <= 0:
+        return 0
+    weeks, extra = divmod(total, 7)
+    n = weeks * 5                      # every whole week is exactly 5 weekdays
+    d = start + timedelta(days=weeks * 7)
+    for _ in range(extra):             # at most 6 iterations
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+def _news_signal_age_days(news: Optional[dict]) -> Optional[int]:
+    """How many trading days old a news read is, or None when it carries no
+    usable `as_of` — an unknown age is treated as fresh by the caller rather
+    than silently discounting a score.
+
+    Trading days rather than calendar days because the scheduled runs are
+    weekday-only (.github/workflows/*.yml): a Friday read served on Monday is
+    three calendar days old but has missed just one session of news, so pricing
+    it as three days stale would penalize every Monday. Holidays aren't modeled,
+    matching _us_market_open_now — a holiday counts as a session, which only
+    ever fades the nudge slightly early."""
+    raw = (news or {}).get("as_of")
+    if not raw:
+        return None
+    try:
+        as_of = datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    return _weekdays_between(as_of, _et_now().date())
+
+
+def _news_as_of_label(news: Optional[dict]) -> str:
+    """A read's `as_of` as a short "Aug 24", or the raw value if it isn't a
+    date. Shown in the verdict reason so an aged read can't pass for today's."""
+    raw = str((news or {}).get("as_of") or "")
+    try:
+        d = datetime.strptime(raw, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return raw
+    return f"{d:%b} {d.day}"
+
+
 def _news_signal_modifier(news: Optional[dict]):
     """Map a news-sentiment dict to (delta, description) for the verdict, or None
     for a neutral/absent signal. Bounded to ±6 so news nudges but never dominates
-    fundamentals (same magnitude band as the insider/sector signals)."""
+    fundamentals (same magnitude band as the insider/sector signals), then
+    haircut by the read's age so a carried-over score fades instead of standing
+    in for today's news (see _NEWS_FULL_WEIGHT_DAYS)."""
     if not news:
         return None
     score = news.get("score")
@@ -1356,9 +1453,29 @@ def _news_signal_modifier(news: Optional[dict]):
         delta = -3
     else:
         return None   # neutral band — no nudge
+
+    age = _news_signal_age_days(news)
+    stale = age is not None and age > _NEWS_FULL_WEIGHT_DAYS
+    if stale:
+        if age >= _NEWS_MAX_AGE_DAYS:
+            return None       # too old to claim anything about today
+        if abs(delta) < 6:
+            # Half of ±3 rounds to nothing on purpose: a read that was only a
+            # weak signal when fresh isn't worth carrying once it's stale.
+            return None
+        delta = 3 if delta > 0 else -3
+
     rationale = (news.get("rationale") or "").strip()
     lbl = news.get("label") or ("positive" if delta > 0 else "negative")
-    desc = f"Recent news {lbl}" + (f": {rationale}" if rationale else "")
+    # "Recent news" only when the read really is from today; otherwise the
+    # reason carries the date, so the verdict can't call last week's headline
+    # recent. `age` of None (no as_of) keeps the original wording.
+    if not age:
+        when = "Recent news"
+    else:
+        when = f"News ({_news_as_of_label(news)}"
+        when += ", half weight)" if stale else ")"
+    desc = f"{when} {lbl}" + (f": {rationale}" if rationale else "")
     return (delta, desc)
 
 
