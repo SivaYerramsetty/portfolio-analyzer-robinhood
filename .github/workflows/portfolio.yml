@@ -17,6 +17,11 @@ on:
         description: "Embed a Claude AI post-mortem of the Missed Opportunities (uses ANTHROPIC_API_KEY; off by default)"
         type: boolean
         default: false
+      base_score_mode:
+        description: "Base score this run acts on for pruning, tax flags and history (the report shows all three either way). 'default' = the BASE_SCORE_MODE repository variable (composite when unset)"
+        type: choice
+        options: [default, composite, quality, blend]
+        default: default
 
 permissions:
   contents: read
@@ -102,6 +107,12 @@ jobs:
           NEWS_CACHE_TTL_HOURS: ${{ vars.NEWS_CACHE_TTL_HOURS }}  # optional; unset = refresh once/calendar-day. A number = rolling N-hour window; 0 = no cache
           NEWS_BATCH_WAIT_SECONDS: ${{ vars.NEWS_BATCH_WAIT_SECONDS }}  # optional; defaults to 300s before falling back to lexicon
           # NEWS_BATCH: '0'                                       # set to disable the 50%-off Batches API pre-pass
+          # Default verdict base score: composite (default) | quality | blend.
+          # It drives watchlist pruning, tax flags and the history ledger; the
+          # report carries all three bases regardless. The report's "Make
+          # default" button writes this variable, so scheduled dispatches
+          # (which send no inputs) follow it too.
+          BASE_SCORE_MODE:    ${{ vars.BASE_SCORE_MODE }}
           TAX_FILING_STATUS:  ${{ secrets.TAX_FILING_STATUS }}
           TAX_TAXABLE_INCOME: ${{ secrets.TAX_TAXABLE_INCOME }}
           TAX_STATE_RATE:     ${{ secrets.TAX_STATE_RATE }}
@@ -118,12 +129,19 @@ jobs:
           if [ "${{ inputs.include_tax }}" = "true" ]; then TAX_FLAG="--tax"; fi
           MISS_FLAG=""
           if [ "${{ inputs.analyze_misses }}" = "true" ]; then MISS_FLAG="--analyze-misses"; fi
+          # A one-off base score overrides BASE_SCORE_MODE; 'default' (and the
+          # no-input scheduled dispatch) leaves the saved variable in charge.
+          BASE_FLAG=""
+          case "${{ inputs.base_score_mode }}" in
+            composite|quality|blend) BASE_FLAG="--base-score ${{ inputs.base_score_mode }}" ;;
+          esac
           python analyze_portfolio.py \
             --source robinhood \
             --include-watchlists \
             --prune-watchlists \
             $TAX_FLAG \
             $MISS_FLAG \
+            $BASE_FLAG \
             --save-positions positions.csv \
             --out report.html
 

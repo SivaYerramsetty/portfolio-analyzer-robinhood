@@ -116,7 +116,7 @@ def _render_table_only(rows, section: str) -> str:
         _tr_open, _td, _ticker_cell, _name_sector_cell, _position_cell,
         _cost_gain_cell, _price_target_cell, _today_cell, _range_trend_cell,
         _filter_dots, _score_cell, _rating_bar, _insider_cell,
-        _verdict_cell, _VERDICT_ORDER,
+        _verdict_td,
         generate_html_report,
     )
 
@@ -161,7 +161,6 @@ def _render_table_only(rows, section: str) -> str:
     html = "<div class='table-wrap'><table>\n<thead><tr>" + headers + "</tr></thead><tbody>\n"
 
     for r in rows_sorted:
-        verdict_label = r.verdict.label if r.verdict else "—"
         rating_score = -1
         if r.rating_breakdown and r.rating_breakdown.get("total"):
             t = r.rating_breakdown["total"]
@@ -195,9 +194,7 @@ def _render_table_only(rows, section: str) -> str:
                     rating_score)
         html += _td(_insider_cell(r.insider_activity),
                     r.score_insider if r.score_insider is not None else -1)
-        html += _td(_verdict_cell(r.verdict),
-                    r.verdict.score if r.verdict and r.verdict.score is not None
-                    else (100 - _VERDICT_ORDER.get(verdict_label, 99)))
+        html += _verdict_td(r)
         html += "</tr>\n"
 
     html += "</tbody></table></div>\n"
@@ -208,7 +205,7 @@ def _render_watchlist_tables(watchlists: dict) -> str:
     from analyze_portfolio import (
         _tr_open, _td, _ticker_cell, _name_sector_cell,
         _price_target_cell, _range_trend_cell, _filter_dots,
-        _score_cell, _rating_bar, _insider_cell, _verdict_cell, _VERDICT_ORDER,
+        _score_cell, _rating_bar, _insider_cell, _verdict_td,
     )
     if not watchlists:
         return "<p style='color:#7f8c8d;padding:12px;'>No watchlist items.</p>"
@@ -232,7 +229,6 @@ def _render_watchlist_tables(watchlists: dict) -> str:
                  "</tr></thead><tbody>\n")
         for r in items_sorted:
             passed = sum(1 for f in r.filters if f.passed) if r.filters else 0
-            verdict_label = r.verdict.label if r.verdict else "—"
             rating_score = -1
             if r.rating_breakdown and r.rating_breakdown.get("total"):
                 t = r.rating_breakdown["total"]
@@ -259,9 +255,7 @@ def _render_watchlist_tables(watchlists: dict) -> str:
                         rating_score)
             html += _td(_insider_cell(r.insider_activity),
                         r.score_insider if r.score_insider is not None else -1)
-            html += _td(_verdict_cell(r.verdict),
-                        r.verdict.score if r.verdict and r.verdict.score is not None
-                        else (100 - _VERDICT_ORDER.get(verdict_label, 99)))
+            html += _verdict_td(r)
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
     return html

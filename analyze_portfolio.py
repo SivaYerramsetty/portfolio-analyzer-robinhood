@@ -115,6 +115,14 @@ COMMAND REFERENCE — every way to run this script
     --add-to-watchlist NAME  Append --tickers to a Robinhood watchlist (no report).
     --sync-dry-run         Preview --add-to-watchlist / --sync without writing.
     --debug-insider TICKER Diagnose insider data sources for one stock.
+    --base-score {composite,quality,blend}
+                           The base score this run acts on (watchlist pruning,
+                           tax flags, history): the Composite Score (default),
+                           the nine quality filters + analyst + insider, or the
+                           average of the two. Overrides the BASE_SCORE_MODE env
+                           var (a repo variable in CI, set with the report's
+                           "Make default" button). The report always carries
+                           all three; its Base switch flips between them.
 
 --- HTML REPORT FEATURES (no flags needed; always on) ---------------------
 
@@ -688,20 +696,25 @@ def _render_fear_greed_gauge(fg: Optional[dict]) -> str:
     )
 
 
-def _render_portfolio_health_gauge(results: list) -> str:
+def _render_portfolio_health_gauge(results: list, mode: Optional[str] = None) -> str:
     """
-    Value-weighted average of per-position verdict scores (0–100).
+    Value-weighted average of per-position verdict scores (0–100), under
+    `mode`'s verdicts (default the run's).
     Pairs 'how the market feels' with 'how strong your book is'.
     """
+    scores = {}
+    for r in results:
+        v = verdict_in(r, mode)
+        if v and v.score is not None:
+            scores[id(r)] = v.score
     scored = [r for r in results
-              if r.verdict and r.verdict.score is not None
-              and r.live_market_value is not None]
+              if id(r) in scores and r.live_market_value is not None]
     if not scored:
         return ""
     total_val = sum(r.live_market_value for r in scored)
     if total_val <= 0:
         return ""
-    health = sum(r.verdict.score * r.live_market_value for r in scored) / total_val
+    health = sum(scores[id(r)] * r.live_market_value for r in scored) / total_val
     rating = (
         "Weak" if health < 25 else
         "Soft" if health < 45 else
@@ -709,8 +722,8 @@ def _render_portfolio_health_gauge(results: list) -> str:
         "Solid" if health <= 75 else
         "Strong"
     )
-    strong = sum(1 for r in scored if r.verdict.score >= 55)
-    weak = sum(1 for r in scored if r.verdict.score < 45)
+    strong = sum(1 for r in scored if scores[id(r)] >= 55)
+    weak = sum(1 for r in scored if scores[id(r)] < 45)
     sub_html = (
         '<div class="fg-prev">'
         f'<span class="fg-prev-item">Strong <strong>{strong}</strong></span>'
@@ -719,7 +732,8 @@ def _render_portfolio_health_gauge(results: list) -> str:
         '</div>'
     )
     return _render_gauge_card(
-        dom_id="healthMeter", score=health, rating=rating,
+        dom_id="healthMeter" if mode is None else f"healthMeter-{mode}",
+        score=health, rating=rating,
         label="Portfolio Health", sub_html=sub_html,
         source="Value-weighted verdict scores",
         tooltip="Your holdings' verdict scores, weighted by position size. Higher = a stronger book overall.",
@@ -1494,6 +1508,48 @@ class FilterResult:
     # auto-formatted number (used by P/E to show trailing + forward side by
     # side, which the generic % formatter can't express).
     display: Optional[str] = None
+    # Soft-gate credit (0-1) this filter adds to the quality-filter score: 1.0
+    # on a pass, fading to 0 over a band past the threshold (see
+    # _soft_credit_min/_max). None means the filter had no data — it's left out
+    # of the score and lowers its coverage instead of counting as a fail.
+    credit: Optional[float] = None
+
+
+# Soft gates for the quality-filter score (the `quality` base-score mode). A
+# filter that misses its threshold keeps partial credit, fading linearly to zero
+# this far past it (relative to the threshold). Pass/fail itself is unchanged —
+# this only stops a P/E drifting from 29.9 to 30.1 intraday from swinging the
+# verdict by a whole filter's worth of points.
+_SOFT_GATE_BAND = 0.20
+
+
+def _soft_credit_min(value: float, threshold: float, passed: bool) -> float:
+    """Credit for an at-least gate (growth, ROE, margin, quick ratio): 1.0 on a
+    pass, fading to 0 at threshold * (1 - band)."""
+    if passed:
+        return 1.0
+    floor = threshold * (1 - _SOFT_GATE_BAND)
+    return _clip01((value - floor) / (threshold - floor))
+
+
+def _soft_credit_max(value: float, threshold: float, passed: bool) -> float:
+    """Credit for a below gate (P/E, PEG, debt/equity): 1.0 on a pass, fading
+    to 0 at threshold * (1 + band)."""
+    if passed:
+        return 1.0
+    ceiling = threshold * (1 + _SOFT_GATE_BAND)
+    return _clip01((ceiling - value) / (ceiling - threshold))
+
+
+def _is_loss_making(info: dict) -> bool:
+    """True when yfinance shows the company losing money. Earnings-based gates
+    (EPS growth, P/E, PEG) have no value for such names; that absence is a
+    genuine fail, not missing data, so it must still cost the filter's credit."""
+    for key in ("trailingEps", "netIncomeToCommon", "profitMargins"):
+        v = _safe_get(info, key)
+        if v is not None and v <= 0:
+            return True
+    return False
 
 
 def _safe_get(d: dict, key: str) -> Optional[float]:
@@ -1819,6 +1875,9 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
       - debtToEquity is returned as a percentage (100 = 1.0 ratio).
     """
     results: list[FilterResult] = []
+    # Earnings-based gates with no value are a fail for a loss-maker (credit 0)
+    # but missing data for anyone else (credit None) — see FilterResult.credit.
+    no_earnings_credit = 0.0 if _is_loss_making(info) else None
 
     # 1. Revenue growth >= 10%  (prefer 3-year CAGR; fall back to 1-year YoY)
     #    A compounder is defined by sustained growth, not flash-in-the-pan
@@ -1831,12 +1890,15 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
     if rev_cagr is None:
         rev_cagr = _safe_get(info, "revenueGrowth")
         rev_lookback = "1yr YoY" if rev_cagr is not None else None
+    rev_pass = rev_cagr is not None and rev_cagr >= 0.10
     results.append(FilterResult(
         name="Revenue growth >=10%",
-        passed=(rev_cagr is not None and rev_cagr >= 0.10),
+        passed=rev_pass,
         actual=(rev_cagr * 100) if rev_cagr is not None else None,
         threshold=">= 10%",
         note=rev_lookback or "",
+        credit=(_soft_credit_min(rev_cagr, 0.10, rev_pass)
+                if rev_cagr is not None else None),
     ))
 
     # 2. EPS growth >= 10%  (prefer 3-year CAGR; fall back to 1-year YoY)
@@ -1849,12 +1911,15 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
     if eps_cagr is None:
         eps_cagr = _safe_get(info, "earningsGrowth")
         eps_lookback = "1yr YoY" if eps_cagr is not None else None
+    eps_pass = eps_cagr is not None and eps_cagr >= 0.10
     results.append(FilterResult(
         name="EPS growth >=10%",
-        passed=(eps_cagr is not None and eps_cagr >= 0.10),
+        passed=eps_pass,
         actual=(eps_cagr * 100) if eps_cagr is not None else None,
         threshold=">= 10%",
         note=eps_lookback or "",
+        credit=(_soft_credit_min(eps_cagr, 0.10, eps_pass)
+                if eps_cagr is not None else no_earnings_credit),
     ))
 
     # 3. P/E < 30 — pass if EITHER trailing or forward PE is under 30 (uses
@@ -1868,21 +1933,37 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
         pe_display = f"{forward_pe:.1f} fwd"
     else:
         pe_display = None
+    pe_pass = pe is not None and pe < 30
+    if pe is not None:
+        pe_credit = _soft_credit_max(pe, 30, pe_pass)
+    elif trailing_pe is not None or forward_pe is not None:
+        pe_credit = 0.0    # a P/E exists but none is positive: losses
+    else:
+        pe_credit = no_earnings_credit
     results.append(FilterResult(
         name="P/E < 30",
-        passed=(pe is not None and pe < 30),
+        passed=pe_pass,
         actual=pe,
         threshold="< 30",
         display=pe_display,
+        credit=pe_credit,
     ))
 
     # 4. PEG < 2
     peg = _safe_get(info, "trailingPegRatio") or _safe_get(info, "pegRatio")
+    peg_pass = peg is not None and 0 < peg < 2
+    if peg is None:
+        peg_credit = no_earnings_credit
+    elif peg <= 0:
+        peg_credit = 0.0   # negative PEG: shrinking or negative earnings
+    else:
+        peg_credit = _soft_credit_max(peg, 2, peg_pass)
     results.append(FilterResult(
         name="PEG < 2",
-        passed=(peg is not None and 0 < peg < 2),
+        passed=peg_pass,
         actual=peg,
         threshold="< 2",
+        credit=peg_credit,
     ))
 
     # 5. ROE >= 15%  (prefer 3-year average; fall back to 1-year TTM)
@@ -1897,12 +1978,15 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
     if roe_avg is None:
         roe_avg = _safe_get(info, "returnOnEquity")
         roe_lookback = "1yr TTM" if roe_avg is not None else None
+    roe_pass = roe_avg is not None and roe_avg >= 0.15
     results.append(FilterResult(
         name="ROE >= 15%",
-        passed=(roe_avg is not None and roe_avg >= 0.15),
+        passed=roe_pass,
         actual=(roe_avg * 100) if roe_avg is not None else None,
         threshold=">= 15%",
         note=roe_lookback or "",
+        credit=(_soft_credit_min(roe_avg, 0.15, roe_pass)
+                if roe_avg is not None else None),
     ))
 
     # 6. Operating margin >= 15%  (prefer 3-year average; fall back to 1-year)
@@ -1913,22 +1997,28 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
     if om_avg is None:
         om_avg = _safe_get(info, "operatingMargins")
         om_lookback = "1yr TTM" if om_avg is not None else None
+    om_pass = om_avg is not None and om_avg >= 0.15
     results.append(FilterResult(
         name="Op margin >= 15%",
-        passed=(om_avg is not None and om_avg >= 0.15),
+        passed=om_pass,
         actual=(om_avg * 100) if om_avg is not None else None,
         threshold=">= 15%",
         note=om_lookback or "",
+        credit=(_soft_credit_min(om_avg, 0.15, om_pass)
+                if om_avg is not None else None),
     ))
 
     # 7. Debt-to-equity < 1 (yfinance returns this *100; 100 = 1.0)
     de_raw = _safe_get(info, "debtToEquity")
     de_ratio = (de_raw / 100) if de_raw is not None else None
+    de_pass = de_ratio is not None and de_ratio < 1
     results.append(FilterResult(
         name="Debt/Equity < 1",
-        passed=(de_ratio is not None and de_ratio < 1),
+        passed=de_pass,
         actual=de_ratio,
         threshold="< 1",
+        credit=(_soft_credit_max(de_ratio, 1, de_pass)
+                if de_ratio is not None else None),
     ))
 
     # 8. Free cash flow positive AND growing
@@ -1946,6 +2036,8 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
         growing = fcf_consistency.get("growing", False)
         all_positive = positive_years == total_years and total_years >= 2
         fcf_pass = all_positive and growing
+        # Near miss: cash-generative every year, just not growing.
+        fcf_credit = 1.0 if fcf_pass else (0.5 if all_positive else 0.0)
         if all_positive and growing:
             note_suffix = f" ({positive_years}/{total_years} yrs +, growing)"
         elif all_positive:
@@ -1961,6 +2053,10 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
             fcf is not None and fcf > 0
             and fcf_growing is not False
         )
+        if fcf is None:
+            fcf_credit = None
+        else:
+            fcf_credit = 1.0 if fcf_pass else (0.5 if fcf > 0 else 0.0)
         if fcf_growing is True:
             note_suffix = " (1yr: growing)"
         elif fcf_growing is False:
@@ -1973,18 +2069,36 @@ def apply_quality_filters(info: dict) -> list[FilterResult]:
         actual=(fcf / 1e9) if fcf is not None else None,
         threshold="> 0, all yrs",
         note=("$B" + note_suffix) if fcf is not None else "",
+        credit=fcf_credit,
     ))
 
     # 9. Quick ratio > 1.0
     qr = _safe_get(info, "quickRatio")
+    qr_pass = qr is not None and qr > 1.0
     results.append(FilterResult(
         name="Quick ratio > 1.0",
-        passed=(qr is not None and qr > 1.0),
+        passed=qr_pass,
         actual=qr,
         threshold="> 1.0",
+        credit=(_soft_credit_min(qr, 1.0, qr_pass) if qr is not None else None),
     ))
 
     return results
+
+
+def compute_filter_score(filters: list[FilterResult]) -> tuple[Optional[float], float]:
+    """Soft-gated quality-filter score: (0-100 or None, coverage 0-1).
+
+    The mean credit over the filters that had data. Filters with no data are
+    left out (like the composite drops a missing sub-score) and show up as
+    lower coverage instead of dragging the score down as fails."""
+    if not filters:
+        return None, 0.0
+    rated = [f.credit for f in filters if f.credit is not None]
+    if not rated:
+        return None, 0.0
+    return (round(sum(rated) / len(rated) * 100, 1),
+            round(len(rated) / len(filters), 3))
 
 
 # ============================================================
@@ -2001,6 +2115,49 @@ EARNINGS_SOON_DAYS = 7
 # section (in addition to explicit SELL/TRIM verdicts).
 TAX_FLAG_SCORE_THRESHOLD = 75
 
+# ---- Verdict base score (switchable) ----
+# compute_verdict_v2 starts every verdict from a 0-100 base, then applies the
+# context modifiers. The base comes from one of three modes:
+#   composite — the Composite Score. The original behavior and the default.
+#   quality   — the nine quality filters (soft-gated) at 70%, plus the same
+#               analyst and insider sub-scores the composite uses, at 15% each.
+#   blend     — the average of the composite and quality bases.
+# Analyst and insider carry 15% each in every mode, so switching changes only
+# how the fundamentals are measured. Chosen by --base-score, else the
+# BASE_SCORE_MODE env var — a repository variable in CI, so scheduled runs
+# (which dispatch without inputs) follow the saved choice too.
+BASE_SCORE_MODES = ("composite", "quality", "blend")
+DEFAULT_BASE_SCORE_MODE = "composite"
+BASE_SCORE_LABELS = {"composite": "Composite", "quality": "Quality", "blend": "Blend"}
+QUALITY_BASE_WEIGHTS = {"filters": 0.70, "analyst": 0.15, "insider": 0.15}
+_base_score_mode_override: Optional[str] = None     # set from --base-score
+_warned_base_modes: set[str] = set()
+
+
+def set_base_score_mode(mode: Optional[str]) -> None:
+    """Override the base-score mode for this process (--base-score). None
+    clears it, falling back to BASE_SCORE_MODE."""
+    global _base_score_mode_override
+    _base_score_mode_override = mode
+
+
+def base_score_mode(saved_only: bool = False) -> str:
+    """The active base-score mode: the --base-score override, else the
+    BASE_SCORE_MODE env var, else composite. `saved_only` skips the override,
+    giving the saved default a one-off run would otherwise mask. An
+    unrecognised value falls back to composite (warned once)."""
+    raw = "" if saved_only else (_base_score_mode_override or "")
+    raw = (raw or os.environ.get("BASE_SCORE_MODE", "")).strip().lower()
+    if not raw:
+        return DEFAULT_BASE_SCORE_MODE
+    if raw not in BASE_SCORE_MODES:
+        if raw not in _warned_base_modes:
+            _warned_base_modes.add(raw)
+            print(f"[base-score] Unknown BASE_SCORE_MODE {raw!r}; "
+                  f"using {DEFAULT_BASE_SCORE_MODE}.")
+        return DEFAULT_BASE_SCORE_MODE
+    return raw
+
 
 @dataclass
 class Verdict:
@@ -2009,10 +2166,15 @@ class Verdict:
     reason: str
     score: Optional[float] = None    # 0-100 numerical verdict score (v2 only)
     # Data-coverage confidence (v2 only): `coverage` is the fraction of the
-    # Composite Score's weight that actually had data (0-1); `confidence` is the
+    # base score's weight that actually had data (0-1); `confidence` is the
     # bucketed label (High/Medium/Low) shown on the verdict card.
     coverage: Optional[float] = None
     confidence: Optional[str] = None
+    # Base-score mode the verdict was built on (v2 only), and what the other
+    # modes would have said — {mode: (label, score)} — so the hover card and
+    # the run log can compare them before anyone switches.
+    base_mode: Optional[str] = None
+    alternates: Optional[dict] = None
 
 
 def _clip01(x: float) -> float:
@@ -2133,6 +2295,36 @@ def compute_composite_score(pa, info: dict) -> None:
         pa.composite_coverage = round(weight_total, 3)
 
 
+def compute_quality_base(pa) -> None:
+    """Populate the `quality` base-score mode's inputs on `pa`.
+
+    filter_score / filter_coverage: the nine filters as a soft-gated 0-100
+    score and the share that had data. quality_base / quality_coverage: that
+    score at 70% plus the analyst and insider sub-scores at 15% each (the
+    weights they carry in the composite), re-normalized over what's available
+    like the composite is. Coverage scales the filters' 70% by their data
+    share, so a name missing two filters reads as less complete. Needs
+    compute_composite_score first — it fills score_analyst.
+    """
+    pa.filter_score, pa.filter_coverage = compute_filter_score(pa.filters)
+    parts = (
+        ("filters", pa.filter_score, pa.filter_coverage),
+        ("analyst", pa.score_analyst, 1.0),
+        ("insider", pa.score_insider, 1.0),
+    )
+    weighted_sum = weight_total = coverage = 0.0
+    for key, val, data_share in parts:
+        if val is None:
+            continue
+        w = QUALITY_BASE_WEIGHTS[key]
+        weighted_sum += val * w
+        weight_total += w
+        coverage += w * data_share
+    if weight_total > 0:
+        pa.quality_base = round(weighted_sum / weight_total, 1)
+        pa.quality_coverage = round(coverage, 3)
+
+
 def apply_context_adjustments(pa) -> None:
     """
     Light, transparent verdict adjustment using sector momentum + 52-week range.
@@ -2212,21 +2404,34 @@ def compute_verdict_v2(
     is_holding: bool = True,
     news_signal: Optional[dict] = None,
     coverage: Optional[float] = None,
+    base_mode: str = DEFAULT_BASE_SCORE_MODE,
+    quality_base: Optional[float] = None,
+    quality_coverage: Optional[float] = None,
+    filter_score: Optional[float] = None,
+    score_analyst: Optional[float] = None,
+    score_insider: Optional[float] = None,
 ) -> Verdict:
     """
     Evidence-weighted verdict logic.
 
     Synthesizes ALL available signals into a single "verdict score" (0-100).
-    The Composite Score is the fundamentals base (quality, growth, valuation
-    *level*, analyst quality, insider activity). On top of it we apply small
-    modifiers ONLY for signals the composite does NOT already contain:
-    trend, sector momentum, 52-week position, upside-to-analyst-target, recent
-    news, and portfolio concentration.
+    It starts from a fundamentals base chosen by `base_mode` (see
+    BASE_SCORE_MODES): the Composite Score (quality, growth, valuation *level*,
+    analyst quality, insider activity), the quality base (the nine filters plus
+    the same analyst and insider sub-scores), or the blend of the two. On top
+    of it we apply small modifiers ONLY for signals the base does NOT already
+    contain: trend, sector momentum, 52-week position, upside-to-analyst-target,
+    recent news, and portfolio concentration.
 
-    No double-counting: quality and insider already live in the composite (as
-    rich continuous sub-scores), so they are NOT re-applied as modifiers here.
-    Upside-to-target is the opposite case — it is deliberately kept OUT of the
-    composite and applied here instead, where it can interact with trend. Each
+    `coverage` is the composite's data coverage; `quality_coverage` the quality
+    base's. The mode picks which one drives confidence. `filter_score`,
+    `score_analyst` and `score_insider` only label the quality base's parts in
+    the breakdown.
+
+    No double-counting: quality, analyst and insider already live in every base
+    (as rich continuous sub-scores), so they are NOT re-applied as modifiers
+    here. Upside-to-target is the opposite case — it is deliberately kept OUT of
+    the base and applied here instead, where it can interact with trend. Each
     factor therefore influences the final score exactly once.
 
     Holdings (is_holding=True) use SELL/TRIM/HOLD/ADD vocabulary with
@@ -2238,24 +2443,31 @@ def compute_verdict_v2(
     every contributing factor (+5 for hot sector, -10 for downtrend, etc.).
     Hovering the verdict pill surfaces the full breakdown.
     """
-    # ---- Base: Composite Score (0-100) ----
-    if composite_score is None:
-        # No composite available — fall back to mid-neutral, no confidence.
-        base = 50.0
-        contributors: list[tuple[str, float]] = [("Composite Score unavailable, neutral baseline", 0)]
-    else:
-        base = float(composite_score)
-        contributors = [(f"Composite Score {base:.0f}", 0)]  # 0 marker, just shows the base
+    # ---- Base (0-100), built the way base_mode says ----
+    if base_mode not in BASE_SCORE_MODES:
+        base_mode = "composite"
+    base_value, coverage, base_line = _verdict_base(
+        base_mode,
+        composite_score=composite_score, composite_coverage=coverage,
+        quality_base=quality_base, quality_coverage=quality_coverage,
+        filters=filters, filter_score=filter_score,
+        score_analyst=score_analyst, score_insider=score_insider,
+    )
+    # Nothing to build the base from — fall back to mid-neutral.
+    base = 50.0 if base_value is None else float(base_value)
+    # 0 marker: the first entry just shows the base in the breakdown.
+    contributors: list[tuple[str, float]] = [(base_line, 0)]
 
     # Score that we'll modify
     score = base
 
     # ---- Quality filter pass/fail count (NOT re-scored here) ----
-    # Quality already drives the Composite Score base (score_quality is 30% of
-    # it, built from the same ROE / margin / leverage / FCF inputs as these
-    # gates), so re-penalizing a quality miss here would double-count it. We
-    # still tally passed/failed because the 52-week-position logic below uses
-    # the count to distinguish a value entry from a falling knife.
+    # Quality already drives every base (score_quality is 30% of the
+    # composite, built from the same ROE / margin / leverage / FCF inputs as
+    # these gates; the quality base scores the gates themselves), so
+    # re-penalizing a quality miss here would double-count it. We still tally
+    # passed/failed because the 52-week-position logic below uses the count to
+    # distinguish a value entry from a falling knife.
     passed = None
     failed = 0
     if filters:
@@ -2306,8 +2518,8 @@ def compute_verdict_v2(
     # sideways: no adjustment
 
     # ---- Insider activity (NOT re-scored here) ----
-    # Insider buying/selling already feeds the Composite Score (score_insider is
-    # 15% of it, as a rich continuous 0-100 built from buy/sell dollar volume).
+    # Insider buying/selling already feeds every base (score_insider is 15% of
+    # it, as a rich continuous 0-100 built from buy/sell dollar volume).
     # The old coarse ±8 bucket here re-applied the same signal, so it's removed
     # to avoid double-counting. (insider_signal stays in the signature for
     # backward compatibility with callers.)
@@ -2396,13 +2608,13 @@ def compute_verdict_v2(
         contributors.append((_ndesc, _nd))
 
     # ---- Confidence dampening (thin data coverage) ----
-    # When the Composite Score was built from only a few sub-scores, the context
-    # modifiers above can swing a poorly-supported base too far (e.g. push a
-    # 2-input composite to a strong BUY on momentum alone). Shrink the *net
-    # modifier* toward neutral in proportion to how complete the data is. The
-    # composite base itself is left untouched — only our confidence in the
-    # context tilt drops. `coverage` is the fraction of composite weight that
-    # had data (0-1); >=0.85 (essentially every sub-score) keeps full strength.
+    # When the base was built from only a few inputs, the context modifiers
+    # above can swing a poorly-supported base too far (e.g. push a 2-input
+    # composite to a strong BUY on momentum alone). Shrink the *net modifier*
+    # toward neutral in proportion to how complete the data is. The base itself
+    # is left untouched — only our confidence in the context tilt drops.
+    # `coverage` is the fraction of the base's weight that had data (0-1);
+    # >=0.85 (essentially every input) keeps full strength.
     confidence = None
     if coverage is not None:
         if coverage >= 0.85:
@@ -2483,7 +2695,161 @@ def compute_verdict_v2(
     reason = headline + " | " + " | ".join(breakdown_lines)
 
     return Verdict(label=label, color=color, reason=reason, score=round(score, 1),
-                   coverage=coverage, confidence=confidence)
+                   coverage=coverage, confidence=confidence, base_mode=base_mode)
+
+
+def _verdict_base(
+    mode: str,
+    *,
+    composite_score: Optional[float],
+    composite_coverage: Optional[float],
+    quality_base: Optional[float],
+    quality_coverage: Optional[float],
+    filters: Optional[list],
+    filter_score: Optional[float],
+    score_analyst: Optional[float],
+    score_insider: Optional[float],
+) -> tuple[Optional[float], Optional[float], str]:
+    """Pick compute_verdict_v2's starting score for a base-score mode.
+
+    Returns (base, coverage, breakdown line). base is None when the mode has
+    nothing to build from; the line is the first row of the hover breakdown
+    (the card parser takes the first non-±N segment as the base). Anything but
+    quality/blend is treated as composite."""
+    if mode == "quality":
+        if quality_base is None:
+            return None, quality_coverage, "Quality base unavailable, neutral baseline"
+        detail = _quality_base_detail(filters, filter_score, score_analyst, score_insider)
+        return quality_base, quality_coverage, f"Quality base {quality_base:.0f} — {detail}"
+
+    if mode == "blend":
+        sides = [(name, val, cov) for name, val, cov in (
+            ("composite", composite_score, composite_coverage),
+            ("quality", quality_base, quality_coverage),
+        ) if val is not None]
+        if not sides:
+            return None, None, "Blend base unavailable, neutral baseline"
+        base = round(sum(val for _, val, _ in sides) / len(sides), 1)
+        covs = [cov for _, _, cov in sides if cov is not None]
+        coverage = round(sum(covs) / len(covs), 3) if covs else None
+        if len(sides) == 2:
+            detail = f"composite {composite_score:.0f}, quality {quality_base:.0f}"
+        else:
+            name, val, _ = sides[0]
+            missing = "quality" if name == "composite" else "composite"
+            detail = f"{name} {val:.0f} only ({missing} unavailable)"
+        return base, coverage, f"Blend base {base:.0f} — {detail}"
+
+    if composite_score is None:
+        return None, composite_coverage, "Composite Score unavailable, neutral baseline"
+    base = float(composite_score)
+    return base, composite_coverage, f"Composite Score {base:.0f}"
+
+
+def _quality_base_detail(filters: Optional[list], filter_score: Optional[float],
+                         score_analyst: Optional[float],
+                         score_insider: Optional[float]) -> str:
+    """The parts of a quality base for its breakdown line, e.g.
+    'filters 82 (7/9 pass), analyst 70, insider 48'."""
+    filters = filters or []
+    if filter_score is None:
+        parts = ["filters n/a"]
+    else:
+        passed = sum(1 for f in filters if f.passed)
+        note = f"{passed}/{len(filters)} pass"
+        no_data = sum(1 for f in filters if f.credit is None)
+        if no_data:
+            note += f", {no_data} without data"
+        parts = [f"filters {filter_score:.0f} ({note})"]
+    parts.append("analyst n/a" if score_analyst is None else f"analyst {score_analyst:.0f}")
+    parts.append("insider n/a" if score_insider is None else f"insider {score_insider:.0f}")
+    return ", ".join(parts)
+
+
+def _insider_signal(pa) -> Optional[str]:
+    """Coarse insider bucket for compute_verdict_v2's `insider_signal` (kept for
+    its signature; the verdict itself scores insiders only through the base)."""
+    if not pa.insider_activity:
+        return None
+    sig = pa.insider_activity.get("net_signal", "")
+    if sig == "Buying":
+        return "supports_buy"
+    if sig == "Selling" and pa.score_insider is not None and pa.score_insider <= 35:
+        return "caution"
+    return "no_signal"
+
+
+def has_verdict_base(pa, mode: str) -> bool:
+    """Whether `pa` has what `mode` builds its base from."""
+    if mode == "quality":
+        return pa.quality_base is not None
+    if mode == "blend":
+        return pa.composite_score is not None or pa.quality_base is not None
+    return pa.composite_score is not None
+
+
+def _verdict_v2_under(pa, mode: str, is_holding: bool,
+                      position_pct: Optional[float]) -> Optional[Verdict]:
+    if not has_verdict_base(pa, mode):
+        return None
+    return compute_verdict_v2(
+        composite_score=pa.composite_score,
+        filters=pa.filters,
+        current_price=pa.current_price,
+        target_price=pa.target_mean,
+        upside_pct=pa.upside_pct,
+        trend=pa.trend,
+        pct_above_ma200=pa.pct_above_ma200,
+        week52_position=pa.week52_position,
+        sector_label=(pa.sector_momentum or {}).get("label"),
+        insider_signal=_insider_signal(pa),
+        position_pct_portfolio=position_pct,
+        is_holding=is_holding,
+        news_signal=pa.news_sentiment,
+        coverage=pa.composite_coverage,
+        base_mode=mode,
+        quality_base=pa.quality_base,
+        quality_coverage=pa.quality_coverage,
+        filter_score=pa.filter_score,
+        score_analyst=pa.score_analyst,
+        score_insider=pa.score_insider,
+    )
+
+
+def verdicts_v2_for(pa, *, is_holding: bool,
+                    position_pct: Optional[float] = None) -> dict[str, Verdict]:
+    """The v2 verdict for a position under every base-score mode that has a
+    base to start from, each with `alternates` holding the others' label and
+    score. `position_pct` is the live portfolio weight, known only once
+    finalize_holding_verdicts has run."""
+    verdicts = {}
+    for mode in BASE_SCORE_MODES:
+        verdict = _verdict_v2_under(pa, mode, is_holding, position_pct)
+        if verdict is not None:
+            verdicts[mode] = verdict
+    for mode, verdict in verdicts.items():
+        verdict.alternates = {other: (v.label, v.score)
+                              for other, v in verdicts.items() if other != mode}
+    return verdicts
+
+
+def set_v2_verdicts(pa, *, is_holding: bool,
+                    position_pct: Optional[float] = None) -> None:
+    """Score `pa` under every mode. pa.verdicts keeps them all for the report's
+    instant base switch; pa.verdict is the run's mode — what watchlist pruning,
+    tax flags and the history ledger act on."""
+    pa.verdicts = verdicts_v2_for(pa, is_holding=is_holding,
+                                  position_pct=position_pct)
+    pa.verdict = pa.verdicts.get(base_score_mode(), pa.verdict)
+
+
+def verdict_in(r, mode: Optional[str]) -> Optional[Verdict]:
+    """r's verdict under `mode`. Falls back to the run's verdict for mode None
+    and for positions without per-mode verdicts (ETF/thematic, fallback
+    verdicts), whose verdict doesn't depend on the base."""
+    if mode is None:
+        return r.verdict
+    return (getattr(r, "verdicts", None) or {}).get(mode) or r.verdict
 
 
 def _verdict_headline(label: str, score: float,
@@ -2804,6 +3170,13 @@ class PositionAnalysis:
     # Fraction of the composite's weight (0-1) that had data behind it — a
     # data-completeness measure used to express verdict confidence.
     composite_coverage: Optional[float] = None
+    # `quality` base-score mode inputs (compute_quality_base): the nine filters
+    # as a soft-gated 0-100 score + the share that had data, and the mode's
+    # base (filters 70%, analyst 15%, insider 15%) + its coverage.
+    filter_score: Optional[float] = None
+    filter_coverage: Optional[float] = None
+    quality_base: Optional[float] = None
+    quality_coverage: Optional[float] = None
     # Next earnings report (event-risk timing): ISO date + days from today.
     # days_to_earnings is forward-only (None once a report is in the past).
     next_earnings_date: Optional[str] = None
@@ -2814,6 +3187,9 @@ class PositionAnalysis:
     news_sentiment: Optional[dict] = None
     # Output
     verdict: Optional[Verdict] = None
+    # v2 verdict under every base-score mode ({mode: Verdict}); `verdict` is
+    # the run's mode. Empty for ETF/thematic and fallback verdicts.
+    verdicts: dict = field(default_factory=dict)
     error: Optional[str] = None
     # Holding period / tax
     position_opened: Optional[str] = None     # ISO date string or None
@@ -3181,43 +3557,21 @@ def analyze_position(
 
         # Composite scoring (now includes insider as 5th sub-score)
         compute_composite_score(pa, info)
+        # Quality base-score mode (nine filters + the analyst/insider above)
+        if pa.bucket == "compounder":
+            compute_quality_base(pa)
 
         # ---- Evidence-weighted v2 verdict (replaces the preliminary one above) ----
         # Run for compounders (both held and watchlist). The v2 logic uses every
-        # available signal — composite score, trend, insider, sector, valuation,
-        # 52-week position, quality — to produce a single weighted verdict with
-        # full transparency in the reason text.
-        if pa.bucket == "compounder" and pa.composite_score is not None:
-            insider_signal = None
-            if pa.insider_activity:
-                sig = pa.insider_activity.get("net_signal", "")
-                ins_score = pa.score_insider
-                if sig == "Buying":
-                    insider_signal = "supports_buy"
-                elif sig == "Selling" and ins_score is not None and ins_score <= 35:
-                    insider_signal = "caution"
-                else:
-                    insider_signal = "no_signal"
-            sector_label = (pa.sector_momentum or {}).get("label")
+        # available signal — the base score (see BASE_SCORE_MODES), trend,
+        # sector, valuation, 52-week position, news — to produce a single
+        # weighted verdict with full transparency in the reason text.
+        if pa.bucket == "compounder" and has_verdict_base(pa, base_score_mode()):
             # Latest-news sentiment: Claude when ANTHROPIC_API_KEY is set, else
             # a free headline lexicon (no key/cost). Cached on disk so warm runs
             # re-fetch nothing. Disable entirely with NEWS_SIGNAL=0.
             pa.news_sentiment = score_news_sentiment(ticker, pa.name)
-            pa.verdict = compute_verdict_v2(
-                composite_score=pa.composite_score,
-                filters=pa.filters,
-                current_price=pa.current_price,
-                target_price=pa.target_mean,
-                upside_pct=pa.upside_pct,
-                trend=pa.trend,
-                pct_above_ma200=pa.pct_above_ma200,
-                week52_position=pa.week52_position,
-                sector_label=sector_label,
-                insider_signal=insider_signal,
-                is_holding=not is_watchlist,
-                news_signal=pa.news_sentiment,
-                coverage=pa.composite_coverage,
-            )
+            set_v2_verdicts(pa, is_holding=not is_watchlist)
 
     except Exception as e:
         pa.error = f"{type(e).__name__}: {e}"
@@ -3446,6 +3800,58 @@ def _gh_repo_slug() -> str:
     return ""
 
 
+_BASE_DEFAULT_NOTE = " ★ The default for scheduled runs."
+_BASE_SCORE_BLURBS = {
+    "composite": "the Composite Score (quality 30%, growth 20%, value 20%, "
+                 "analyst 15%, insider 15%)",
+    "quality": "the nine quality filters (70%; near misses earn partial "
+               "credit) plus the analyst (15%) and insider (15%) scores",
+    "blend": "the average of the Composite and Quality bases",
+}
+
+
+def _base_switch_html(interactive: bool) -> str:
+    """Header segmented control for the verdict base score (BASE_SCORE_MODES).
+
+    Every mode is already in the report, so a segment switches the view
+    instantly (the base-view script); the pressed one starts as the run's mode.
+    ★ marks the saved default: what scheduled runs use for watchlist pruning,
+    tax flags and the missed-opportunity history. When interactive, a "Make
+    default" button saves the viewed mode as that default (the script in
+    _build_refresh_widget)."""
+    run_mode = base_score_mode()
+    saved = base_score_mode(saved_only=True)
+    buttons = []
+    for mode in BASE_SCORE_MODES:
+        name = BASE_SCORE_LABELS[mode]
+        title = f"{name}: verdicts start from {_BASE_SCORE_BLURBS[mode]}."
+        full_title, mark = title, ""
+        if mode == saved:
+            full_title += _BASE_DEFAULT_NOTE
+            mark = "<span class='base-default-mark' aria-hidden='true'>★</span>"
+        buttons.append(
+            f'<button type="button" data-mode="{mode}" '
+            f'aria-pressed="{"true" if mode == run_mode else "false"}" '
+            f'data-title="{title}" title="{full_title}">{name}{mark}</button>')
+    label_tip = ("Verdict base score: what every verdict starts from. All three "
+                 "are in this report, so switching is instant. ★ marks the "
+                 "default that scheduled runs use for watchlist pruning, tax "
+                 "flags and the missed-opportunity history.")
+    if run_mode != saved:
+        label_tip += (f" This run used {BASE_SCORE_LABELS[run_mode]} for those "
+                      f"(a one-off override).")
+    html = (f'<div class="base-switch" id="baseScoreSwitch" role="group" '
+            f'aria-label="Verdict base score" data-run="{run_mode}" '
+            f'data-saved="{saved}">'
+            f'<span class="base-switch-label" title="{label_tip}">Base</span>'
+            + "".join(buttons) + "</div>")
+    if interactive:
+        html += ('<button type="button" class="refresh-btn base-default-btn" '
+                 'id="baseDefaultBtn" hidden title="Save the viewed base score '
+                 'as the default for scheduled runs">★ Make default</button>')
+    return html
+
+
 def _build_refresh_widget() -> tuple[str, str]:
     """Button + JS that triggers the Actions workflow_dispatch from the report.
 
@@ -3456,15 +3862,19 @@ def _build_refresh_widget() -> tuple[str, str]:
 
     Returns (button_html, status_and_script_html) so the button can sit in
     the header controls cluster while the status line + script live below.
-    Both are "" when the repo can't be resolved.
+    When the repo can't be resolved there is nothing to dispatch to: the
+    buttons are just a read-only base-score indicator and the script is "".
     """
     repo = _gh_repo_slug()
     if not repo:
-        return "", ""
+        return _base_switch_html(interactive=False), ""
+    # Base-score switch first; the script below saves its "Make default"
+    # choice as the BASE_SCORE_MODE repository variable.
     # Tax toggle sits before the refresh button. Its state lives in
     # localStorage; when on, the dispatch below sends include_tax=true so the
     # regenerated report contains the Tax-Aware Trim Guidance section.
-    button = ('<button id="taxSectionToggle" class="refresh-btn tax-toggle" '
+    button = _base_switch_html(interactive=True)
+    button += ('<button id="taxSectionToggle" class="refresh-btn tax-toggle" '
               'aria-pressed="false" '
               'title="Include the Tax-Aware Trim Guidance section in the '
               'next data refresh">'
@@ -3489,6 +3899,9 @@ def _build_refresh_widget() -> tuple[str, str]:
   var TOKEN_KEY = "gh-dispatch-token";
   var TAX_KEY = "tax-section-enabled";
   var MISS_KEY = "miss-analysis-enabled";
+  var BASE_VAR = "BASE_SCORE_MODE";   // repository variable the workflow reads
+  var BASE_LABELS = __BASE_LABELS__;
+  var DEFAULT_NOTE = __DEFAULT_NOTE__;
   var pollTimer = null, startedAt = null;
 
   function taxEnabled() {
@@ -3544,6 +3957,85 @@ def _build_refresh_widget() -> tuple[str, str]:
     });
     paint();
   })();
+  // "Make default" for the base-score switch. The switch itself is instant
+  // (every mode is in the report); the default is what scheduled runs use for
+  // watchlist pruning, tax flags and the missed-opportunity history. Those
+  // runs dispatch with no inputs, so it lives in the BASE_SCORE_MODE
+  // repository variable (token needs Variables: write).
+  (function() {
+    var sw = document.getElementById("baseScoreSwitch");
+    var btn = document.getElementById("baseDefaultBtn");
+    if (!sw || !btn) return;
+    function viewed() {
+      return document.documentElement.getAttribute("data-base-view");
+    }
+    function sync() {
+      var mode = viewed();
+      btn.hidden = !BASE_LABELS[mode] || mode === sw.getAttribute("data-saved");
+      btn.textContent = "\\u2605 Make " + (BASE_LABELS[mode] || "") + " default";
+    }
+    function markSaved(mode) {
+      sw.setAttribute("data-saved", mode);
+      sw.querySelectorAll("button[data-mode]").forEach(function(b) {
+        var isDefault = b.getAttribute("data-mode") === mode;
+        var mark = b.querySelector(".base-default-mark");
+        if (isDefault && !mark) {
+          mark = document.createElement("span");
+          mark.className = "base-default-mark";
+          mark.setAttribute("aria-hidden", "true");
+          mark.textContent = "\\u2605";
+          b.appendChild(mark);
+        } else if (!isDefault && mark) {
+          mark.remove();
+        }
+        b.title = b.getAttribute("data-title") + (isDefault ? DEFAULT_NOTE : "");
+      });
+      sync();
+    }
+    function send(tok, method, url, body) {
+      return fetch(url, {method: method, headers: headers(tok),
+                         body: JSON.stringify(body)})
+        .then(function(r) { return r.status; });
+    }
+    async function saveDefault(tok, mode) {
+      var body = {name: BASE_VAR, value: mode};
+      var status = await send(tok, "PATCH", API + "/actions/variables/" + BASE_VAR, body);
+      if (status === 404) {   // first save: the variable doesn't exist yet
+        status = await send(tok, "POST", API + "/actions/variables", body);
+      }
+      return status;
+    }
+    btn.addEventListener("click", async function() {
+      var mode = viewed(), name = BASE_LABELS[mode];
+      if (!name) return;
+      if (!confirm("Make " + name + " the default base score?\\n\\n" +
+                   "Scheduled runs will use it for watchlist pruning, tax flags " +
+                   "and the missed-opportunity history (the " + BASE_VAR +
+                   " repository variable). Every base stays one click away " +
+                   "in the report.")) return;
+      var tok = getToken(false);
+      if (!tok) return;
+      btn.disabled = true;
+      setStatus("Saving " + name + " as the default base score\\u2026");
+      var status = null;
+      try { status = await saveDefault(tok, mode); }
+      catch (e) { setStatus("Network error: " + e, true); }
+      btn.disabled = false;
+      if (status === 204 || status === 201) {
+        markSaved(mode);
+        setStatus(name + " is now the default base score for scheduled runs.");
+      } else if (status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        setStatus("Token rejected (HTTP 401) \\u2014 click Make default again " +
+                  "to re-enter it.", true);
+      } else if (status !== null) {
+        setStatus("Couldn't save the default (HTTP " + status + "): the token " +
+                  "needs \\u201cVariables: Read and write\\u201d on " + REPO + ".", true);
+      }
+    });
+    document.addEventListener("basescorechange", sync);
+    sync();
+  })();
 
   function setStatus(msg, isError) {
     var el = document.getElementById("ghRefreshStatus");
@@ -3563,7 +4055,9 @@ def _build_refresh_widget() -> tuple[str, str]:
         "Create one at github.com -> Settings -> Developer settings -> " +
         "Fine-grained tokens:\\n" +
         "  - Repository access: only " + REPO + "\\n" +
-        "  - Permissions: Actions = Read and write\\n\\n" +
+        "  - Permissions: Actions = Read and write\\n" +
+        "    (plus Variables = Read and write, so the Base switch can save\\n" +
+        "    its choice for scheduled runs)\\n\\n" +
         "It is stored only in this browser (localStorage), never on any server.");
       if (tok) localStorage.setItem(TOKEN_KEY, tok.trim());
     }
@@ -3652,7 +4146,10 @@ def _build_refresh_widget() -> tuple[str, str]:
 })();
 </script>
 """
-    return button, widget.replace("__REPO__", repo)
+    widget = (widget.replace("__REPO__", repo)
+              .replace("__BASE_LABELS__", json.dumps(BASE_SCORE_LABELS))
+              .replace("__DEFAULT_NOTE__", json.dumps(_BASE_DEFAULT_NOTE)))
+    return button, widget
 
 
 # For sortable verdict column: most urgent action first.
@@ -3675,19 +4172,96 @@ def _score_strength_color(s: float) -> str:
     return "var(--pos-down)"
 
 
+def _mode_variants(render, tag: str = "span") -> str:
+    """HTML for every base-score mode, of which the report shows only the
+    viewed one (html[data-base-view] + the .bmode rules in _base_view_css).
+
+    `render(mode)` builds one variant. Modes that render the same HTML share
+    a single copy; if all do, it comes back unwrapped. Empty variants get no
+    wrapper, so those modes show nothing. Copies the run's mode doesn't use
+    also carry an inline display:none, so a client that drops the stylesheet
+    (an email) still shows exactly one."""
+    run_mode = base_score_mode()
+    groups: dict[str, list[str]] = {}
+    for mode in BASE_SCORE_MODES:
+        groups.setdefault(render(mode), []).append(mode)
+    if len(groups) == 1:
+        return next(iter(groups))
+    out = []
+    for html, modes in groups.items():
+        if not html:
+            continue
+        classes = " ".join(f"bmode-{m}" for m in modes)
+        hidden = "" if run_mode in modes else " style='display:none'"
+        out.append(f"<{tag} class='bmode {classes}'{hidden}>{html}</{tag}>")
+    return "".join(out)
+
+
+def _base_view_css() -> str:
+    """CSS that shows only the viewed mode's copy of each .bmode variant."""
+    hide = ",\n".join(f"html[data-base-view='{m}'] .bmode:not(.bmode-{m})"
+                      for m in BASE_SCORE_MODES)
+    show = ",\n".join(f"html[data-base-view='{m}'] .bmode.bmode-{m}"
+                      for m in BASE_SCORE_MODES)
+    return (f"{hide} {{ display: none !important; }}\n"
+            f"{show} {{ display: contents !important; }}\n")
+
+
+def tax_flagged(verdict: Optional[Verdict]) -> bool:
+    """Whether a verdict puts its position in the tax section: SELL/TRIM, or a
+    verdict score below TAX_FLAG_SCORE_THRESHOLD."""
+    if not verdict:
+        return False
+    return (verdict.label in ("SELL", "TRIM")
+            or (verdict.score is not None
+                and verdict.score < TAX_FLAG_SCORE_THRESHOLD))
+
+
+def _verdict_sort_value(verdict: Optional[Verdict]):
+    """Verdict column sort key: the score, else the label's urgency order."""
+    if verdict and verdict.score is not None:
+        return verdict.score
+    return 100 - _VERDICT_ORDER.get(verdict.label if verdict else "—", 99)
+
+
+def _mode_orders(rows: list, key) -> dict[int, dict[str, int]]:
+    """{id(row): {mode: index}}: each row's place in its table's default order
+    (key(row, mode), highest first) under every base-score mode, for the base
+    switch to re-sort by. Empty when no row has per-mode verdicts."""
+    if not any(getattr(r, "verdicts", None) for r in rows):
+        return {}
+    orders: dict[int, dict[str, int]] = {id(r): {} for r in rows}
+    for mode in BASE_SCORE_MODES:
+        ranked = sorted(rows, key=lambda r: key(r, mode), reverse=True)
+        for index, r in enumerate(ranked):
+            orders[id(r)][mode] = index
+    return orders
+
+
+def _verdict_td(r) -> str:
+    """The verdict <td>: one cell per base-score mode, and a sort value per
+    mode that the base switch copies into data-sort."""
+    days = getattr(r, "days_to_earnings", None)
+    cell = _mode_variants(lambda m: _verdict_cell(verdict_in(r, m), days))
+    per_mode = "".join(f" data-sort-{m}='{_verdict_sort_value(verdict_in(r, m))}'"
+                       for m in BASE_SCORE_MODES) if r.verdicts else ""
+    return f"<td data-sort='{_verdict_sort_value(r.verdict)}'{per_mode}>{cell}</td>"
+
+
 def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
     """Render the verdict pill + 0-100 score with a styled hover-card breakdown.
 
     Layout: a colored verdict pill (label) and the numeric score sit side by
     side. Hovering the cell reveals a styled card that breaks the score down
-    factor by factor — the Composite Score base, then each +/- modifier (trend,
-    sector, upside, news, ...) — topped with a 0-100 strength bar. The card also
-    surfaces data-coverage confidence and, when known, the next-earnings date.
+    factor by factor — the base score (Composite, Quality or Blend), then each
+    +/- modifier (trend, sector, upside, news, ...) — topped with a 0-100
+    strength bar. The card also surfaces data-coverage confidence, the verdict
+    under the other base-score modes, and, when known, the next-earnings date.
     At-a-glance markers sit beside the score: an amber dot for thin-data (Low)
     confidence and a calendar glyph when earnings are within a week.
 
     v2 verdict reasons are structured as
-        headline | Composite Score N | +X · factor | -Y · factor | = verdict score N
+        headline | <base line> | +X · factor | -Y · factor | = verdict score N
     which we parse into the card. Non-v2 verdicts (ETF/thematic — no numeric
     score) fall back to the simple pill + native tooltip. The score also lives
     in the parent <td> data-sort so the column sorts by conviction strength.
@@ -3712,7 +4286,8 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
     sc = _score_strength_color(score)
     parts = [p.strip() for p in reason.split(" | ")]
     headline = parts[0] if parts else ""
-    # parts[1] = Composite Score base; middle = factor lines; last = "= verdict score N"
+    # parts[1] = base line (e.g. "Composite Score N"); middle = factor lines;
+    # last = "= verdict score N"
     base_line = ""
     factor_rows = []
     for seg in parts[1:]:
@@ -3768,6 +4343,16 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
         if soon:
             cell_marker += "<span class='vmark vmark-earn' aria-hidden='true'>📅</span>"
 
+    # The same verdict under the other base-score modes, for comparing them
+    # before switching (see BASE_SCORE_MODES).
+    alt_html = ""
+    alternates = getattr(verdict, "alternates", None) or {}
+    alt_bits = [f"{BASE_SCORE_LABELS.get(m, m)} base: {alt_label} {alt_score:.0f}"
+                for m, (alt_label, alt_score) in alternates.items()
+                if alt_score is not None]
+    if alt_bits:
+        alt_html = f"<div class='valt'>{_esc(' · '.join(alt_bits))}</div>"
+
     card = (
         f"<div class='vcard' role='tooltip'>"
         f"<div class='vcard-head'>"
@@ -3775,13 +4360,14 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
         f"<span class='vcard-score' style='color:{sc};'>{score:.0f}</span></div>"
         f"{bar}{conf_html}{base_html}"
         f"<div class='vrows'>{''.join(factor_rows)}</div>"
-        f"{earn_html}"
+        f"{alt_html}{earn_html}"
         f"</div>"
     )
     # No native title= (it duplicated, and lagged behind, the styled card on
     # desktop). The full breakdown still reaches touch devices via data-tip,
     # which the mobile tap-to-reveal sheet reads.
-    mobile_tip = _esc(reason.replace(" | ", "\n"))
+    mobile_tip = _esc(reason.replace(" | ", "\n")
+                      + ("\n" + " · ".join(alt_bits) if alt_bits else ""))
     return (
         f"<span class='vcell' data-tip='{mobile_tip}'>"
         f"<span class='verdict' style='background:{color};'>{label}</span>"
@@ -3800,8 +4386,28 @@ def _td(value: str, sort_value, css_class: str = "") -> str:
     return f"<td{cls} data-sort='{sv}'>{value}</td>"
 
 
-def _tr_open(r) -> str:
-    """Open a <tr> with data attributes used by the filter bar."""
+def _rank_move_attrs(move: Optional[dict]) -> tuple[str, object]:
+    """(data-rank-move, data-rank-delta) for a rank movement: up/down/new/''
+    and the signed places gained (+climbed / -slipped) for magnitude filters."""
+    if not move:
+        return "", ""
+    if move.get("new"):
+        return "new", ""
+    delta = move.get("delta") or 0
+    if delta > 0:
+        return "up", delta
+    if delta < 0:
+        return "down", delta
+    return "", ""
+
+
+def _tr_open(r, orders: Optional[dict[str, int]] = None) -> str:
+    """Open a <tr> with data attributes used by the filter bar.
+
+    Rows with per-mode verdicts also carry each mode's verdict, score, rank
+    movement and tax flag (data-<attr>-<mode>), which the base switch copies
+    into the plain attributes. `orders` ({mode: index}) is the row's place in
+    its table's default order under each mode."""
     verdict = (r.verdict.label if r.verdict else "") or ""
     # Verdict numeric score (0-100), separate from the label
     verdict_score = ("" if (not r.verdict or r.verdict.score is None)
@@ -3849,22 +4455,25 @@ def _tr_open(r) -> str:
         else:
             insider = "no_signal"
     # Rank movement vs the previous day (set by _attach_rank_moves; may be
-    # absent in lookup mode). data-rank-move: up/down/new/''; data-rank-delta is
-    # the signed places gained (+climbed / -slipped) for magnitude filters.
-    rank_move = ""
-    rank_delta = ""
-    _rm = getattr(r, "_rank_move", None)
-    if _rm:
-        if _rm.get("new"):
-            rank_move = "new"
-        else:
-            _d = _rm.get("delta") or 0
-            if _d > 0:
-                rank_move, rank_delta = "up", _d
-            elif _d < 0:
-                rank_move, rank_delta = "down", _d
+    # absent in lookup mode).
+    rank_move, rank_delta = _rank_move_attrs(getattr(r, "_rank_move", None))
     # Whether tax analysis is populated (for "show tax-relevant" filter)
     has_tax = "1" if getattr(r, "tax", None) is not None else "0"
+    # The same per base-score mode. Tax detail is computed for positions any
+    # mode flags, but only counts in the modes that flag it.
+    per_mode = ""
+    if getattr(r, "verdicts", None):
+        moves = getattr(r, "_rank_moves", None) or {}
+        for m in BASE_SCORE_MODES:
+            v = verdict_in(r, m)
+            m_move, m_delta = _rank_move_attrs(moves.get(m))
+            m_tax = "1" if has_tax == "1" and tax_flagged(v) else "0"
+            per_mode += (f"data-verdict-{m}='{v.label if v else ''}' "
+                         f"data-verdict-score-{m}='{'' if not v or v.score is None else v.score}' "
+                         f"data-rank-move-{m}='{m_move}' data-rank-delta-{m}='{m_delta}' "
+                         f"data-has-tax-{m}='{m_tax}' ")
+    for m, index in (orders or {}).items():
+        per_mode += f"data-order-{m}='{index}' "
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
     earnings_days = "" if getattr(r, "days_to_earnings", None) is None else r.days_to_earnings
     # News sentiment — label (bullish/neutral/bearish) drives the news facet;
@@ -3892,6 +4501,7 @@ def _tr_open(r) -> str:
         f"data-recommendation='{recommendation}' "
         f"data-has-tax='{has_tax}' "
         f"data-rank-move='{rank_move}' data-rank-delta='{rank_delta}' "
+        f"{per_mode}"
         f"data-search='{search_text}'>"
     )
 
@@ -3977,9 +4587,16 @@ def _trend_cell(r) -> str:
 
 def _rank_move_badge(r) -> str:
     """Small ▲/▼/NEW chip showing rank movement vs the previous day (rank is by
-    verdict score within the ticker's table). Unchanged rows render nothing, to
-    keep tables clean. Movement is set on r._rank_move by _attach_rank_moves."""
-    move = getattr(r, "_rank_move", None)
+    verdict score within the ticker's table), one per base-score mode.
+    Unchanged rows render nothing, to keep tables clean. Movement is set on
+    r._rank_moves / r._rank_move by _attach_rank_moves."""
+    moves = getattr(r, "_rank_moves", None)
+    if moves:
+        return _mode_variants(lambda m: _rank_badge_html(moves.get(m)))
+    return _rank_badge_html(getattr(r, "_rank_move", None))
+
+
+def _rank_badge_html(move: Optional[dict]) -> str:
     if not move:
         return ""
     base = ("font-size:8px;font-weight:700;padding:1px 4px;border-radius:6px;"
@@ -4382,10 +4999,17 @@ def _insider_cell(activity: Optional[dict]) -> str:
 
 
 def _filter_dots(filters: list[FilterResult]) -> str:
-    """Render filter pass/fail as colored dots with hover tooltip."""
+    """Render filter pass/fail as colored dots with hover tooltip. A grey dot
+    is a filter with no data (left out of the quality-filter score); a red
+    dot's tooltip shows any partial soft-gate credit it still earns."""
     parts = []
     for f in filters:
-        color = "#27ae60" if f.passed else "#c0392b"
+        if f.passed:
+            color = "#27ae60"
+        elif f.credit is None:
+            color = "#95a5a6"
+        else:
+            color = "#c0392b"
         # Format actual value with units. For filters whose `note` is empty
         # or a "%" unit indicator, treat it as the unit suffix (legacy
         # behavior). For filters whose `note` is descriptive metadata
@@ -4402,11 +5026,41 @@ def _filter_dots(filters: list[FilterResult]) -> str:
             # then append the note as context.
             actual_str = f"{f.actual:.1f}% ({f.note})"
         title = f"{f.name}: {actual_str} (threshold {f.threshold})"
+        if f.credit is None and not f.passed:
+            title += " · no data, left out of the quality score"
+        elif not f.passed and f.credit:
+            title += f" · near miss, {f.credit * 100:.0f}% credit in the quality score"
         parts.append(
             f'<span title="{title}" class="qdot" '
             f'style="background:{color};"></span>'
         )
     return "".join(parts)
+
+
+def _filter_count_html(r, passed: int) -> str:
+    """The 'N/9' beside the filter dots; its tooltip carries the soft-gated
+    quality-filter score the Quality base score is built from."""
+    style = "color:var(--fg-muted);font-size:11px"
+    if r.filter_score is None:
+        return f"<span style='{style}'>{passed}/9</span>"
+    rated = sum(1 for f in r.filters if f.credit is not None)
+    tip = (f"Quality-filter score {r.filter_score:.0f}/100: near misses earn "
+           f"partial credit; {rated} of {len(r.filters)} filters had data")
+    return f"<span style='{style};cursor:help;' title='{tip}'>{passed}/9</span>"
+
+
+def _verdict_th() -> str:
+    """Verdict column header. Its tooltip names no single base: the Base
+    switch changes that in the page. `verdict-th` lets the switch re-sort a
+    table the reader sorted by this column."""
+    return (
+        "<th class='verdict-th' title='Verdict score (0-100): starts from the base "
+        "score picked with the Base switch (Composite, Quality or Blend), then adds "
+        "trend, sector, 52-week position, upside to target, position size and "
+        "news. Hover a verdict for the breakdown.' style='cursor:help;'>"
+        "Verdict <span style='color:var(--fg-faint);font-weight:400;font-size:10px;"
+        "text-transform:none;letter-spacing:0;'>(score)</span></th>"
+    )
 
 
 def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
@@ -4796,33 +5450,31 @@ def _render_tax_section(flagged: list,
         except Exception as e:
             print(f"[tax-section] Could not render YTD summary: {e}")
 
-    # ---------- Per-position trim guidance (existing behavior) ----------
+    # ---------- Per-position trim guidance ----------
+    # Tax detail exists for every position any base-score mode flags; each
+    # mode shows only the cards its own verdicts flag (see tax_flagged).
+    flagged = [r for r in flagged if r.tax is not None]
     if flagged:
         html += "<h3 style='margin-top:32px;'>Per-Position Trim Detail</h3>\n"
 
+        def _none_flagged(mode):
+            if any(tax_flagged(verdict_in(r, mode)) for r in flagged):
+                return ""
+            return ("<p style='color:var(--fg-muted);font-size:12px;'>No positions "
+                    f"are flagged under the {BASE_SCORE_LABELS[mode]} base score.</p>")
+        html += _mode_variants(_none_flagged, tag="div")
+
     for r in flagged:
         ta = r.tax
-        if ta is None:
-            continue  # tax analysis failed for this one — don't render a broken card
-        verdict_color = r.verdict.color if r.verdict else "#7f8c8d"
-        # Header row
-        html += (
-            f"<div style='border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-card);"
-            f"padding:14px 16px;margin-bottom:14px;'>"
-        )
-        html += (
-            f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'>"
-            f"<span class='ticker' style='font-size:15px;'>{r.ticker}</span>"
-            f"<span class='verdict' style='background:{verdict_color}'>"
-            f"{r.verdict.label}</span>"
-        )
+        # Everything but the verdict pill is the same in every mode.
+        card = ""
         # Holding period badge
         if getattr(ta, "has_lots", False) and ta.lt_shares and ta.st_shares:
-            html += (f"<span style='font-size:11px;background:var(--bg-chip-amber);color:var(--fg-chip-amber);"
+            card += (f"<span style='font-size:11px;background:var(--bg-chip-amber);color:var(--fg-chip-amber);"
                      f"padding:3px 8px;border-radius:4px;'>Mixed: "
                      f"{ta.lt_shares:g} LT + {ta.st_shares:g} ST</span>")
         elif ta.is_long_term is True:
-            html += ("<span style='font-size:11px;background:var(--bg-chip-green);color:var(--fg-chip-green);"
+            card += ("<span style='font-size:11px;background:var(--bg-chip-green);color:var(--fg-chip-green);"
                      "padding:3px 8px;border-radius:4px;'>Long-term ✓</span>")
         elif ta.is_long_term is False:
             badge = "Short-term"
@@ -4830,12 +5482,12 @@ def _render_tax_section(flagged: list,
                 badge += f" · {ta.next_lot_to_lt_days}d to long-term"
             elif ta.days_to_long_term is not None:
                 badge += f" · {ta.days_to_long_term}d to long-term"
-            html += (f"<span style='font-size:11px;background:var(--bg-chip-red);color:var(--fg-chip-red);"
+            card += (f"<span style='font-size:11px;background:var(--bg-chip-red);color:var(--fg-chip-red);"
                      f"padding:3px 8px;border-radius:4px;'>{badge}</span>")
         else:
-            html += ("<span style='font-size:11px;background:var(--bg-chip-neutral);color:var(--fg-chip-neutral);"
+            card += ("<span style='font-size:11px;background:var(--bg-chip-neutral);color:var(--fg-chip-neutral);"
                      "padding:3px 8px;border-radius:4px;'>Holding period unknown</span>")
-        html += "</div>\n"
+        card += "</div>\n"
 
         # Gain + tax estimate line
         gain = ta.unrealized_gain
@@ -4847,8 +5499,8 @@ def _render_tax_section(flagged: list,
             st_g = ta.st_gain or 0
             lt_tax = ta.lt_tax or 0
             st_tax = ta.st_tax or 0
-            html += "<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
-            html += (
+            card += "<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
+            card += (
                 f"<table style='margin:0;font-size:12px;width:auto;"
                 f"border-collapse:collapse;'>"
                 f"<tr><th style='background:#fff;color:#7f8c8d;text-align:left;"
@@ -4860,7 +5512,7 @@ def _render_tax_section(flagged: list,
                 f"<th style='background:#fff;color:#7f8c8d;text-align:right;"
                 f"padding:2px 12px;border:none;'>Est. tax if sold</th></tr>"
             )
-            html += (
+            card += (
                 f"<tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-up);'>"
                 f"Long-term</td>"
                 f"<td style='text-align:right;padding:2px 12px;border:none;'>{lt_sh:g}</td>"
@@ -4869,7 +5521,7 @@ def _render_tax_section(flagged: list,
                 f"{_fmt_money(lt_tax)}"
                 f"{f' ({ta.effective_rate_lt*100:.0f}%)' if ta.effective_rate_lt else ''}</td></tr>"
             )
-            html += (
+            card += (
                 f"<tr><td style='padding:2px 12px 2px 0;border:none;color:var(--pos-down);'>"
                 f"Short-term</td>"
                 f"<td style='text-align:right;padding:2px 12px;border:none;'>{st_sh:g}</td>"
@@ -4878,18 +5530,18 @@ def _render_tax_section(flagged: list,
                 f"{_fmt_money(st_tax)}"
                 f"{f' ({ta.effective_rate_st*100:.0f}%)' if ta.effective_rate_st else ''}</td></tr>"
             )
-            html += (
+            card += (
                 f"<tr style='border-top:1px solid var(--border-medium);font-weight:600;'>"
                 f"<td style='padding:3px 12px 3px 0;border:none;'>Total</td>"
                 f"<td style='text-align:right;padding:3px 12px;border:none;'>{lt_sh+st_sh:g}</td>"
                 f"<td style='text-align:right;padding:3px 12px;border:none;'>{_fmt_money(lt_g+st_g)}</td>"
                 f"<td style='text-align:right;padding:3px 12px;border:none;'>{_fmt_money(lt_tax+st_tax)}</td></tr>"
             )
-            html += "</table></div>\n"
+            card += "</table></div>\n"
 
             # Collapsible per-lot detail
             if ta.lots_detail:
-                html += (
+                card += (
                     "<details style='margin-bottom:8px;'>"
                     "<summary style='font-size:11px;color:var(--fg-muted);cursor:pointer;'>"
                     f"View all {len(ta.lots_detail)} lot(s)</summary>"
@@ -4906,7 +5558,7 @@ def _render_tax_section(flagged: list,
                               else f"<span style='color:#a02622;'>ST "
                                    f"({lot['days_to_lt']}d to LT)</span>")
                     gain_color = "var(--pos-up)" if lot["gain"] >= 0 else "var(--pos-down)"
-                    html += (
+                    card += (
                         f"<tr><td>{lot['date']}</td>"
                         f"<td class='num'>{lot['shares']:g}</td>"
                         f"<td class='num'>{_fmt_money(lot['buy_price'])}</td>"
@@ -4915,7 +5567,7 @@ def _render_tax_section(flagged: list,
                         f"<td class='num' style='color:{gain_color};'>"
                         f"{_fmt_money(lot['gain'])}</td></tr>"
                     )
-                html += "</tbody></table></div></details>\n"
+                card += "</tbody></table></details>\n"
         elif gain is not None and gain > 0:
             st = ta.tax_if_short_term
             lt = ta.tax_if_long_term
@@ -4948,32 +5600,44 @@ def _render_tax_section(flagged: list,
                     parts.append(
                         f"Est. tax: {_fmt_money(lt)} (LT) / {_fmt_money(st)} (ST)"
                     )
-            html += ("<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
+            card += ("<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
                      + " &nbsp;·&nbsp; ".join(parts) + "</div>\n")
         elif gain is not None and gain < 0:
-            html += (f"<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
+            card += (f"<div style='font-size:12px;color:var(--fg-body);margin-bottom:8px;'>"
                      f"Unrealized loss: <strong style='color:var(--pos-down);'>"
                      f"{_fmt_money(gain)}</strong> &nbsp;·&nbsp; "
                      f"Selling harvests a deductible loss</div>\n")
         else:
-            html += ("<div style='font-size:12px;color:var(--fg-muted);margin-bottom:8px;'>"
+            card += ("<div style='font-size:12px;color:var(--fg-muted);margin-bottom:8px;'>"
                      "Cost basis unavailable — connect via Robinhood for gain/tax "
                      "estimates</div>\n")
 
         # Timing note
         if ta.timing_note:
-            html += (f"<div style='font-size:12px;color:#34495e;background:#f8f9fa;"
+            card += (f"<div style='font-size:12px;color:#34495e;background:#f8f9fa;"
                      f"padding:8px 10px;border-radius:4px;margin-bottom:8px;'>"
                      f"⏱ {ta.timing_note}</div>\n")
 
         # Strategies
         if ta.strategies:
-            html += "<ul style='margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--fg-body);'>"
+            card += "<ul style='margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--fg-body);'>"
             for strat in ta.strategies:
-                html += f"<li style='margin-bottom:4px;'>{strat}</li>"
-            html += "</ul>\n"
+                card += f"<li style='margin-bottom:4px;'>{strat}</li>"
+            card += "</ul>\n"
 
-        html += "</div>\n"
+        def render_card(mode):
+            v = verdict_in(r, mode)
+            if not tax_flagged(v):
+                return ""
+            return (
+                "<div style='border:1px solid var(--border-medium);border-radius:8px;"
+                "background:var(--bg-card);padding:14px 16px;margin-bottom:14px;'>"
+                "<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'>"
+                f"<span class='ticker' style='font-size:15px;'>{r.ticker}</span>"
+                f"<span class='verdict' style='background:{v.color}'>{v.label}</span>"
+                f"{card}</div>\n"
+            )
+        html += _mode_variants(render_card, tag="div")
 
     return html
 
@@ -4997,38 +5661,102 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
         if r.live_market_value is not None and live_total > 0:
             r.live_pct_portfolio = r.live_market_value / live_total * 100
 
+    mode = base_score_mode()
     for r in results:
         if (r.bucket == "compounder"
-                and r.composite_score is not None
+                and has_verdict_base(r, mode)
                 and r.live_pct_portfolio is not None):
-            insider_signal = None
-            if r.insider_activity:
-                sig = r.insider_activity.get("net_signal", "")
-                ins_score = r.score_insider
-                if sig == "Buying":
-                    insider_signal = "supports_buy"
-                elif sig == "Selling" and ins_score is not None and ins_score <= 35:
-                    insider_signal = "caution"
-                else:
-                    insider_signal = "no_signal"
-            sector_label = (r.sector_momentum or {}).get("label")
-            r.verdict = compute_verdict_v2(
-                composite_score=r.composite_score,
-                filters=r.filters,
-                current_price=r.current_price,
-                target_price=r.target_mean,
-                upside_pct=r.upside_pct,
-                trend=r.trend,
-                pct_above_ma200=r.pct_above_ma200,
-                week52_position=r.week52_position,
-                sector_label=sector_label,
-                insider_signal=insider_signal,
-                position_pct_portfolio=r.live_pct_portfolio,
-                is_holding=True,
-                news_signal=r.news_sentiment,   # reuse the score from analyze_position
-                coverage=r.composite_coverage,
-            )
+            # Reuses r.news_sentiment scored in analyze_position.
+            set_v2_verdicts(r, is_holding=True, position_pct=r.live_pct_portfolio)
     return live_total
+
+
+def compare_base_modes(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    prune_threshold: Optional[float] = None,
+) -> list[str]:
+    """Side-by-side of the base-score modes over this run's v2 verdicts, as log
+    lines: verdict counts per mode for holdings and watchlist names, how many
+    watchlist names each would prune (when `prune_threshold` is given), and
+    which verdicts would change. Read off each position's `verdicts` — nothing
+    is re-scored. Run after finalize_holding_verdicts so holdings include the
+    position-size overlay."""
+    active = base_score_mode()
+    held = {r.ticker for r in results}
+    seen: set[str] = set()
+    watch: list[PositionAnalysis] = []
+    for items in (watchlists or {}).values():
+        for r in items:
+            if r.ticker not in held and r.ticker not in seen:
+                seen.add(r.ticker)
+                watch.append(r)
+
+    def by_mode(r) -> dict:
+        if r.error:
+            return {}
+        return {m: (v.label, v.score) for m, v in (r.verdicts or {}).items()}
+
+    holding_rows = [by_mode(r) for r in results]
+    watch_rows = [by_mode(r) for r in watch]
+    groups = [(name, rows, labels) for name, rows, labels in (
+        ("holdings", holding_rows, ("ADD", "HOLD", "TRIM", "SELL")),
+        ("watchlist", watch_rows, ("BUY", "WATCH", "WAIT", "PASS")),
+    ) if any(rows)]
+    if not groups:
+        return []
+    show_prune = prune_threshold is not None and any(watch_rows)
+
+    saved = base_score_mode(saved_only=True)
+    source = "saved default" if saved == active else "this run only"
+    lines = [f"[base-score] Verdicts use the {BASE_SCORE_LABELS[active]} base "
+             f"({source}). Side by side — same modifiers, different base:"]
+    header = f"  {'base':<12}"
+    for name, _, labels in groups:
+        header += f"{name + ' ' + '/'.join(labels):<34}"
+    if show_prune:
+        header += f"prune <{prune_threshold:g}"
+    lines.append(header.rstrip())
+    for mode in BASE_SCORE_MODES:
+        row = f"  {BASE_SCORE_LABELS[mode] + ('*' if mode == active else ''):<12}"
+        for _, rows, labels in groups:
+            got = [m[mode][0] for m in rows if mode in m]
+            row += f"{'/'.join(str(got.count(lbl)) for lbl in labels):<34}"
+        if show_prune:
+            row += str(sum(1 for m in watch_rows
+                           if mode in m and m[mode][1] is not None
+                           and m[mode][1] < prune_threshold))
+        lines.append(row.rstrip())
+
+    def pruned_under(mode: str) -> set[str]:
+        return {r.ticker for r, m in zip(watch, watch_rows)
+                if mode in m and m[mode][1] is not None
+                and m[mode][1] < prune_threshold}
+
+    tickers = [r.ticker for r in results] + [r.ticker for r in watch]
+    modes_by_ticker = holding_rows + watch_rows
+    for mode in BASE_SCORE_MODES:
+        if mode == active:
+            continue
+        name = BASE_SCORE_LABELS[mode]
+        changes = [f"{t} {m[active][0]}→{m[mode][0]}"
+                   for t, m in zip(tickers, modes_by_ticker)
+                   if active in m and mode in m and m[active][0] != m[mode][0]]
+        if changes:
+            lines.append(f"  {name} would change {len(changes)}: " + ", ".join(changes))
+        else:
+            lines.append(f"  {name} would change no verdicts.")
+        # Pruning deletes from the real watchlists, so name the tickers.
+        if show_prune:
+            now, then = pruned_under(active), pruned_under(mode)
+            bits = []
+            if then - now:
+                bits.append("also prune " + ", ".join(sorted(then - now)))
+            if now - then:
+                bits.append("keep " + ", ".join(sorted(now - then)))
+            if bits:
+                lines.append("    and would " + "; ".join(bits))
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -5153,6 +5881,15 @@ def _rec_factors(r: PositionAnalysis) -> dict:
         "score_insider": _r(r.score_insider, 1),
         "composite_score": _r(r.composite_score, 1),
         "composite_coverage": _r(r.composite_coverage, 3),
+        # Quality base-score mode inputs, which base the verdict used, and what
+        # every base said — so the modes can be graded against outcomes.
+        "filter_score": _r(r.filter_score, 1),
+        "filter_coverage": _r(r.filter_coverage, 3),
+        "quality_base": _r(r.quality_base, 1),
+        "quality_coverage": _r(r.quality_coverage, 3),
+        "base_mode": (r.verdict.base_mode if r.verdict else None),
+        "verdicts": ({m: [v.label, _r(v.score, 1)] for m, v in r.verdicts.items()}
+                     or None),
         # Verdict-layer inputs
         "upside_pct": _r(r.upside_pct, 1),
         "sector_momentum": ((r.sector_momentum or {}).get("label")
@@ -5228,31 +5965,43 @@ def _current_rec_snapshot(
 # tracked per group — holdings compounders, holdings thematics, and each
 # watchlist rank independently — so we only ever compare like-for-like.
 
-def _holding_rank_key(r):
-    """Default holdings sort: verdict score desc, market value as tiebreak."""
-    score = (r.verdict.score if r.verdict and r.verdict.score is not None else -1)
+def _holding_rank_key(r, mode: Optional[str] = None):
+    """Default holdings sort: verdict score desc (under `mode`, default the
+    run's), market value as tiebreak."""
+    v = verdict_in(r, mode)
+    score = v.score if v and v.score is not None else -1
     return (score, r.live_market_value or 0)
 
 
-def _watchlist_rank_key(r):
-    """Default watchlist sort: verdict score desc, upside as tiebreak."""
-    score = (r.verdict.score if r.verdict and r.verdict.score is not None else -1)
+def _watchlist_rank_key(r, mode: Optional[str] = None):
+    """Default watchlist sort: verdict score desc (under `mode`, default the
+    run's), upside as tiebreak."""
+    v = verdict_in(r, mode)
+    score = v.score if v and v.score is not None else -1
     return (score, r.upside_pct if r.upside_pct is not None else -1e6)
 
 
 def compute_run_ranks(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    mode: Optional[str] = None,
 ) -> dict[str, dict]:
     """Return {ticker: {"group": str, "rank": int}} — each ticker's 1-based
-    position under the report's default (verdict-score) sort within its group.
-    Groups: 'compounder', 'thematic', 'watch:<list>'. Held tickers are excluded
-    from watchlist ranking to mirror the rendered tables (holdings win)."""
+    position under the report's default (verdict-score) sort within its group,
+    scoring with `mode`'s verdicts (default the run's). Groups: 'compounder',
+    'thematic', 'watch:<list>'. Held tickers are excluded from watchlist
+    ranking to mirror the rendered tables (holdings win)."""
+    def holding_key(r):
+        return _holding_rank_key(r, mode)
+
+    def watchlist_key(r):
+        return _watchlist_rank_key(r, mode)
+
     ranks: dict[str, dict] = {}
     compounders = sorted((r for r in results if r.bucket == "compounder"),
-                         key=_holding_rank_key, reverse=True)
+                         key=holding_key, reverse=True)
     thematics = sorted((r for r in results if r.bucket == "thematic"),
-                       key=_holding_rank_key, reverse=True)
+                       key=holding_key, reverse=True)
     for group, lst in (("compounder", compounders), ("thematic", thematics)):
         for i, r in enumerate(lst, 1):
             ranks[r.ticker] = {"group": group, "rank": i}
@@ -5260,7 +6009,7 @@ def compute_run_ranks(
         held = {r.ticker for r in results}
         for wl_name, items in watchlists.items():
             ordered = sorted((r for r in items if r.ticker not in held),
-                             key=_watchlist_rank_key, reverse=True)
+                             key=watchlist_key, reverse=True)
             for i, r in enumerate(ordered, 1):
                 # A ticker in several lists is ranked by the first list it
                 # appears in (its analysis object is shared across lists).
@@ -5269,58 +6018,106 @@ def compute_run_ranks(
     return ranks
 
 
+def compute_run_ranks_by_mode(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+) -> dict[str, dict[str, dict]]:
+    """compute_run_ranks for every base-score mode: {mode: {ticker: rank}}, so
+    each mode's view of the report gets its own rank-movement badges."""
+    return {m: compute_run_ranks(results, watchlists, mode=m)
+            for m in BASE_SCORE_MODES}
+
+
+def _rank_record(entry: dict, mode: str, run_date: Optional[str] = None) -> dict:
+    """The ledger's rank fields for one base-score mode. Composite ranks live
+    on the entry itself (they predate modes, so older ledgers keep working);
+    each other mode gets a `mode_ranks` sub-record. Passing run_date creates a
+    missing record, stamped with the day tracking began (`since`)."""
+    if mode == "composite":
+        return entry
+    records = entry.get("mode_ranks") or {}
+    if run_date is None:
+        return records.get(mode) or {}
+    entry["mode_ranks"] = records
+    return records.setdefault(mode, {"since": run_date})
+
+
+def _roll_rank(record: dict, cur_rank: dict, run_date: str) -> None:
+    """Store today's rank in a rank record. The first run of a new day first
+    rolls the previous run's rank into the prior-day baseline; same-day
+    re-runs keep it, so every run today compares to yesterday."""
+    if record.get("last_rank_date") != run_date:
+        record["prev_day_rank"] = record.get("last_rank")
+        record["prev_day_rank_group"] = record.get("last_rank_group")
+    record["last_rank"] = cur_rank.get("rank")
+    record["last_rank_group"] = cur_rank.get("group")
+    record["last_rank_date"] = run_date
+
+
 def _attach_rank_moves(
     history: dict,
-    ranks: dict[str, dict],
+    ranks_by_mode: dict[str, dict[str, dict]],
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     run_date: Optional[str] = None,
 ) -> None:
-    """Compare this run's ranks against the rank recorded on the *previous
+    """Compare this run's ranks (per base-score mode, from
+    compute_run_ranks_by_mode) against the rank recorded on the *previous
     calendar day* (not merely the previous run) and stash the movement on each
-    analysis object as `r._rank_move` for the ticker badge: {"delta":
-    places_gained, "new": bool}. Positive delta = climbed. `new` marks a ticker
-    with no comparable prior-day rank (first sighting, or it changed group).
+    analysis object for the ticker badge: `r._rank_moves` = {mode: {"delta":
+    places_gained, "new": bool}}, and `r._rank_move` for the run's mode.
+    Positive delta = climbed. `new` marks a ticker with no comparable prior-day
+    rank (first sighting, or it changed group).
 
     Comparing to the prior day (rather than the prior run) means the two runs on
     the same trading day — 9:30 AM and 4 PM — both show movement relative to
     yesterday's close-of-day ranking, instead of the afternoon run diffing only
     against the morning run. MUST run before update_recs_history rolls the
-    baseline forward."""
+    baseline forward.
+
+    Each mode compares only against its own rank history. A mode with no
+    history before today shows no badge for known tickers: that says nothing
+    about the stock."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     tickers = history.get("tickers", {})
 
-    def _move_for(ticker: str) -> Optional[dict]:
-        cur = ranks.get(ticker)
+    def _move_for(ticker: str, mode: str) -> Optional[dict]:
+        cur = (ranks_by_mode.get(mode) or {}).get(ticker)
         if not cur:
             return None
         entry = tickers.get(ticker)
         if not entry:
             return {"delta": None, "new": True}
+        record = _rank_record(entry, mode)
         # Baseline = rank as of the last run of a previous calendar day. If the
         # most recent stored run was itself on an earlier day, that run IS the
         # prior-day baseline; if it already ran earlier today, use the retained
         # prior-day baseline so both of today's runs compare to yesterday.
-        if entry.get("last_rank_date") != run_date:
-            base_rank = entry.get("last_rank")
-            base_group = entry.get("last_rank_group")
+        if record.get("last_rank_date") != run_date:
+            base_rank = record.get("last_rank")
+            base_group = record.get("last_rank_group")
         else:
-            base_rank = entry.get("prev_day_rank")
-            base_group = entry.get("prev_day_rank_group")
-        if base_rank is None or base_group != cur["group"]:
+            base_rank = record.get("prev_day_rank")
+            base_group = record.get("prev_day_rank_group")
+        if base_rank is None:
+            if (mode != "composite"
+                    and record.get("since", run_date) == run_date
+                    and entry.get("first_date") != run_date):
+                return None
+            return {"delta": None, "new": True}
+        if base_group != cur["group"]:
             return {"delta": None, "new": True}
         return {"delta": base_rank - cur["rank"], "new": False}
 
+    run_mode = base_score_mode()
     seen: set[str] = set()
-    for r in results:
-        r._rank_move = _move_for(r.ticker)
+    for r in [*results, *(r for items in (watchlists or {}).values() for r in items)]:
+        if r.ticker in seen:
+            continue
         seen.add(r.ticker)
-    for items in (watchlists or {}).values():
-        for r in items:
-            if r.ticker not in seen:
-                r._rank_move = _move_for(r.ticker)
-                seen.add(r.ticker)
+        r._rank_moves = {m: _move_for(r.ticker, m) for m in BASE_SCORE_MODES}
+        r._rank_move = r._rank_moves.get(run_mode)
 
 
 # Fixed return horizons (calendar days from first sight) captured for durability
@@ -5381,26 +6178,35 @@ def update_recs_history(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
     run_date: Optional[str] = None,
-    ranks: Optional[dict[str, dict]] = None,
+    ranks_by_mode: Optional[dict[str, dict[str, dict]]] = None,
     sp_level: Optional[float] = None,
 ) -> dict:
     """Record the first sighting of every ticker we see (any verdict) and refresh
     latest price/alloc for already-tracked tickers. Mutates and returns
-    `history`. `ranks` (from compute_run_ranks) is persisted per ticker, rolling
-    a prior-DAY baseline forward on the first run of each new day so the next run
-    can render rank-movement badges relative to yesterday. `sp_level` (current
-    ^GSPC close) is frozen per ticker at first sight and refreshed after, so a
-    miss can later be scored on excess return (alpha) rather than raw gain."""
+    `history`. The ranks of every base-score mode (from
+    compute_run_ranks_by_mode) are persisted per ticker (see _rank_record),
+    rolling a prior-DAY baseline forward on the first run of each new day so
+    the next run can render rank-movement badges relative to yesterday.
+    `sp_level` (current ^GSPC close) is frozen per ticker at first sight and
+    refreshed after, so a miss can later be scored on excess return (alpha)
+    rather than raw gain."""
     if run_date is None:
         run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    if ranks is None:
-        ranks = compute_run_ranks(results, watchlists)
+    if ranks_by_mode is None:
+        ranks_by_mode = compute_run_ranks_by_mode(results, watchlists)
     tickers = history.setdefault("tickers", {})
     snapshot = _current_rec_snapshot(results, watchlists)
 
+    def _mode_ranks(entry: dict, ticker: str) -> None:
+        for mode in BASE_SCORE_MODES:
+            if mode != "composite":
+                _roll_rank(_rank_record(entry, mode, run_date),
+                           (ranks_by_mode.get(mode) or {}).get(ticker) or {},
+                           run_date)
+
     for ticker, cur in snapshot.items():
         entry = tickers.get(ticker)
-        cur_rank = ranks.get(ticker) or {}
+        cur_rank = (ranks_by_mode.get("composite") or {}).get(ticker) or {}
         if entry is None:
             # Track every ticker from its first sighting, whatever the verdict.
             tickers[ticker] = {
@@ -5444,6 +6250,7 @@ def update_recs_history(
                 "prev_day_rank": None,
                 "prev_day_rank_group": None,
             }
+            _mode_ranks(tickers[ticker], ticker)
             continue
         # Refresh latest snapshot for an already-tracked ticker.
         entry["name"] = cur["name"] or entry.get("name")
@@ -5472,18 +6279,13 @@ def update_recs_history(
         # Peak/trough (round-trip depth), fixed-horizon returns, and the latest
         # S&P level for alpha — all derived from the entry itself.
         _refresh_outcome_fields(entry, cur["price"], run_date, sp_level)
-        # Rank: on the first run of a new day, roll the daily baseline forward
-        # (the prior run — yesterday's last — becomes what today diffs against).
-        # Same-day re-runs keep the baseline so both runs compare to yesterday.
-        if entry.get("last_rank_date") != run_date:
-            entry["prev_day_rank"] = entry.get("last_rank")
-            entry["prev_day_rank_group"] = entry.get("last_rank_group")
-        # prev_rank still tracks the immediately-previous run (kept for history).
+        # Rank (composite, on the entry itself): prev_rank still tracks the
+        # immediately-previous run (kept for history); _roll_rank rolls the
+        # daily baseline forward on the first run of a new day.
         entry["prev_rank"] = entry.get("last_rank")
         entry["prev_rank_group"] = entry.get("last_rank_group")
-        entry["last_rank"] = cur_rank.get("rank")
-        entry["last_rank_group"] = cur_rank.get("group")
-        entry["last_rank_date"] = run_date
+        _roll_rank(entry, cur_rank, run_date)
+        _mode_ranks(entry, ticker)
     return history
 
 
@@ -6490,16 +7292,21 @@ def _render_avoided_losses(avoided: list[dict]) -> str:
     return html
 
 
-def _portfolio_insights(results: list[PositionAnalysis]) -> list[dict]:
+def _portfolio_insights(results: list[PositionAnalysis],
+                        mode: Optional[str] = None) -> list[dict]:
     """Build prioritized, data-driven recommendations for the header chip.
 
     Turns the per-position analysis into a few concise, actionable findings
     (exit/trim flags, concentration, high-conviction adds, stretched
-    valuations, weak fundamentals, insider selling). Each item is a dict
-    {icon, label, detail, tone} where tone (danger/warn/good) drives the
-    colored icon chip in the panel. Most important first; empty list means
-    nothing notable.
+    valuations, weak fundamentals, insider selling), judging verdicts under
+    `mode` (default the run's). Each item is a dict {icon, label, detail,
+    tone} where tone (danger/warn/good) drives the colored icon chip in the
+    panel. Most important first; empty list means nothing notable.
     """
+    def label(r):
+        v = verdict_in(r, mode)
+        return v.label if v else None
+
     held = [r for r in results if (r.shares or 0) > 0]
     if not held:
         return []
@@ -6515,13 +7322,13 @@ def _portfolio_insights(results: list[PositionAnalysis]) -> list[dict]:
 
     out: list[dict] = []
 
-    sells = [r for r in held if r.verdict and r.verdict.label == "SELL"]
+    sells = [r for r in held if label(r) == "SELL"]
     if sells:
         out.append({"icon": "🚩", "label": "Review for exit", "tone": "danger",
                     "detail": f"{names(sells)} — scoring below the framework's "
                               f"keep threshold."})
 
-    trims = [r for r in held if r.verdict and r.verdict.label == "TRIM"]
+    trims = [r for r in held if label(r) == "TRIM"]
     if trims:
         out.append({"icon": "✂️", "label": "Trim candidates", "tone": "warn",
                     "detail": names(trims) + "."})
@@ -6535,7 +7342,7 @@ def _portfolio_insights(results: list[PositionAnalysis]) -> list[dict]:
                     "detail": f"{parts} — sizeable position(s); consider "
                               f"rebalancing."})
 
-    adds = [r for r in held if r.verdict and r.verdict.label == "ADD"]
+    adds = [r for r in held if label(r) == "ADD"]
     if adds:
         out.append({"icon": "➕", "label": "High-conviction adds", "tone": "good",
                     "detail": names(adds) + "."})
@@ -6549,7 +7356,7 @@ def _portfolio_insights(results: list[PositionAnalysis]) -> list[dict]:
 
     weak = [r for r in held
             if qpass(r) is not None and qpass(r) <= 4
-            and (not r.verdict or r.verdict.label not in ("SELL", "TRIM"))]
+            and label(r) not in ("SELL", "TRIM")]
     if weak:
         parts = ", ".join(f"{r.ticker} ({qpass(r)}/9)" for r in weak[:3])
         out.append({"icon": "🔻", "label": "Weak fundamentals", "tone": "danger",
@@ -6625,9 +7432,19 @@ def generate_html_report(
     compounders.sort(key=_holding_rank_key, reverse=True)
     thematics.sort(key=_holding_rank_key, reverse=True)
 
-    action_items = [r for r in results
-                    if r.verdict and r.verdict.label in ("SELL", "TRIM")]
-    add_items = [r for r in results if r.verdict and r.verdict.label == "ADD"]
+    # Header counts, one per base-score mode (see _mode_variants).
+    def count_labels(rows, labels) -> str:
+        def render(mode):
+            n = 0
+            for r in rows:
+                v = verdict_in(r, mode)
+                if v and v.label in labels:
+                    n += 1
+            return str(n)
+        return _mode_variants(render)
+
+    action_count_html = count_labels(results, ("SELL", "TRIM"))
+    add_count_html = count_labels(results, ("ADD",))
 
     _now_est = datetime.now(ZoneInfo("America/New_York"))
     now = _now_est.strftime("%B %d, %Y · %I:%M %p %Z")
@@ -6654,8 +7471,7 @@ def generate_html_report(
     delta_sign = "+" if delta >= 0 else ""
 
     # Watchlist counts for summary card
-    watchlist_total = 0
-    watchlist_buys = 0
+    watchlist_unique: list[PositionAnalysis] = []
     if watchlists:
         seen_tickers: set[str] = set()
         held_tickers = {r.ticker for r in results}
@@ -6664,27 +7480,46 @@ def generate_html_report(
                 if r.ticker in held_tickers or r.ticker in seen_tickers:
                     continue
                 seen_tickers.add(r.ticker)
-                watchlist_total += 1
-                if r.verdict and r.verdict.label == "BUY":
-                    watchlist_buys += 1
+                watchlist_unique.append(r)
     watchlist_stat_html = ""
-    if watchlist_total:
+    if watchlist_unique:
         watchlist_stat_html = (
             f'<a class="stat clickable" href="#" '
             f'onclick="applyHeaderFilter(\'verdict-buy\');return false;">'
-            f'<strong>{watchlist_buys} / {watchlist_total}</strong>'
+            f'<strong>{count_labels(watchlist_unique, ("BUY",))} / '
+            f'{len(watchlist_unique)}</strong>'
             f'Watchlist BUY signals</a>'
         )
 
     has_holdings = bool(results)
     report_title = "Portfolio Analysis" if has_holdings else "Stock Analysis"
 
+    # Base-score view: CSS showing the viewed mode's variants, and a script that
+    # restores this browser's last viewed mode before the tables render.
+    base_view_css = _base_view_css()
+    base_view_boot_js = (
+        "<script>\n"
+        "// Base-score view: reopen the mode this browser last viewed, before the\n"
+        "// tables render so they never flash another mode.\n"
+        f"window.BASE_SCORE_MODES = {json.dumps(list(BASE_SCORE_MODES))};\n"
+        "(function() {\n"
+        "  try {\n"
+        "    var v = localStorage.getItem('base-score-view');\n"
+        "    if (window.BASE_SCORE_MODES.indexOf(v) !== -1) {\n"
+        "      document.documentElement.setAttribute('data-base-view', v);\n"
+        "    }\n"
+        "  } catch (e) {}\n"
+        "})();\n"
+        "</script>"
+    )
+
     # Top-of-report meter row: market sentiment · book quality · concentration.
     # Each renderer returns "" when its data is unavailable, so the row simply
     # shows whichever gauges apply (and collapses entirely with no holdings).
     _meter_cards = [
         _render_fear_greed_gauge(fetch_market_fear_greed()),
-        _render_portfolio_health_gauge(results),
+        _mode_variants(lambda m: _render_portfolio_health_gauge(results, m),
+                       tag="div"),
         _render_diversification_gauge(results),
     ]
     _meter_cards = [c for c in _meter_cards if c]
@@ -6697,25 +7532,36 @@ def generate_html_report(
     # Hover reveals the full list (JS handles hover/scroll/leave auto-hide).
     qr_chip_html = ""
     if has_holdings:
-        _insights = _portfolio_insights(results)
-        if _insights:
-            _rows = "".join(
-                f'<div class="qr-item qr-{it["tone"]}">'
-                f'<span class="qr-ico">{it["icon"]}</span>'
-                f'<span class="qr-text">'
-                f'<span class="qr-label">{it["label"]}</span>'
-                f'<span class="qr-detail">{it["detail"]}</span>'
-                f'</span></div>'
-                for it in _insights
-            )
+        # One set of findings per base-score mode (see _mode_variants).
+        _insights = {m: _portfolio_insights(results, m) for m in BASE_SCORE_MODES}
+        if any(_insights.values()):
+            def _qr_rows(mode):
+                items = _insights[mode] or [{
+                    "icon": "✅", "label": "No critical issues", "tone": "good",
+                    "detail": "Nothing notable under this base score."}]
+                return "".join(
+                    f'<div class="qr-item qr-{it["tone"]}">'
+                    f'<span class="qr-ico">{it["icon"]}</span>'
+                    f'<span class="qr-text">'
+                    f'<span class="qr-label">{it["label"]}</span>'
+                    f'<span class="qr-detail">{it["detail"]}</span>'
+                    f'</span></div>'
+                    for it in items
+                )
+
+            def _qr_label(mode):
+                if not _insights[mode]:
+                    return "✅ No critical issues"
+                return ('<span class="qr-bulb">💡</span>Quick recommendations'
+                        f'<span class="qr-count">{len(_insights[mode])}</span>')
+
             qr_chip_html = (
                 '<div class="qr-wrap" id="qrWrap">'
                 f'<button class="qr-trigger" id="qrTrigger">'
-                f'<span class="qr-bulb">💡</span>Quick recommendations'
-                f'<span class="qr-count">{len(_insights)}</span></button>'
+                f'{_mode_variants(_qr_label)}</button>'
                 f'<div class="qr-panel" id="qrPanel">'
                 f'<div class="qr-panel-head">Quick recommendations</div>'
-                f'<div class="qr-list">{_rows}</div>'
+                f'<div class="qr-list">{_mode_variants(_qr_rows, tag="div")}</div>'
                 f'</div>'
                 "</div>"
             )
@@ -6846,11 +7692,11 @@ def generate_html_report(
     {after_hours_stat}
     <a class="stat clickable" href="#compounders" onclick="scrollToSection('compounders');return false;"><strong>{len(compounders)}</strong>Compounder positions</a>
     <a class="stat clickable" href="#thematic" onclick="scrollToSection('thematic');return false;"><strong>{len(thematics)}</strong>Thematic / ETF positions</a>
-    <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{len(action_items)}</strong>Sell / Trim flags</a>
-    <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{len(add_items)}</strong>Add candidates</a>"""
+    <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{action_count_html}</strong>Sell / Trim flags</a>
+    <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{add_count_html}</strong>Add candidates</a>"""
 
     html = f"""<!DOCTYPE html>
-<html>
+<html data-base-view="{base_score_mode()}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6975,12 +7821,16 @@ def generate_html_report(
                     align-items: center; gap: 16px; flex-wrap: wrap;
                     margin: 0 0 12px; }}
   .report-header .sub {{ margin: 3px 0 0; }}
-  .report-controls {{ display: flex; align-items: center; gap: 8px; }}
+  /* Controls wrap onto extra rows on narrow screens rather than pushing the
+     page into horizontal scroll. */
+  .report-controls {{ display: flex; align-items: center; gap: 8px;
+                      flex-wrap: wrap; }}
   .refresh-btn {{ height: 34px; padding: 0 14px; border-radius: 17px;
                   border: 1px solid var(--border-medium);
                   background: var(--bg-card); color: var(--fg-body);
                   cursor: pointer; font-size: 12px; font-weight: 600;
                   display: flex; align-items: center; gap: 6px;
+                  white-space: nowrap;
                   box-shadow: var(--shadow-card);
                   transition: transform 0.15s, background 0.2s; }}
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
@@ -6990,6 +7840,29 @@ def generate_html_report(
   .miss-toggle.active {{ background: var(--bg-chip-green);
                         color: var(--fg-chip-green);
                         border-color: var(--pos-up); }}
+  /* Verdict base-score switch: a segmented pill matching .refresh-btn. */
+  .base-switch {{ height: 34px; flex: none; display: flex; align-items: center;
+                  gap: 2px; padding: 0 3px 0 12px; border-radius: 17px;
+                  border: 1px solid var(--border-medium);
+                  background: var(--bg-card); box-shadow: var(--shadow-card);
+                  font-size: 12px; font-weight: 600; }}
+  .base-switch-label {{ color: var(--fg-muted); margin-right: 4px; cursor: help;
+                        white-space: nowrap; }}
+  .base-switch button {{ height: 26px; padding: 0 10px; border: 0;
+                         border-radius: 13px; background: transparent;
+                         color: var(--fg-body); font: inherit; cursor: pointer;
+                         transition: background 0.2s; }}
+  .base-switch button:not([aria-pressed="true"]):hover {{ background: var(--bg-card-hover); }}
+  .base-switch button[aria-pressed="true"] {{ background: var(--bg-pill-active);
+                                              color: var(--fg-pill-active); }}
+  .base-default-mark {{ font-size: 9px; margin-left: 3px; opacity: 0.8; }}
+  .base-default-btn[hidden] {{ display: none; }}
+  /* Only the viewed base score's copy of each verdict-dependent piece shows. */
+{base_view_css}
+  @media (max-width: 360px) {{
+    .base-switch-label {{ display: none; }}
+    .base-switch {{ padding-left: 3px; }}
+  }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);
                      text-align: right; margin: -6px 0 10px; }}
   .refresh-status:empty {{ display: none; }}
@@ -7163,6 +8036,10 @@ def generate_html_report(
   .vearn {{ color: var(--fg-muted); }}
   .vearn-soon {{ color: var(--fg-chip-amber); }}
   .vearn-ico {{ font-size: 12px; }}
+  /* Same verdict under the other base-score modes. */
+  .valt {{ margin-top: 10px; padding-top: 8px;
+           border-top: 1px dashed var(--border-medium);
+           font-size: 11px; color: var(--fg-muted); }}
   /* At-a-glance markers beside the score (low-confidence dot, earnings glyph). */
   .vmark {{ font-size: 10px; cursor: help; line-height: 1; }}
   .vmark-conf {{ color: #e67e22; }}
@@ -7539,6 +8416,7 @@ def generate_html_report(
     setInterval(tick, 30000);
   }})();
 </script>
+{base_view_boot_js}
 <script>
   // Apply saved theme BEFORE first paint to avoid a white flash on dark-mode loads.
   (function() {{
@@ -7615,12 +8493,12 @@ def generate_html_report(
             "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
             "<th>Analyst Ratings</th>"
             "<th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th>"
-            "<th>Verdict <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>(score)</span></th>"
+            + _verdict_th() +
             "</tr></thead><tbody>\n"
         )
+        orders = _mode_orders(compounders, _holding_rank_key)
         for r in compounders:
             passed = sum(1 for f in r.filters if f.passed)
-            verdict_label = r.verdict.label if r.verdict else "—"
             rating_score = -1
             if r.rating_breakdown and r.rating_breakdown.get("total"):
                 t = r.rating_breakdown["total"]
@@ -7629,8 +8507,7 @@ def generate_html_report(
                      - r.rating_breakdown.get("sell", 0)) / t
                 )
             rating_html = _rating_bar(r.rating_breakdown, r.recommendation, r.num_analysts)
-            verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
-            html += _tr_open(r)
+            html += _tr_open(r, orders.get(id(r)))
             html += _td(_ticker_cell(r), r.ticker, "ticker")
             html += _td(_name_sector_cell(r), r.name)
             html += _td(_position_cell(r), r.live_market_value or -1, "num")
@@ -7646,7 +8523,7 @@ def generate_html_report(
             html += _td(_range_trend_cell(r),
                         r.week52_position if r.week52_position is not None else -1)
             html += _td(
-                f"{_filter_dots(r.filters)} <span style='color:var(--fg-muted);font-size:11px'>{passed}/9</span>",
+                f"{_filter_dots(r.filters)} {_filter_count_html(r, passed)}",
                 passed,
             )
             html += _td(_score_cell(r.composite_score, r.score_quality, r.score_growth,
@@ -7655,7 +8532,7 @@ def generate_html_report(
             html += _td(rating_html, rating_score)
             html += _td(_insider_cell(r.insider_activity),
                         r.score_insider if r.score_insider is not None else -1)
-            html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
+            html += _verdict_td(r)
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
 
@@ -7696,12 +8573,12 @@ def generate_html_report(
                 "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
                 "<th>Analyst Ratings</th>"
                 "<th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th>"
-                "<th>Verdict <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>(score)</span></th>"
+                + _verdict_th() +
                 "</tr></thead><tbody>\n"
             )
+            orders = _mode_orders(items, _watchlist_rank_key)
             for r in items:
                 passed = sum(1 for f in r.filters if f.passed)
-                verdict_label = r.verdict.label if r.verdict else "—"
                 rating_score = -1
                 if r.rating_breakdown and r.rating_breakdown.get("total"):
                     t = r.rating_breakdown["total"]
@@ -7712,13 +8589,11 @@ def generate_html_report(
                 rating_html = _rating_bar(
                     r.rating_breakdown, r.recommendation, r.num_analysts
                 )
-                verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
                 quality_cell = (
-                    f"{_filter_dots(r.filters)} "
-                    f"<span style='color:var(--fg-muted);font-size:11px'>{passed}/9</span>"
+                    f"{_filter_dots(r.filters)} {_filter_count_html(r, passed)}"
                     if r.filters else "<span style='color:var(--fg-faint);'>n/a</span>"
                 )
-                html += _tr_open(r)
+                html += _tr_open(r, orders.get(id(r)))
                 html += _td(_ticker_cell(r), r.ticker, "ticker")
                 html += _td(_name_sector_cell(r), r.name)
                 # Watchlist items omit Position / Cost-Gain (you don't own them)
@@ -7734,7 +8609,7 @@ def generate_html_report(
                 html += _td(rating_html, rating_score)
                 html += _td(_insider_cell(r.insider_activity),
                             r.score_insider if r.score_insider is not None else -1)
-                html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
+                html += _verdict_td(r)
                 html += "</tr>\n"
             html += "</tbody></table></div>\n"
 
@@ -7771,7 +8646,6 @@ def generate_html_report(
             "</tr></thead><tbody>\n"
         )
         for r in thematics:
-            verdict_label = r.verdict.label if r.verdict else "—"
             rating_score = -1
             if r.rating_breakdown and r.rating_breakdown.get("total"):
                 t = r.rating_breakdown["total"]
@@ -7780,7 +8654,6 @@ def generate_html_report(
                      - r.rating_breakdown.get("sell", 0)) / t
                 )
             rating_html = _rating_bar(r.rating_breakdown, r.recommendation, r.num_analysts)
-            verdict_html = _verdict_cell(r.verdict, getattr(r, 'days_to_earnings', None))
             html += _tr_open(r)
             html += _td(_ticker_cell(r), r.ticker, "ticker")
             html += _td(r.name, r.name)
@@ -7802,7 +8675,7 @@ def generate_html_report(
             html += _td(rating_html, rating_score)
             html += _td(_insider_cell(r.insider_activity),
                         r.score_insider if r.score_insider is not None else -1)
-            html += _td(verdict_html, (r.verdict.score if r.verdict and r.verdict.score is not None else (100 - _VERDICT_ORDER.get(verdict_label, 99))))
+            html += _verdict_td(r)
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
     # ---------- Tax analysis section (moved to bottom by request) ----------
@@ -7816,11 +8689,91 @@ def generate_html_report(
     html += """
 <p style="color:#95a5a6;font-size:11px;margin-top:30px;">
 Prices live via yfinance. Analyst ratings via Finnhub if configured, else yfinance fallback.
-Quality dots: green = pass, red = fail. Hover for actual values.
+Quality dots: green = pass, red = fail, grey = no data. Hover for actual values.
 Click any column header to sort. Click again to reverse.
 Verdicts are framework outputs, not investment advice.
 </p>
 <script>
+// Base-score view switch. Every verdict-dependent piece of the report is
+// rendered once per base-score mode (.bmode copies, shown by CSS from
+// html[data-base-view]), and rows carry each mode's verdict, score, rank move
+// and tax flag as data-<attr>-<mode>. Switching copies the viewed mode's
+// values into the plain attributes that sorting and the filter bar read,
+// restores the table order, and remembers the choice in this browser.
+(function() {
+  var MODES = window.BASE_SCORE_MODES || [];
+  var VIEW_KEY = 'base-score-view';
+  var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax'];
+  var root = document.documentElement;
+  var sw = document.getElementById('baseScoreSwitch');
+
+  function sortValue(td) {
+    var s = td ? td.getAttribute('data-sort') : null;
+    if (s === null || s === '') return null;
+    var n = parseFloat(s);
+    return isNaN(n) ? s.toLowerCase() : n;
+  }
+  // Default order comes from data-order-<mode>. A table the reader sorted by
+  // the verdict column is re-sorted the same way on the new scores; one sorted
+  // by any other column keeps its order.
+  function reorder(table, mode) {
+    var tbody = table.tBodies[0];
+    if (!tbody || !tbody.rows.length) return;
+    var key = 'data-order-' + mode;
+    var rows = Array.prototype.slice.call(tbody.rows);
+    if (!rows.every(function(r) { return r.hasAttribute(key); })) return;
+    var sorted = table.querySelector('th.sort-asc, th.sort-desc');
+    if (sorted && !sorted.classList.contains('verdict-th')) return;
+    if (sorted) {
+      var idx = sorted.cellIndex, asc = sorted.classList.contains('sort-asc');
+      rows.sort(function(a, b) {
+        var av = sortValue(a.cells[idx]), bv = sortValue(b.cells[idx]);
+        if (av === null && bv === null) return 0;
+        if (av === null) return 1;
+        if (bv === null) return -1;
+        var cmp = (typeof av === 'number' && typeof bv === 'number')
+          ? av - bv : String(av).localeCompare(String(bv));
+        return asc ? cmp : -cmp;
+      });
+    } else {
+      rows.sort(function(a, b) { return a.getAttribute(key) - b.getAttribute(key); });
+    }
+    rows.forEach(function(r) { tbody.appendChild(r); });
+  }
+  function apply(mode) {
+    root.setAttribute('data-base-view', mode);
+    document.querySelectorAll('tr[data-verdict-' + mode + ']').forEach(function(tr) {
+      PER_MODE.forEach(function(attr) {
+        var v = tr.getAttribute('data-' + attr + '-' + mode);
+        if (v !== null) tr.setAttribute('data-' + attr, v);
+      });
+    });
+    document.querySelectorAll('td[data-sort-' + mode + ']').forEach(function(td) {
+      td.setAttribute('data-sort', td.getAttribute('data-sort-' + mode));
+    });
+    document.querySelectorAll('table').forEach(function(t) { reorder(t, mode); });
+    if (sw) {
+      sw.querySelectorAll('button[data-mode]').forEach(function(b) {
+        b.setAttribute('aria-pressed', b.getAttribute('data-mode') === mode ? 'true' : 'false');
+      });
+    }
+    document.dispatchEvent(new CustomEvent('basescorechange', {detail: {mode: mode}}));
+  }
+  window.setBaseView = function(mode) {
+    if (MODES.indexOf(mode) === -1) return;
+    try { localStorage.setItem(VIEW_KEY, mode); } catch (e) {}
+    apply(mode);
+  };
+  if (sw) {
+    sw.addEventListener('click', function(ev) {
+      var btn = ev.target.closest('button[data-mode]');
+      if (btn) window.setBaseView(btn.getAttribute('data-mode'));
+    });
+  }
+  // The early script may have restored another mode than the run's.
+  var initial = root.getAttribute('data-base-view');
+  if (MODES.indexOf(initial) !== -1) apply(initial);
+})();
 // Measure the sticky h2 height so pinned table headers (thead) sit exactly
 // beneath it (CSS uses top: var(--h2-pin-h)). Re-measured on resize because
 // the h2 height changes with viewport font scaling.
@@ -8082,6 +9035,15 @@ Verdicts are framework outputs, not investment advice.
   function attrRaw(row, attr) { var v = row.getAttribute('data-' + attr); return v == null ? '' : v; }
   function attrNum(row, attr) { var v = row.getAttribute('data-' + attr);
     if (v == null || v === '') return NaN; var n = parseFloat(v); return isNaN(n) ? NaN : n; }
+  // Base-score-dependent attributes switch with the base view, so their
+  // controls are built from every mode's values (data-<attr>-<mode>) too.
+  function attrVariants(row, attr) {
+    var out = [attr];
+    (window.BASE_SCORE_MODES || []).forEach(function(m) {
+      if (row.hasAttribute('data-' + attr + '-' + m)) out.push(attr + '-' + m);
+    });
+    return out;
+  }
 
   function niceStep(span) {
     if (span <= 0) return 1;
@@ -8090,7 +9052,11 @@ Verdicts are framework outputs, not investment advice.
   }
   function computeDomain(card) {
     var vals = [];
-    for (var i = 0; i < rows.length; i++) { var v = attrNum(rows[i], card.attr); if (!isNaN(v)) vals.push(v); }
+    for (var i = 0; i < rows.length; i++) {
+      attrVariants(rows[i], card.attr).forEach(function(a) {
+        var v = attrNum(rows[i], a); if (!isNaN(v)) vals.push(v);
+      });
+    }
     if (!vals.length) return null;
     var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
     if (mx <= mn) return null;
@@ -8101,9 +9067,10 @@ Verdicts are framework outputs, not investment advice.
   function presentValues(card) {
     var seen = {}, skip = card.skip || [];
     for (var i = 0; i < rows.length; i++) {
-      var v = attrRaw(rows[i], card.attr);
-      if (skip.indexOf(v) !== -1) continue;
-      seen[v] = (seen[v] || 0) + 1;
+      attrVariants(rows[i], card.attr).forEach(function(a) {
+        var v = attrRaw(rows[i], a);
+        if (skip.indexOf(v) === -1) seen[v] = (seen[v] || 0) + 1;
+      });
     }
     var keys = Object.keys(seen);
     var ord = card.order || [];
@@ -8499,6 +9466,7 @@ Verdicts are framework outputs, not investment advice.
   renderUsed();
 
   searchInput.addEventListener('input', refresh);
+  document.addEventListener('basescorechange', function() { refresh(); });
   searchX.addEventListener('click', function() { searchInput.value = ''; refresh(); searchInput.focus(); });
   clearBtn.addEventListener('click', function() { searchInput.value = ''; applyState({ facets:{}, ranges:{} }); });
 
@@ -8830,6 +9798,14 @@ def main():
                          "missed_opp_analysis_<date>.md. Off by default and never "
                          "part of the normal report (needs ANTHROPIC_API_KEY; model "
                          "via MISSED_OPP_MODEL).")
+    ap.add_argument("--base-score", choices=BASE_SCORE_MODES, default=None,
+                    help="The base score this run acts on for watchlist "
+                         "pruning, tax flags and the history ledger: composite "
+                         "(the Composite Score), quality (the nine quality "
+                         "filters 70%% + analyst 15%% + insider 15%%) or blend "
+                         "(the average of the two). Overrides the "
+                         "BASE_SCORE_MODE env var; default composite. The "
+                         "report carries all three either way.")
     ap.add_argument("--lots-csv", default=None,
                     help="Optional purchase-history CSV (columns: ticker,date,"
                          "shares,price) for exact lot-level tax analysis in CSV "
@@ -8874,6 +9850,7 @@ def main():
                          "already present. Use --sync-dry-run to preview. "
                          "Example: --add-to-watchlist 'AI Plays' --tickers NVDA,GOOGL")
     args = ap.parse_args()
+    set_base_score_mode(args.base_score)
 
     # ---------- Debug insider lookup (standalone) ----------
     if args.debug_insider:
@@ -9109,6 +10086,10 @@ def main():
         with open(args.positions_csv) as f:
             rows = list(csv.DictReader(f))
 
+    _mode, _saved_mode = base_score_mode(), base_score_mode(saved_only=True)
+    print(f"Verdict base score: {BASE_SCORE_LABELS[_mode]}"
+          + ("" if _mode == _saved_mode else
+             f" (this run only; saved default {BASE_SCORE_LABELS[_saved_mode]})"))
     print(f"Analyzing {len(rows)} positions...")
     results: list[PositionAnalysis] = analyze_positions_parallel(
         rows, use_robinhood_ratings=use_rh_ratings)
@@ -9170,6 +10151,17 @@ def main():
     # were never flagged for tax analysis — missing from the tax section.
     finalize_holding_verdicts(results)
 
+    # What the other base-score modes would have decided (and pruned) — the
+    # numbers to check before switching BASE_SCORE_MODE.
+    try:
+        for line in compare_base_modes(
+                results, watchlists_analyzed or None,
+                prune_threshold=(args.prune_threshold
+                                 if args.prune_watchlists else None)):
+            print(line)
+    except Exception as e:
+        print(f"[base-score] Skipped the mode comparison: {e}")
+
     # Missed-opportunity tracking. Refresh the git-tracked ledger with this run's
     # buy-type verdicts (first sighting) and latest prices, then derive the set of
     # recommendations we under-acted on while the stock ran up. Best-effort: any
@@ -9185,7 +10177,7 @@ def main():
         # BEFORE update_recs_history rolls the daily baseline forward. Both use
         # the same run_date so the same-day/new-day split stays consistent.
         _run_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-        run_ranks = compute_run_ranks(results, watchlists_analyzed or None)
+        run_ranks = compute_run_ranks_by_mode(results, watchlists_analyzed or None)
         _attach_rank_moves(recs_history, run_ranks, results,
                            watchlists_analyzed or None, run_date=_run_date)
         # S&P level at this run — frozen per ticker at first sight, refreshed
@@ -9193,7 +10185,8 @@ def main():
         # gain. Cheap: fetch_benchmark_returns is cached (30-min TTL).
         _sp_level = (fetch_benchmark_returns() or {}).get("level")
         update_recs_history(recs_history, results, watchlists_analyzed or None,
-                            run_date=_run_date, ranks=run_ranks, sp_level=_sp_level)
+                            run_date=_run_date, ranks_by_mode=run_ranks,
+                            sp_level=_sp_level)
         save_recs_history(recs_history)
         recs_tracked_count = len(recs_history.get("tickers", {}))
         missed_opportunities = compute_missed_opportunities(recs_history)
@@ -9252,12 +10245,11 @@ def main():
         # Tax analysis is opt-in (--tax). When off, leave `flagged` empty so no
         # r.tax is populated and the tax section is omitted from the report.
         # Flag SELL/TRIM verdicts plus any position whose verdict score is
-        # below 75 — weak-scoring holds are trim candidates too.
+        # below 75 — weak-scoring holds are trim candidates too. A position
+        # any base-score mode flags gets tax detail, so the report's base
+        # switch can show each mode's own set without a re-run.
         flagged = ([r for r in results
-                    if r.verdict and (
-                        r.verdict.label in ("SELL", "TRIM")
-                        or (r.verdict.score is not None
-                            and r.verdict.score < TAX_FLAG_SCORE_THRESHOLD))]
+                    if any(tax_flagged(verdict_in(r, m)) for m in BASE_SCORE_MODES)]
                    if args.tax else [])
         if flagged:
             has_lots = bool(tax_lots_lookup)

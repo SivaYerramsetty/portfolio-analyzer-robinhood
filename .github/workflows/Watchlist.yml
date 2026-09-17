@@ -67,6 +67,7 @@ jobs:
           SMTP_USER:          ${{ secrets.SMTP_USER }}
           SMTP_PASS:          ${{ secrets.SMTP_PASS }}
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          BASE_SCORE_MODE:    ${{ vars.BASE_SCORE_MODE }}   # saved verdict base score (see portfolio.yml)
         run: |
             python analyze_portfolio.py \
             --source robinhood \
