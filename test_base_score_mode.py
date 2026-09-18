@@ -674,14 +674,15 @@ def _tag_errors(html: str) -> list[str]:
     return checker.errors + [f"unclosed <{t}>" for t in checker.stack]
 
 
-def _render_report(results, watchlists) -> str:
+def _render_report(results, watchlists, env=None) -> str:
     """generate_html_report with its network lookups stubbed out."""
     stubs = {"fetch_market_fear_greed": lambda: None,
              "fetch_benchmark_returns": lambda: None,
              "_compute_holdings_ytd_return": lambda results: None}
     real = {name: getattr(ap, name) for name in stubs}
-    old_repo = os.environ.get("GITHUB_REPOSITORY")
-    os.environ["GITHUB_REPOSITORY"] = "owner/repo"
+    over = {"GITHUB_REPOSITORY": "owner/repo", **(env or {})}
+    old = {k: os.environ.get(k) for k in over}
+    os.environ.update(over)
     try:
         for name, stub in stubs.items():
             setattr(ap, name, stub)
@@ -690,10 +691,11 @@ def _render_report(results, watchlists) -> str:
     finally:
         for name, fn in real.items():
             setattr(ap, name, fn)
-        if old_repo is None:
-            os.environ.pop("GITHUB_REPOSITORY", None)
-        else:
-            os.environ["GITHUB_REPOSITORY"] = old_repo
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_full_report() -> None:
@@ -737,6 +739,7 @@ def test_full_report() -> None:
                           _scored("XXX", 75, all_fail, shares=0, value=0.0,
                                   upside_pct=5.0)]}
         html = _render_report(results, watch)
+        qr_html = _render_report(results, watch, env={"QUICK_RECS": "1"})
 
     labels = {p.ticker: {m: v.label for m, v in p.verdicts.items()}
               for p in holdings[:3] + watch["Tech"]}
@@ -784,8 +787,17 @@ def test_full_report() -> None:
           "watchlist BUY count per mode")
     check(all(f'id="healthMeter-{m}"' in html for m in ap.BASE_SCORE_MODES), True,
           "a health gauge per mode")
-    qr = re.search(r'<div class="qr-list">(.*?)</div></div></div>', html, re.S).group(1)
-    check(qr.count("class='bmode"), 3, "quick recommendations per mode")
+    # Header controls: quick recommendations are hidden unless QUICK_RECS=1,
+    # and the old auto-refresh toggle is gone in favour of a reload button.
+    check(('<div class="qr-list">' in html, 'id="qrWrap"' in html), (False, False),
+          "the quick-recommendations chip stays out of the header by default")
+    check(('id="pageReloadBtn"' in html, 'id="autoReloadToggle"' in html),
+          (True, False), "the header has a browser-reload button, no Auto toggle")
+    qr = re.search(r'<div class="qr-list">(.*?)</div></div></div>',
+                   qr_html, re.S).group(1)
+    check(qr.count("class='bmode"), 3,
+          "QUICK_RECS=1 brings the chip back, one list per mode")
+    check(_tag_errors(qr_html), [], "and the page still balances with it")
 
     check(_tag_errors(html), [],
           "the page's tags balance, per-lot tax detail and mode copies included")

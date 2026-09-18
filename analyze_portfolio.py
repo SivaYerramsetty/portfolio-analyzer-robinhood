@@ -3913,7 +3913,7 @@ def _build_refresh_widget() -> tuple[str, str]:
     catch (e) { return false; }
   }
   // Tax section toggle: persisted per-browser; honored by every dispatch
-  // (manual button AND the auto-refresh timer, which calls ghTriggerRefresh).
+  // the Refresh data button makes (ghTriggerRefresh reads it at send time).
   (function() {
     var tb = document.getElementById("taxSectionToggle");
     if (!tb) return;
@@ -4063,10 +4063,6 @@ def _build_refresh_widget() -> tuple[str, str]:
     }
     return tok ? tok.trim() : null;
   }
-  // Hooks for the auto-refresh toggle: check for a stored token
-  // without prompting, and ensure one exists (prompting once) at enable time.
-  window.ghHasToken = function() { return !!localStorage.getItem(TOKEN_KEY); };
-  window.ghEnsureToken = function() { return getToken(false); };
   function elapsedStr() {
     var s = Math.floor((Date.now() - startedAt) / 1000);
     return Math.floor(s / 60) + "m " + (s % 60) + "s";
@@ -7528,10 +7524,11 @@ def generate_html_report(
         if _meter_cards else ""
     )
 
-    # Quick-recommendations chip — sits in the header controls beside Refresh.
-    # Hover reveals the full list (JS handles hover/scroll/leave auto-hide).
+    # Quick-recommendations chip — hidden by default to keep the header
+    # controls to one clean row; set QUICK_RECS=1 to put it back beside the
+    # Base switch. Hover reveals the full list (JS handles the auto-hide).
     qr_chip_html = ""
-    if has_holdings:
+    if has_holdings and os.environ.get("QUICK_RECS", "").strip() == "1":
         # One set of findings per base-score mode (see _mode_variants).
         _insights = {m: _portfolio_insights(results, m) for m in BASE_SCORE_MODES}
         if any(_insights.values()):
@@ -7703,8 +7700,8 @@ def generate_html_report(
 <!-- GitHub Pages serves HTML with Cache-Control: max-age=600, so a plain
      browser refresh can show the previous report for up to ~10 min after a new
      run deploys. Tell the browser to always revalidate the document so a manual
-     refresh fetches the freshly published HTML (the auto-refresh separately
-     cache-busts with a ?v=timestamp query). -->
+     refresh fetches the freshly published HTML (the header's reload button
+     separately cache-busts with a ?v=timestamp query). -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -7815,16 +7812,29 @@ def generate_html_report(
           transition: background 0.2s, color 0.2s; }}
 
   /* ---------- Headers ---------- */
-  /* Compact report header: title + meta on the left, controls (refresh,
-     theme toggle) on the right, all in one wrapping flex row. */
-  .report-header {{ display: flex; justify-content: space-between;
-                    align-items: center; gap: 16px; flex-wrap: wrap;
-                    margin: 0 0 12px; }}
-  .report-header .sub {{ margin: 3px 0 0; }}
-  /* Controls wrap onto extra rows on narrow screens rather than pushing the
-     page into horizontal scroll. */
+  /* Compact report header: title + meta on the left, controls (base switch,
+     refresh, icons) on the right, all in one wrapping flex row. The control
+     row sits on the title's baseline and keeps a flush right edge with the
+     cards below, even when it wraps onto its own line. */
+  .report-header {{ display: flex; align-items: flex-end;
+                    gap: 10px 20px; flex-wrap: wrap; margin: 0 0 14px; }}
+  /* Title and timestamp share one baseline and only stack when the controls
+     leave too little room — so the title line fills the width instead of
+     trailing off into empty space. The title block grows, which is what
+     pushes the controls to the right edge while they fit beside it; once
+     they wrap they start at the title's left edge rather than hanging in
+     the middle of their own row. */
+  .report-title {{ display: flex; align-items: baseline; flex-wrap: wrap;
+                   gap: 0 14px; flex: 1 1 auto; min-width: 0; }}
+  .hdr-meta {{ color: var(--fg-muted); font-size: 13px; white-space: nowrap; }}
+  /* Controls wrap onto an extra row on narrow screens rather than pushing
+     the page into horizontal scroll. */
   .report-controls {{ display: flex; align-items: center; gap: 8px;
-                      flex-wrap: wrap; }}
+                      flex-wrap: wrap; flex: 0 1 auto; }}
+  /* Icon-only controls (reload, theme) cluster at the end of the row, set
+     slightly apart from the labelled buttons. */
+  .ctl-icons {{ display: inline-flex; align-items: center; gap: 8px;
+                margin-left: 4px; }}
   .refresh-btn {{ height: 34px; padding: 0 14px; border-radius: 17px;
                   border: 1px solid var(--border-medium);
                   background: var(--bg-card); color: var(--fg-body);
@@ -7835,7 +7845,6 @@ def generate_html_report(
                   transition: transform 0.15s, background 0.2s; }}
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
   .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
-  .auto-toggle.active,
   .tax-toggle.active,
   .miss-toggle.active {{ background: var(--bg-chip-green);
                         color: var(--fg-chip-green);
@@ -7881,7 +7890,6 @@ def generate_html_report(
         box-shadow: 0 2px 4px var(--bg-page); }}
   h3 {{ font-size: 15px; margin: 24px 0 10px; font-weight: 600;
         color: var(--fg-table-header); }}
-  .sub {{ color: var(--fg-muted); font-size: 13px; margin-bottom: 28px; }}
 
   /* ---------- Summary card ---------- */
   /* Top-of-report meters — market sentiment · portfolio health · diversification. */
@@ -8256,14 +8264,19 @@ def generate_html_report(
   }}
 
   /* ---------- Theme toggle button (in the header controls cluster) ---------- */
-  .theme-toggle {{ width: 34px; height: 34px; flex: 0 0 auto;
+  .theme-toggle, .icon-btn {{ width: 34px; height: 34px; flex: 0 0 auto;
                    border-radius: 50%; border: 1px solid var(--border-medium);
                    background: var(--bg-card); color: var(--fg-body);
-                   cursor: pointer; font-size: 16px;
+                   cursor: pointer; font-size: 16px; line-height: 1;
+                   padding: 0;
                    display: flex; align-items: center; justify-content: center;
                    box-shadow: var(--shadow-card);
                    transition: transform 0.15s, background 0.2s; }}
-  .theme-toggle:hover {{ transform: scale(1.08); background: var(--bg-card-hover); }}
+  .theme-toggle:hover, .icon-btn:hover {{ transform: scale(1.08);
+                                          background: var(--bg-card-hover); }}
+  /* The reload glyph reads better a touch larger and optically centred. */
+  .icon-btn {{ font-size: 18px; }}
+  .icon-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
 
   /* ---------- Inline-chip overrides (dark mode) ---------- */
   /* Cell renderers use inline styles with hardcoded chip colors. We override
@@ -8320,6 +8333,10 @@ def generate_html_report(
     table {{ font-size: 12px; }}
     thead th, td {{ padding: 8px 6px; }}
     .refresh-status {{ text-align: left; margin-top: 0; }}
+    /* Stacked header: let the timestamp wrap onto its own lines rather than
+       push the page sideways. */
+    .report-header {{ align-items: flex-start; }}
+    .hdr-meta {{ white-space: normal; }}
     /* Chip can sit anywhere once the controls wrap, so anchor the panel to
        the viewport (full-width sheet) instead of the chip to avoid clipping. */
     .qr-panel {{ position: fixed; top: auto; bottom: 12px;
@@ -8361,8 +8378,8 @@ def generate_html_report(
 </head>
 <body>
 <script>
-  // Keep refreshes (browser reload or the auto-refresh) anchored at the
-  // top. Two things otherwise scroll the page on reload: (1) the browser's
+  // Keep refreshes (the browser's own reload or the header's reload
+  // button) anchored at the top. Two things otherwise scroll the page on reload: (1) the browser's
   // default scroll-position restoration, and (2) a stale "#section" hash left in
   // the URL (e.g. after a header tile jump) which makes the browser re-jump to
   // that section on every load. Disable restoration and strip any hash before
@@ -8431,18 +8448,20 @@ def generate_html_report(
   }})();
 </script>
 <div class="report-header">
-  <div>
+  <div class="report-title">
     <h1>{report_title}</h1>
-    <div class="sub">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
+    <div class="hdr-meta">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
   </div>
   <div class="report-controls">
     {qr_chip_html}
     {refresh_button_html}
-    <button class="refresh-btn auto-toggle" id="autoReloadToggle" aria-pressed="false"
-            title="Auto-reload this page every 30 min to pick up the latest published report">
-      &#9201; Auto</button>
-    <button class="theme-toggle" id="themeToggle"
-            title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+    <span class="ctl-icons">
+      <button class="icon-btn" id="pageReloadBtn"
+              title="Reload this page to pick up the latest published report"
+              aria-label="Reload page">&#8635;</button>
+      <button class="theme-toggle" id="themeToggle"
+              title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
+    </span>
   </div>
 </div>
 {refresh_status_html}
@@ -8790,90 +8809,17 @@ Verdicts are framework outputs, not investment advice.
   window.addEventListener('resize', setPinOffset);
   window.addEventListener('load', setPinOffset);
 })();
-// Auto-refresh toggle: when enabled (persisted in localStorage), every
-// 30 min it triggers the GitHub Actions workflow (same flow as the manual
-// Refresh button: dispatch -> poll -> reload when the new report deploys).
-// Fallbacks: no stored token or no refresh widget -> plain page reload; a
-// refresh already in progress -> skip this cycle (its success path reloads).
-// The reload keeps the password session (sessionStorage) and re-arms the
-// timer. A 30s interval checking a deadline (rather than one long setTimeout)
-// survives background-tab throttling and laptop sleep.
+// Browser reload button. GitHub Pages caches the report, so this uses the
+// cache-busting reload (reloadFreshReport) to fetch whatever is currently
+// published rather than a stale copy. Distinct from "Refresh data", which
+// dispatches the Actions workflow to regenerate the report from live data.
 (function() {
-  var KEY = 'auto-reload-hourly';
-  var PERIOD_MS = 1800000;
-  var btn = document.getElementById('autoReloadToggle');
+  var btn = document.getElementById('pageReloadBtn');
   if (!btn) return;
-  var timer = null;
-
-  function canDispatch() {
-    var rb = document.getElementById('ghRefreshBtn');
-    return typeof window.ghTriggerRefresh === 'function' && rb &&
-           typeof window.ghHasToken === 'function' && window.ghHasToken();
-  }
-  function label() {
-    if (!btn.classList.contains('active')) {
-      btn.innerHTML = '&#9201; Auto';
-      btn.title = 'Every 30 min: trigger the GitHub workflow to regenerate the '
-                + 'report, then reload this page when it deploys. (Without a '
-                + 'saved token it only reloads the page.)';
-      return;
-    }
-    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
-    var mins = Math.max(1, Math.round((nextAt - Date.now()) / 60000));
-    btn.innerHTML = '&#9201; Auto &middot; ' + mins + 'm';
-    btn.title = 'Auto-refresh is ON — in ~' + mins + ' min: '
-              + (canDispatch()
-                 ? 'trigger the workflow and reload when the new report deploys.'
-                 : 'reload the page (no saved token, so the workflow is not triggered).')
-              + ' Click to turn off.';
-  }
-  function fire() {
-    // Re-arm first so a failed run is retried next cycle, not every 30s.
-    btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
-    var rb = document.getElementById('ghRefreshBtn');
-    if (rb && rb.disabled) {
-      label();   // a refresh is already running — it reloads the page itself
-      return;
-    }
-    if (canDispatch()) {
-      window.ghTriggerRefresh();
-    } else {
-      (window.reloadFreshReport || location.reload.bind(location))();
-    }
-    label();
-  }
-  function check() {
-    var nextAt = parseInt(btn.dataset.nextAt || '0', 10);
-    if (nextAt && Date.now() >= nextAt) { fire(); return; }
-    label();
-  }
-  function setState(on, save, interactive) {
-    btn.classList.toggle('active', on);
-    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    if (save) { try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {} }
-    if (timer) { clearInterval(timer); timer = null; }
-    if (on) {
-      // Ask for the token now (once) so the unattended auto-refresh trigger can
-      // work later — prompting at 3am when the timer fires would be useless.
-      if (interactive && typeof window.ghEnsureToken === 'function'
-          && !((window.ghHasToken && window.ghHasToken()))) {
-        window.ghEnsureToken();
-      }
-      btn.dataset.nextAt = String(Date.now() + PERIOD_MS);
-      timer = setInterval(check, 30000);
-      document.addEventListener('visibilitychange', check);
-    } else {
-      delete btn.dataset.nextAt;
-      document.removeEventListener('visibilitychange', check);
-    }
-    label();
-  }
   btn.addEventListener('click', function() {
-    setState(!btn.classList.contains('active'), true, true);
+    btn.disabled = true;
+    (window.reloadFreshReport || location.reload.bind(location))();
   });
-  var saved = null;
-  try { saved = localStorage.getItem(KEY); } catch (e) {}
-  setState(saved === '1', false, false);
 })();
 (function() {
   function sortableValue(td) {
@@ -9570,7 +9516,7 @@ window.scrollToSection = function(id) {
 
   // Elements with their own tap action (or that aren't real tooltips).
   var SKIP = 'th,button,a,summary,label,input,select,' +
-             '.refresh-btn,.theme-toggle,#autoReloadToggle';
+             '.refresh-btn,.theme-toggle,.icon-btn';
 
   // Best-effort: the column header text for a tapped data cell, as a label.
   function columnLabel(cell) {
