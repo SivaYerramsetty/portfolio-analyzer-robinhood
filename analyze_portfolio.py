@@ -7816,15 +7816,21 @@ def generate_html_report(
      refresh, icons) on the right, all in one wrapping flex row. The control
      row sits on the title's baseline and keeps a flush right edge with the
      cards below, even when it wraps onto its own line. */
-  .report-header {{ display: flex; justify-content: space-between;
-                    align-items: flex-end; gap: 10px 20px; flex-wrap: wrap;
-                    margin: 0 0 14px; }}
-  .report-header .sub {{ margin: 4px 0 0; }}
-  /* Controls wrap onto extra rows on narrow screens rather than pushing the
-     page into horizontal scroll; margin-left keeps them right-aligned. */
-  .report-controls {{ display: flex; align-items: center;
-                      justify-content: flex-end; gap: 8px;
-                      flex-wrap: wrap; margin-left: auto; }}
+  .report-header {{ display: flex; align-items: flex-end;
+                    gap: 10px 20px; flex-wrap: wrap; margin: 0 0 14px; }}
+  /* Title and timestamp share one baseline and only stack when the controls
+     leave too little room — so the title line fills the width instead of
+     trailing off into empty space. The title block grows, which is what
+     pushes the controls to the right edge while they fit beside it; once
+     they wrap they start at the title's left edge rather than hanging in
+     the middle of their own row. */
+  .report-title {{ display: flex; align-items: baseline; flex-wrap: wrap;
+                   gap: 0 14px; flex: 1 1 auto; min-width: 0; }}
+  .hdr-meta {{ color: var(--fg-muted); font-size: 13px; white-space: nowrap; }}
+  /* Controls wrap onto an extra row on narrow screens rather than pushing
+     the page into horizontal scroll. */
+  .report-controls {{ display: flex; align-items: center; gap: 8px;
+                      flex-wrap: wrap; flex: 0 1 auto; }}
   /* Icon-only controls (reload, theme) cluster at the end of the row, set
      slightly apart from the labelled buttons. */
   .ctl-icons {{ display: inline-flex; align-items: center; gap: 8px;
@@ -7884,7 +7890,6 @@ def generate_html_report(
         box-shadow: 0 2px 4px var(--bg-page); }}
   h3 {{ font-size: 15px; margin: 24px 0 10px; font-weight: 600;
         color: var(--fg-table-header); }}
-  .sub {{ color: var(--fg-muted); font-size: 13px; margin-bottom: 28px; }}
 
   /* ---------- Summary card ---------- */
   /* Top-of-report meters — market sentiment · portfolio health · diversification. */
@@ -8328,10 +8333,10 @@ def generate_html_report(
     table {{ font-size: 12px; }}
     thead th, td {{ padding: 8px 6px; }}
     .refresh-status {{ text-align: left; margin-top: 0; }}
-    /* Stacked header: the controls get their own full-width row, so line
-       them up with the title's left edge instead of the right margin. */
+    /* Stacked header: let the timestamp wrap onto its own lines rather than
+       push the page sideways. */
     .report-header {{ align-items: flex-start; }}
-    .report-controls {{ margin-left: 0; justify-content: flex-start; }}
+    .hdr-meta {{ white-space: normal; }}
     /* Chip can sit anywhere once the controls wrap, so anchor the panel to
        the viewport (full-width sheet) instead of the chip to avoid clipping. */
     .qr-panel {{ position: fixed; top: auto; bottom: 12px;
@@ -8443,9 +8448,9 @@ def generate_html_report(
   }})();
 </script>
 <div class="report-header">
-  <div>
+  <div class="report-title">
     <h1>{report_title}</h1>
-    <div class="sub">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
+    <div class="hdr-meta">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
   </div>
   <div class="report-controls">
     {qr_chip_html}
