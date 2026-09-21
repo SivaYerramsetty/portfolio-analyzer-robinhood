@@ -908,7 +908,8 @@ def _parse_yf_purchases_df(df, verbose: bool,
 
 
 def insider_score(activity: Optional[dict],
-                  market_cap: Optional[float] = None) -> Optional[float]:
+                  market_cap: Optional[float] = None,
+                  neutral_as_missing: bool = False) -> Optional[float]:
     """
     Convert insider activity into a 0-100 sub-score for the Buy Score blend.
 
@@ -925,7 +926,20 @@ def insider_score(activity: Optional[dict],
        We weight the discretionary portion of S-code sales at 4x the
        scheduled portion. Only the discretionary slice drives "Selling".
 
-    Returns 0-100, or None if no Form 4 activity at all.
+    `neutral_as_missing` (the recalibrated scoring) returns None instead of a
+    number for the three readings that carry no directional information —
+    selling too small relative to market cap to register, RSU tax withholding,
+    and compensation-only activity. Those are the outcomes this function's own
+    logic already calls noise, and they describe essentially every mega-cap
+    that pays in stock: an executive who is granted shares and sells on a
+    preset plan never produces an open-market buy, so the score could not rise
+    above ~50 no matter what the business did. Returning a number anyway pinned
+    a 15%-weight input near 48 across that whole cohort — a level shift dressed
+    as a signal. None lets the composite renormalize over the inputs that do
+    discriminate, the same way it already handles a missing sub-score.
+
+    Returns 0-100, None if no Form 4 activity at all, and (when
+    `neutral_as_missing`) None for the no-information readings above.
     """
     if activity is None:
         return None
@@ -992,7 +1006,8 @@ def insider_score(activity: Optional[dict],
                 return 40
             if sell_pct >= 0.05:
                 return 45
-            return 48       # tiny relative to cap — basically noise
+            # Tiny relative to cap — basically noise.
+            return None if neutral_as_missing else 48
         else:
             # Absolute fallback
             if effective_sell >= 10_000_000:
@@ -1005,10 +1020,10 @@ def insider_score(activity: Optional[dict],
 
     # ----- Heavy tax-withholding (RSU cash-out, not discretionary) -----
     tw_pct = _pct(tw) if market_cap else None
-    if tw_pct is not None and tw_pct >= 0.2:
-        return 40
-    if tw_pct is None and tw >= 10_000_000:
-        return 40
+    heavy_withholding = ((tw_pct is not None and tw_pct >= 0.2)
+                         or (tw_pct is None and tw >= 10_000_000))
+    if heavy_withholding:
+        return None if neutral_as_missing else 40
 
     # ----- Compensation only / Neutral -----
-    return 50
+    return None if neutral_as_missing else 50

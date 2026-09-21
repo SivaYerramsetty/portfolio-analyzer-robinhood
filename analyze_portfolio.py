@@ -2128,10 +2128,160 @@ TAX_FLAG_SCORE_THRESHOLD = 75
 # how the fundamentals are measured. Chosen by --base-score, else the
 # BASE_SCORE_MODE env var — a repository variable in CI, so scheduled runs
 # (which dispatch without inputs) follow the saved choice too.
-BASE_SCORE_MODES = ("composite", "quality", "blend")
-DEFAULT_BASE_SCORE_MODE = "composite"
-BASE_SCORE_LABELS = {"composite": "Composite", "quality": "Quality", "blend": "Blend"}
+BASE_SCORE_BASES = ("composite", "quality", "blend")
+BASE_SCORE_BASE_LABELS = {"composite": "Composite", "quality": "Quality",
+                          "blend": "Blend"}
 QUALITY_BASE_WEIGHTS = {"filters": 0.70, "analyst": 0.15, "insider": 0.15}
+
+# ---- Calibration (switchable, orthogonal to the base) ----
+# A second axis on top of the base: which *calibration* of the sub-scores and
+# context modifiers the verdict uses. "std" is the original scoring, unchanged.
+# "cal" applies the six findings from the September 2026 miss review (see
+# CALIBRATION_BLURB) — six changes that were each traced to a specific scoring
+# artefact rather than to a view about any one stock:
+#
+#   1. insider — a compensation-only / below-noise read returns *no score*
+#      instead of 48, so the weight renormalizes away. The old value pinned a
+#      15%-weight input near 48 for every RSU-paying mega-cap (53 of 55 ledger
+#      entries sat in the 45-52 band), which is a level shift, not a signal.
+#   2. value — rescaled so the quality GATE scores 50 rather than 0. The old
+#      P/E 10->100 / 30->0 ramp is a deep-value scale: it marked a name the
+#      nine filters passed as below-average on valuation, so the two bases
+#      contradicted each other by construction.
+#   3a. upside-to-target — a continuous ramp over the same +/-6 band instead of
+#      a +6/+3/0/-3/-10 step function whose cliffs moved the score 6-9 points
+#      on a 1% price move.
+#   3b. momentum — a small, explicit credit for price holding above its own
+#      200-day line. The old model rewarded realized strength only through the
+#      trend bonus, which a name recovering from a drawdown cannot earn.
+#   4. hysteresis — a label only gives ground once the score falls clear of the
+#      threshold band, so a BUY holds instead of flickering off the next day.
+#   6. earnings proximity — an imminent print is scored (fresh-money framing
+#      only) instead of being rendered as a footnote the verdict ignores.
+#
+# Finding 5 (never drop a recently-held name from the tracked universe) is a
+# data-collection fix, not a scoring one — it changes what gets analyzed, so it
+# cannot be a per-view toggle. It is always on; --no-pin-recent-holdings opts
+# out. See PIN_RECENT_HOLDINGS_DAYS.
+CALIBRATIONS = ("std", "cal")
+DEFAULT_CALIBRATION = "std"
+CALIBRATION_LABELS = {"std": "Current", "cal": "Recalibrated"}
+CALIBRATION_SUFFIX = "-cal"
+
+# Finding 2: value sub-score ramps, as (x, score) anchor points. The gate
+# thresholds the nine quality filters use (P/E 30, PEG 2) score 50 — passing a
+# gate means average, not zero.
+CAL_VALUE_PE_RAMP = ((15.0, 100.0), (30.0, 50.0), (45.0, 0.0))
+CAL_VALUE_PEG_RAMP = ((0.5, 100.0), (2.0, 50.0), (3.5, 0.0))
+# Finding 3a: upside-to-target is +/-CAL_UPSIDE_MAX, reaching full value at
+# CAL_UPSIDE_FULL_PCT of upside (or downside) instead of stepping.
+CAL_UPSIDE_MAX = 6.0
+CAL_UPSIDE_FULL_PCT = 20.0
+# Finding 3b: realized-strength credit from price vs its own 200-day MA.
+CAL_MOMENTUM_BANDS = ((15.0, 4), (5.0, 2), (-5.0, 0), (-15.0, -2))   # floor, delta
+CAL_MOMENTUM_FLOOR = -4
+# Finding 4: a label holds until the score falls this far below its threshold.
+CAL_HYSTERESIS_BAND = 3.0
+# Finding 6: an imminent print, scored only in fresh-money (watchlist) framing —
+# "don't initiate into a binary" is a real cost; "sell before the print" is not.
+CAL_EARNINGS_BANDS = ((2, -4), (7, -2))    # within N days -> delta
+
+# The full mode key is the base, plus CALIBRATION_SUFFIX when recalibrated
+# ("composite", "blend-cal", ...). Every verdict-dependent piece of the report
+# is rendered once per key, so both switches are instant in the browser.
+BASE_SCORE_MODES = tuple(
+    base + (CALIBRATION_SUFFIX if cal == "cal" else "")
+    for cal in CALIBRATIONS for base in BASE_SCORE_BASES
+)
+DEFAULT_BASE_SCORE_MODE = "composite"
+BASE_SCORE_LABELS = {
+    base + (CALIBRATION_SUFFIX if cal == "cal" else ""):
+        BASE_SCORE_BASE_LABELS[base] + ("" if cal == "std"
+                                        else f" ({CALIBRATION_LABELS[cal]})")
+    for cal in CALIBRATIONS for base in BASE_SCORE_BASES
+}
+
+
+# Compact mode names for the run log's side-by-side, where the full
+# "Composite (Recalibrated)" would wrap the table.
+def _short_mode_label(mode: str) -> str:
+    base, cal = split_base_mode(mode)
+    return BASE_SCORE_BASE_LABELS[base] + ("+cal" if cal == "cal" else "")
+
+
+def split_base_mode(mode: Optional[str]) -> tuple[str, str]:
+    """A mode key -> (base, calibration). Unknown keys read as the defaults."""
+    raw = (mode or "").strip().lower()
+    cal = "std"
+    if raw.endswith(CALIBRATION_SUFFIX):
+        raw, cal = raw[:-len(CALIBRATION_SUFFIX)], "cal"
+    if raw not in BASE_SCORE_BASES:
+        raw = "composite"
+    return raw, cal
+
+
+def join_base_mode(base: str, calibration: str) -> str:
+    """(base, calibration) -> the mode key. Inverse of split_base_mode."""
+    if base not in BASE_SCORE_BASES:
+        base = "composite"
+    return base + (CALIBRATION_SUFFIX if calibration == "cal" else "")
+
+
+# The synthetic watchlist group recently-sold names are analyzed under. Not a
+# real Robinhood list, so watchlist pruning never touches it.
+RECENTLY_HELD_GROUP = "Recently held"
+
+# Finding 5: a name held within this many days stays in the analyzed universe
+# even after it leaves every watchlist, so the run keeps scoring it and the
+# ledger keeps marking it to market. META left the Screening list twice in
+# August 2026 — once at its lowest price of the window — and simply stopped
+# being looked at. Disable with --no-pin-recent-holdings.
+PIN_RECENT_HOLDINGS_DAYS = 180
+
+# Finding 4 needs the label each name carried last run. Populated from the
+# ledger by load_prior_verdict_labels() before any analysis; empty on a first
+# run, in lookup mode, and in tests, where hysteresis simply does not apply.
+_PRIOR_VERDICT_LABELS: dict[str, dict[str, str]] = {}
+
+
+def load_prior_verdict_labels(history: Optional[dict]) -> int:
+    """Fill the hysteresis store from the ledger's last snapshot per ticker.
+
+    Reads the per-mode labels `_rec_factors` logs; an entry written before that
+    logging existed contributes only to the mode the run recorded it under, so
+    one base's label can never stand in for another's. Returns how many tickers
+    carry a prior label."""
+    _PRIOR_VERDICT_LABELS.clear()
+    for ticker, entry in ((history or {}).get("tickers") or {}).items():
+        stored = ((entry.get("last_factors") or {}).get("verdicts") or {})
+        labels = {mode: pair[0] for mode, pair in stored.items()
+                  if mode in BASE_SCORE_MODES
+                  and isinstance(pair, (list, tuple)) and pair}
+        if not labels and entry.get("last_verdict"):
+            recorded = (entry.get("last_factors") or {}).get("base_mode")
+            if recorded in BASE_SCORE_MODES:
+                labels = {recorded: entry["last_verdict"]}
+        if labels:
+            _PRIOR_VERDICT_LABELS[ticker] = labels
+    return len(_PRIOR_VERDICT_LABELS)
+
+
+def prior_verdict_label(ticker: Optional[str], mode: str) -> Optional[str]:
+    """The label `ticker` carried under `mode` last run, or None."""
+    if not ticker:
+        return None
+    return (_PRIOR_VERDICT_LABELS.get(ticker) or {}).get(mode)
+
+
+def _ramp(x: float, points) -> float:
+    """Piecewise-linear interpolation over (x, y) anchors, clamped at both ends.
+    Anchors run in increasing x; y may fall (every calibration ramp here does)."""
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x <= x1:
+            if x <= x0:
+                return y0
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return points[-1][1]
 _base_score_mode_override: Optional[str] = None     # set from --base-score
 _warned_base_modes: set[str] = set()
 
@@ -2181,6 +2331,28 @@ class Verdict:
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
+
+def _value_sub_score(pe: Optional[float], peg: Optional[float],
+                     *, calibrated: bool) -> Optional[float]:
+    """The composite's 0-100 value sub-score from P/E and PEG.
+
+    Standard scoring maps P/E 10 -> 100 and 30 -> 0, PEG 0 -> 100 and 2 -> 0.
+    Both are deep-value ramps: they hit zero exactly at the thresholds the nine
+    quality filters treat as a PASS, so a name the filters cleared on valuation
+    could still score 0 here. Finding 2 rescales both so the gate scores 50 —
+    passing means average, not worthless — and lets a genuinely cheap multiple
+    reach 100 (see CAL_VALUE_PE_RAMP / CAL_VALUE_PEG_RAMP).
+
+    Missing or non-positive inputs drop out; None when neither is usable."""
+    parts = []
+    if pe is not None and pe > 0:
+        parts.append(_ramp(pe, CAL_VALUE_PE_RAMP) if calibrated
+                     else _clip01((30 - pe) / 20) * 100)
+    if peg is not None and peg > 0:
+        parts.append(_ramp(peg, CAL_VALUE_PEG_RAMP) if calibrated
+                     else _clip01((2 - peg) / 2) * 100)
+    return round(sum(parts) / len(parts), 1) if parts else None
 
 
 def compute_composite_score(pa, info: dict) -> None:
@@ -2246,14 +2418,8 @@ def compute_composite_score(pa, info: dict) -> None:
     # Keeping it out of the composite means valuation-vs-target is counted once
     # (in the verdict) rather than once here and again there — see the
     # no-double-counting note in compute_verdict_v2.
-    v_components = []
-    if pe is not None and pe > 0:
-        # P/E 10 -> 100, P/E 30 -> 0, scaled
-        v_components.append(_clip01((30 - pe) / 20))
-    if peg is not None and peg > 0:
-        v_components.append(_clip01((2 - peg) / 2))
-    if v_components:
-        pa.score_value = round(sum(v_components) / len(v_components) * 100, 1)
+    pa.score_value = _value_sub_score(pe, peg, calibrated=False)
+    pa.score_value_cal = _value_sub_score(pe, peg, calibrated=True)
 
     # Analyst (20%): rec_avg (lower = better) + number of analysts (more = more conviction)
     if pa.rating_breakdown and pa.rating_breakdown.get("total"):
@@ -2277,24 +2443,35 @@ def compute_composite_score(pa, info: dict) -> None:
     # Composite (weighted; weights re-normalized over what's available).
     # Insider activity gets meaningful weight because it's high-conviction
     # information — but not dominant.
-    weights = {
-        "score_quality": 0.30, "score_growth": 0.20,
-        "score_value": 0.20, "score_analyst": 0.15,
-        "score_insider": 0.15,
-    }
-    weighted_sum = 0.0
-    weight_total = 0.0
-    for attr, w in weights.items():
-        val = getattr(pa, attr)
-        if val is not None:
-            weighted_sum += val * w
-            weight_total += w
-    if weight_total > 0:
-        pa.composite_score = round(weighted_sum / weight_total, 1)
+    # Built once per calibration: the standard scoring, and the recalibrated
+    # one, which swaps in the rescaled value sub-score and drops a
+    # no-information insider read entirely (see CALIBRATIONS). Both go through
+    # the same renormalize-over-available-weight rule, so a dropped insider
+    # score is handled exactly like an ADR with no coverage.
+    for cal, value_score, insider_score_v in (
+        ("std", pa.score_value, pa.score_insider),
+        ("cal", pa.score_value_cal, pa.score_insider_cal),
+    ):
+        weighted = (
+            ("score_quality", pa.score_quality, 0.30),
+            ("score_growth", pa.score_growth, 0.20),
+            ("score_value", value_score, 0.20),
+            ("score_analyst", pa.score_analyst, 0.15),
+            ("score_insider", insider_score_v, 0.15),
+        )
+        weighted_sum = sum(v * w for _, v, w in weighted if v is not None)
+        weight_total = sum(w for _, v, w in weighted if v is not None)
+        if weight_total <= 0:
+            continue
+        score = round(weighted_sum / weight_total, 1)
         # weight_total is the share of the (normalized-to-1.0) weighting that
         # actually had data — i.e. how complete the fundamental picture is.
         # Drives the verdict's confidence label / modifier dampening.
-        pa.composite_coverage = round(weight_total, 3)
+        coverage = round(weight_total, 3)
+        if cal == "std":
+            pa.composite_score, pa.composite_coverage = score, coverage
+        else:
+            pa.composite_score_cal, pa.composite_coverage_cal = score, coverage
 
 
 def compute_quality_base(pa) -> None:
@@ -2309,22 +2486,28 @@ def compute_quality_base(pa) -> None:
     compute_composite_score first — it fills score_analyst.
     """
     pa.filter_score, pa.filter_coverage = compute_filter_score(pa.filters)
-    parts = (
-        ("filters", pa.filter_score, pa.filter_coverage),
-        ("analyst", pa.score_analyst, 1.0),
-        ("insider", pa.score_insider, 1.0),
-    )
-    weighted_sum = weight_total = coverage = 0.0
-    for key, val, data_share in parts:
-        if val is None:
+    for cal, insider_score_v in (("std", pa.score_insider),
+                                 ("cal", pa.score_insider_cal)):
+        parts = (
+            ("filters", pa.filter_score, pa.filter_coverage),
+            ("analyst", pa.score_analyst, 1.0),
+            ("insider", insider_score_v, 1.0),
+        )
+        weighted_sum = weight_total = coverage = 0.0
+        for key, val, data_share in parts:
+            if val is None:
+                continue
+            w = QUALITY_BASE_WEIGHTS[key]
+            weighted_sum += val * w
+            weight_total += w
+            coverage += w * data_share
+        if weight_total <= 0:
             continue
-        w = QUALITY_BASE_WEIGHTS[key]
-        weighted_sum += val * w
-        weight_total += w
-        coverage += w * data_share
-    if weight_total > 0:
-        pa.quality_base = round(weighted_sum / weight_total, 1)
-        pa.quality_coverage = round(coverage, 3)
+        base, cov = round(weighted_sum / weight_total, 1), round(coverage, 3)
+        if cal == "std":
+            pa.quality_base, pa.quality_coverage = base, cov
+        else:
+            pa.quality_base_cal, pa.quality_coverage_cal = base, cov
 
 
 def apply_context_adjustments(pa) -> None:
@@ -2390,6 +2573,51 @@ def apply_context_adjustments(pa) -> None:
         v.reason = v.reason + " · " + " · ".join(notes)
 
 
+# Verdict-score bands, strongest first: (minimum score, label, color).
+# Holdings carry a stay-the-course bias — selling has tax friction, so the bar
+# to leave is higher and HOLD covers a wide middle. Watchlist names need
+# fresh-money conviction to reach BUY.
+VERDICT_BANDS_HOLDING = (
+    (78.0, "ADD", "#27ae60"),      # strong conviction add
+    (60.0, "HOLD", "#2c3e50"),     # stay the course
+    (50.0, "HOLD", "#7f8c8d"),     # weak HOLD (muted gray)
+    (28.0, "TRIM", "#e67e22"),     # below neutral (~50) — lean out
+    (0.0, "SELL", "#c0392b"),
+)
+VERDICT_BANDS_WATCHLIST = (
+    (75.0, "BUY", "#27ae60"),
+    (60.0, "WATCH", "#2980b9"),    # interesting, not yet
+    (42.0, "WAIT", "#7f8c8d"),     # neutral
+    (0.0, "PASS", "#c0392b"),
+)
+
+
+def _verdict_label(score: float, is_holding: bool, *,
+                   prior_label: Optional[str] = None,
+                   hysteresis: float = 0.0) -> tuple[str, str, Optional[str]]:
+    """Map a verdict score to (label, color, hysteresis note).
+
+    With `hysteresis` and a `prior_label`, a label keeps the ground it has
+    already taken until the score falls clear of its band by that margin.
+    Finding 4: the bands are crossed by a score built from step functions, so a
+    name could read BUY one day and WATCH the next on a 1-2% price move — the
+    call existed but never lasted long enough to act on. The margin applies in
+    one direction only: earning a stronger label still takes a clean crossing,
+    so this adds patience without lowering the bar."""
+    bands = VERDICT_BANDS_HOLDING if is_holding else VERDICT_BANDS_WATCHLIST
+    idx = next(i for i, (lo, _, _) in enumerate(bands) if score >= lo)
+    if hysteresis > 0 and prior_label:
+        # The score a name had to reach to earn the label it is holding.
+        prior_idx = next((i for i, (_, lab, _) in enumerate(bands)
+                          if lab == prior_label), None)
+        if (prior_idx is not None and prior_idx < idx
+                and score >= bands[prior_idx][0] - hysteresis):
+            lo, lab, color = bands[prior_idx]
+            return lab, color, (f"{lab} held — within {hysteresis:.0f} points "
+                                f"of the {lo:.0f} bar it already cleared")
+    return bands[idx][1], bands[idx][2], None
+
+
 def compute_verdict_v2(
     *,
     composite_score: Optional[float],
@@ -2412,6 +2640,8 @@ def compute_verdict_v2(
     filter_score: Optional[float] = None,
     score_analyst: Optional[float] = None,
     score_insider: Optional[float] = None,
+    days_to_earnings: Optional[int] = None,
+    prior_label: Optional[str] = None,
 ) -> Verdict:
     """
     Evidence-weighted verdict logic.
@@ -2446,10 +2676,16 @@ def compute_verdict_v2(
     Hovering the verdict pill surfaces the full breakdown.
     """
     # ---- Base (0-100), built the way base_mode says ----
+    # A mode key carries two independent choices: which base the verdict starts
+    # from, and which calibration of the sub-scores and modifiers it uses. The
+    # caller has already handed us the calibration's sub-scores; `calibrated`
+    # below decides how the context modifiers behave.
     if base_mode not in BASE_SCORE_MODES:
-        base_mode = "composite"
+        base_mode = DEFAULT_BASE_SCORE_MODE
+    base_name, calibration = split_base_mode(base_mode)
+    calibrated = calibration == "cal"
     base_value, coverage, base_line = _verdict_base(
-        base_mode,
+        base_name, calibrated=calibrated,
         composite_score=composite_score, composite_coverage=coverage,
         quality_base=quality_base, quality_coverage=quality_coverage,
         filters=filters, filter_score=filter_score,
@@ -2498,6 +2734,10 @@ def compute_verdict_v2(
                       and (week52_position <= 20 or week52_position >= 92))
 
     # ---- Trend (50d MA / 200d MA alignment) ----
+    # trend_scored records whether this block actually moved the score. The
+    # recalibrated momentum credit below reads it so the two never stack: they
+    # measure the same axis, and the doctrine above is that it is scored once.
+    trend_scored = False
     if week52_extreme and trend in ("uptrend", "downtrend"):
         # Deferred, but keep it visible in the breakdown so the hover still
         # explains the full reasoning rather than silently dropping a factor.
@@ -2509,11 +2749,13 @@ def compute_verdict_v2(
         if pct_above_ma200 is not None and pct_above_ma200 >= 25:
             bonus = 12  # particularly strong uptrend
         score += bonus
+        trend_scored = True
         contributors.append((f"Uptrend"
                               + (f" (+{pct_above_ma200:.0f}% vs 200d)"
                                  if pct_above_ma200 is not None else ""), +bonus))
     elif trend == "downtrend":
         score -= 10
+        trend_scored = True
         contributors.append((f"Downtrend"
                               + (f" ({pct_above_ma200:+.0f}% vs 200d)"
                                  if pct_above_ma200 is not None else ""), -10))
@@ -2552,7 +2794,22 @@ def compute_verdict_v2(
             contributors.append((f"Near 52w high ({week52_position:.0f}%)", -4))
 
     # ---- Valuation vs analyst target ----
-    if upside_pct is not None:
+    # Finding 3a: the standard bands are a step function, and the steps are
+    # large enough that a 1% price move can swing the verdict 6-9 points as
+    # upside crosses 20% or 10%. A name that is working walks *down* the steps
+    # — its price rises into a target that has not moved — so the model de-rates
+    # it for succeeding. The recalibrated form keeps the same +/-6 authority but
+    # spends it continuously, so the same 1% move is worth ~0.3 points.
+    if calibrated and upside_pct is not None:
+        delta = round(max(-CAL_UPSIDE_MAX,
+                          min(CAL_UPSIDE_MAX,
+                              upside_pct / CAL_UPSIDE_FULL_PCT * CAL_UPSIDE_MAX)), 1)
+        if delta:
+            score += delta
+            direction = "upside to" if delta > 0 else "premium to"
+            contributors.append(
+                (f"{direction.capitalize()} target ({upside_pct:+.0f}%)", delta))
+    elif upside_pct is not None:
         if upside_pct >= 20:
             score += 6
             contributors.append((f"Strong upside to target ({upside_pct:+.0f}%)", +6))
@@ -2602,6 +2859,57 @@ def compute_verdict_v2(
             )
             # No flag — 10-15% doesn't trigger the ADD ceiling, just a small nudge
 
+    # ---- Realized strength vs the 200-day line (recalibrated only) ----
+    # Finding 3b: the standard scoring rewards strength only through the trend
+    # bucket, which needs the 50-day above the 200-day. A name recovering from
+    # a drawdown can be well clear of its 200-day for months while the 50-day
+    # is still catching up — it reads "sideways" and earns nothing, even as it
+    # makes new highs. This fills exactly that gap, and only that gap: when the
+    # trend modifier already scored this axis, it stands down rather than
+    # stacking a second reading of the same observation on top.
+    if calibrated and pct_above_ma200 is not None and not week52_extreme:
+        if trend_scored:
+            contributors.append(
+                (f"Momentum not re-scored — trend already counted "
+                 f"{pct_above_ma200:+.0f}% vs 200d", 0))
+        else:
+            delta = CAL_MOMENTUM_FLOOR
+            for floor, band_delta in CAL_MOMENTUM_BANDS:
+                if pct_above_ma200 >= floor:
+                    delta = band_delta
+                    break
+            if delta:
+                score += delta
+                held = "above" if delta > 0 else "below"
+                contributors.append(
+                    (f"Price holding {held} its 200-day "
+                     f"({pct_above_ma200:+.0f}%)", delta))
+
+    # ---- Earnings proximity (recalibrated only) ----
+    # Finding 6: days_to_earnings was computed and rendered as a footnote the
+    # verdict never read. It is scored in fresh-money framing only — committing
+    # new capital the day before a print is a real, avoidable cost, while
+    # "sell ahead of the print" is not a call this model should be making. For
+    # a holding it stays an annotation, so the reasoning shows the event
+    # without the score leaning on it.
+    if calibrated and days_to_earnings is not None and days_to_earnings >= 0:
+        when = ("today" if days_to_earnings == 0
+                else "tomorrow" if days_to_earnings == 1
+                else f"in {days_to_earnings} days")
+        if is_holding:
+            if days_to_earnings <= EARNINGS_SOON_DAYS:
+                contributors.append(
+                    (f"Reports {when} — event risk noted, not scored "
+                     f"(holding)", 0))
+        else:
+            for within, delta in CAL_EARNINGS_BANDS:
+                if days_to_earnings <= within:
+                    score += delta
+                    contributors.append(
+                        (f"Reports {when} — hold fresh money past the print",
+                         delta))
+                    break
+
     # ---- Latest-news sentiment (bounded ±6 nudge) ----
     _news_mod = _news_signal_modifier(news_signal)
     if _news_mod:
@@ -2636,28 +2944,11 @@ def compute_verdict_v2(
     score = max(0.0, min(100.0, score))
 
     # ---- Map to verdict label ----
-    if is_holding:
-        # Holdings: stay-the-course bias. HOLD covers a wide middle band.
-        if score >= 78:
-            label, color = "ADD", "#27ae60"        # strong conviction add
-        elif score >= 60:
-            label, color = "HOLD", "#2c3e50"       # stay the course
-        elif score >= 50:
-            label, color = "HOLD", "#7f8c8d"       # weak HOLD (muted gray)
-        elif score >= 28:
-            label, color = "TRIM", "#e67e22"       # below neutral (~50) — lean out
-        else:
-            label, color = "SELL", "#c0392b"
-    else:
-        # Watchlist: requires fresh-money conviction for BUY.
-        if score >= 75:
-            label, color = "BUY", "#27ae60"
-        elif score >= 60:
-            label, color = "WATCH", "#2980b9"      # interesting, not yet
-        elif score >= 42:
-            label, color = "WAIT", "#7f8c8d"       # neutral
-        else:
-            label, color = "PASS", "#c0392b"
+    label, color, hyst_note = _verdict_label(
+        score, is_holding, prior_label=prior_label,
+        hysteresis=CAL_HYSTERESIS_BAND if calibrated else 0.0)
+    if hyst_note:
+        contributors.append((hyst_note, 0))
 
     # ---- Hard ADD-ceiling for overweight positions ----
     # Even with the position-size penalty applied, a very-strong-fundamentals
@@ -2703,6 +2994,7 @@ def compute_verdict_v2(
 def _verdict_base(
     mode: str,
     *,
+    calibrated: bool = False,
     composite_score: Optional[float],
     composite_coverage: Optional[float],
     quality_base: Optional[float],
@@ -2717,12 +3009,17 @@ def _verdict_base(
     Returns (base, coverage, breakdown line). base is None when the mode has
     nothing to build from; the line is the first row of the hover breakdown
     (the card parser takes the first non-±N segment as the base). Anything but
-    quality/blend is treated as composite."""
+    quality/blend is treated as composite. `calibrated` only labels the line —
+    the caller has already passed the matching calibration's values — so the
+    hover never shows two different numbers under the same name."""
+    tag = " (recalibrated)" if calibrated else ""
     if mode == "quality":
         if quality_base is None:
             return None, quality_coverage, "Quality base unavailable, neutral baseline"
-        detail = _quality_base_detail(filters, filter_score, score_analyst, score_insider)
-        return quality_base, quality_coverage, f"Quality base {quality_base:.0f} — {detail}"
+        detail = _quality_base_detail(filters, filter_score, score_analyst,
+                                      score_insider, calibrated=calibrated)
+        return (quality_base, quality_coverage,
+                f"Quality base{tag} {quality_base:.0f} — {detail}")
 
     if mode == "blend":
         sides = [(name, val, cov) for name, val, cov in (
@@ -2740,17 +3037,18 @@ def _verdict_base(
             name, val, _ = sides[0]
             missing = "quality" if name == "composite" else "composite"
             detail = f"{name} {val:.0f} only ({missing} unavailable)"
-        return base, coverage, f"Blend base {base:.0f} — {detail}"
+        return base, coverage, f"Blend base{tag} {base:.0f} — {detail}"
 
     if composite_score is None:
         return None, composite_coverage, "Composite Score unavailable, neutral baseline"
     base = float(composite_score)
-    return base, composite_coverage, f"Composite Score {base:.0f}"
+    return base, composite_coverage, f"Composite Score{tag} {base:.0f}"
 
 
 def _quality_base_detail(filters: Optional[list], filter_score: Optional[float],
                          score_analyst: Optional[float],
-                         score_insider: Optional[float]) -> str:
+                         score_insider: Optional[float],
+                         calibrated: bool = False) -> str:
     """The parts of a quality base for its breakdown line, e.g.
     'filters 82 (7/9 pass), analyst 70, insider 48'."""
     filters = filters or []
@@ -2764,7 +3062,14 @@ def _quality_base_detail(filters: Optional[list], filter_score: Optional[float],
             note += f", {no_data} without data"
         parts = [f"filters {filter_score:.0f} ({note})"]
     parts.append("analyst n/a" if score_analyst is None else f"analyst {score_analyst:.0f}")
-    parts.append("insider n/a" if score_insider is None else f"insider {score_insider:.0f}")
+    if score_insider is not None:
+        parts.append(f"insider {score_insider:.0f}")
+    else:
+        # Under the recalibration a missing insider score is a decision, not a
+        # gap: the filing history carried no directional information, so the
+        # weight renormalized away rather than scoring a misleading number.
+        parts.append("insider not scored (no signal)" if calibrated
+                     else "insider n/a")
     return ", ".join(parts)
 
 
@@ -2781,21 +3086,46 @@ def _insider_signal(pa) -> Optional[str]:
     return "no_signal"
 
 
+def _calibration_inputs(pa, calibration: str) -> dict:
+    """The sub-scores and bases a calibration scores from.
+
+    Every calibration reads the same filters, analyst score and price factors;
+    only the value sub-score, the insider sub-score, and the bases built from
+    them differ (see CALIBRATIONS). Both sets live on `pa` after
+    compute_composite_score, so one run scores both without re-fetching."""
+    if calibration == "cal":
+        return {"composite_score": pa.composite_score_cal,
+                "coverage": pa.composite_coverage_cal,
+                "quality_base": pa.quality_base_cal,
+                "quality_coverage": pa.quality_coverage_cal,
+                "score_insider": pa.score_insider_cal}
+    return {"composite_score": pa.composite_score,
+            "coverage": pa.composite_coverage,
+            "quality_base": pa.quality_base,
+            "quality_coverage": pa.quality_coverage,
+            "score_insider": pa.score_insider}
+
+
 def has_verdict_base(pa, mode: str) -> bool:
     """Whether `pa` has what `mode` builds its base from."""
-    if mode == "quality":
-        return pa.quality_base is not None
-    if mode == "blend":
-        return pa.composite_score is not None or pa.quality_base is not None
-    return pa.composite_score is not None
+    base, calibration = split_base_mode(mode)
+    vals = _calibration_inputs(pa, calibration)
+    if base == "quality":
+        return vals["quality_base"] is not None
+    if base == "blend":
+        return (vals["composite_score"] is not None
+                or vals["quality_base"] is not None)
+    return vals["composite_score"] is not None
 
 
 def _verdict_v2_under(pa, mode: str, is_holding: bool,
                       position_pct: Optional[float]) -> Optional[Verdict]:
     if not has_verdict_base(pa, mode):
         return None
+    _, calibration = split_base_mode(mode)
+    vals = _calibration_inputs(pa, calibration)
     return compute_verdict_v2(
-        composite_score=pa.composite_score,
+        composite_score=vals["composite_score"],
         filters=pa.filters,
         current_price=pa.current_price,
         target_price=pa.target_mean,
@@ -2808,13 +3138,15 @@ def _verdict_v2_under(pa, mode: str, is_holding: bool,
         position_pct_portfolio=position_pct,
         is_holding=is_holding,
         news_signal=pa.news_sentiment,
-        coverage=pa.composite_coverage,
+        coverage=vals["coverage"],
         base_mode=mode,
-        quality_base=pa.quality_base,
-        quality_coverage=pa.quality_coverage,
+        quality_base=vals["quality_base"],
+        quality_coverage=vals["quality_coverage"],
         filter_score=pa.filter_score,
         score_analyst=pa.score_analyst,
-        score_insider=pa.score_insider,
+        score_insider=vals["score_insider"],
+        days_to_earnings=pa.days_to_earnings,
+        prior_label=prior_verdict_label(pa.ticker, mode),
     )
 
 
@@ -3179,6 +3511,18 @@ class PositionAnalysis:
     filter_coverage: Optional[float] = None
     quality_base: Optional[float] = None
     quality_coverage: Optional[float] = None
+    # Recalibrated twins of the two sub-scores the calibration changes, and of
+    # every base built from them (see CALIBRATIONS). Held alongside the
+    # standard values rather than replacing them so one run can score both and
+    # the report's Scoring switch needs no refresh. score_insider_cal is None
+    # whenever the insider read carries no information — that is the point of
+    # finding 1, not missing data.
+    score_value_cal: Optional[float] = None
+    score_insider_cal: Optional[float] = None
+    composite_score_cal: Optional[float] = None
+    composite_coverage_cal: Optional[float] = None
+    quality_base_cal: Optional[float] = None
+    quality_coverage_cal: Optional[float] = None
     # Next earnings report (event-risk timing): ISO date + days from today.
     # days_to_earnings is forward-only (None once a report is in the past).
     next_earnings_date: Optional[str] = None
@@ -3550,6 +3894,12 @@ def analyze_position(
             # $163M selling at $4T NVDA is very different from $163M at $5B
             market_cap = info.get("marketCap")
             pa.score_insider = insider_score(pa.insider_activity, market_cap=market_cap)
+            # The recalibrated read: identical except that a no-information
+            # outcome (below-noise selling, RSU withholding, compensation only)
+            # comes back as None so the weight renormalizes away — finding 1.
+            pa.score_insider_cal = insider_score(
+                pa.insider_activity, market_cap=market_cap,
+                neutral_as_missing=True)
             # Stash the score on the activity dict so the renderer can use it
             # to decide between "Caution" and "No signal" for selling cases.
             if pa.insider_activity is not None:
@@ -3761,6 +4111,8 @@ def select_watchlist_prune_candidates(
     """
     out: dict[str, list[str]] = {}
     for wl_name, items in (watchlists_analyzed or {}).items():
+        if wl_name == RECENTLY_HELD_GROUP:
+            continue        # synthetic group — there is no such list to prune
         ticks = [pa.ticker for pa in items
                  if not pa.error
                  and pa.verdict is not None
@@ -3811,46 +4163,83 @@ _BASE_SCORE_BLURBS = {
     "blend": "the average of the Composite and Quality bases",
 }
 
+_CALIBRATION_BLURBS = {
+    "std": "Scoring as originally calibrated — the value and insider "
+           "sub-scores and the context modifiers exactly as they have always "
+           "been.",
+    "cal": "Scoring with the six fixes from the missed-opportunity review: a "
+           "no-information insider read drops out instead of scoring ~48; the "
+           "value scale treats the quality gate as average rather than zero; "
+           "upside-to-target ramps instead of stepping; price holding above "
+           "its 200-day earns credit the trend bucket cannot give it; a label "
+           "holds through a near miss; and an imminent earnings print is "
+           "scored for fresh money.",
+}
+
 
 def _base_switch_html(interactive: bool) -> str:
-    """Header segmented control for the verdict base score (BASE_SCORE_MODES).
+    """Header segmented control for the verdict base score and the scoring
+    calibration — the two halves of a mode key (see BASE_SCORE_MODES).
 
-    Every mode is already in the report, so a segment switches the view
-    instantly (the base-view script); the pressed one starts as the run's mode.
-    ★ marks the saved default: what scheduled runs use for watchlist pruning,
-    tax flags and the missed-opportunity history. When interactive, a "Make
-    default" button saves the viewed mode as that default (the script in
-    _build_refresh_widget)."""
+    Every combination is already in the report, so either group switches the
+    view instantly (the base-view script); the pressed pair starts as the run's
+    mode. ★ marks the saved default on both groups: what scheduled runs use for
+    watchlist pruning, tax flags and the missed-opportunity history. When
+    interactive, a "Make default" button saves the viewed combination as that
+    default (the script in _build_refresh_widget)."""
     run_mode = base_score_mode()
     saved = base_score_mode(saved_only=True)
-    buttons = []
-    for mode in BASE_SCORE_MODES:
-        name = BASE_SCORE_LABELS[mode]
-        title = f"{name}: verdicts start from {_BASE_SCORE_BLURBS[mode]}."
-        full_title, mark = title, ""
-        if mode == saved:
-            full_title += _BASE_DEFAULT_NOTE
-            mark = "<span class='base-default-mark' aria-hidden='true'>★</span>"
-        buttons.append(
-            f'<button type="button" data-mode="{mode}" '
-            f'aria-pressed="{"true" if mode == run_mode else "false"}" '
-            f'data-title="{title}" title="{full_title}">{name}{mark}</button>')
-    label_tip = ("Verdict base score: what every verdict starts from. All three "
-                 "are in this report, so switching is instant. ★ marks the "
-                 "default that scheduled runs use for watchlist pruning, tax "
-                 "flags and the missed-opportunity history.")
+    run_base, run_cal = split_base_mode(run_mode)
+    saved_base, saved_cal = split_base_mode(saved)
+
+    def group(items, attr, active, saved_value, title_for):
+        out = []
+        for key, name in items:
+            title = title_for(key)
+            full_title, mark = title, ""
+            if key == saved_value:
+                full_title += _BASE_DEFAULT_NOTE
+                mark = "<span class='base-default-mark' aria-hidden='true'>★</span>"
+            out.append(
+                f'<button type="button" data-{attr}="{key}" '
+                f'aria-pressed="{"true" if key == active else "false"}" '
+                f'data-title="{title}" title="{full_title}">{name}{mark}</button>')
+        return "".join(out)
+
+    base_buttons = group(
+        [(b, BASE_SCORE_BASE_LABELS[b]) for b in BASE_SCORE_BASES],
+        "base", run_base, saved_base,
+        lambda b: f"{BASE_SCORE_BASE_LABELS[b]}: verdicts start from "
+                  f"{_BASE_SCORE_BLURBS[b]}.")
+    cal_buttons = group(
+        [(c, CALIBRATION_LABELS[c]) for c in CALIBRATIONS],
+        "cal", run_cal, saved_cal, lambda c: _CALIBRATION_BLURBS[c])
+
+    label_tip = ("Verdict base score: what every verdict starts from. Every "
+                 "base and scoring combination is in this report, so switching "
+                 "is instant. ★ marks the default that scheduled runs use for "
+                 "watchlist pruning, tax flags and the missed-opportunity "
+                 "history.")
     if run_mode != saved:
         label_tip += (f" This run used {BASE_SCORE_LABELS[run_mode]} for those "
                       f"(a one-off override).")
+    cal_tip = ("Scoring: which calibration of the sub-scores and context "
+               "modifiers the verdict uses. Recalibrated applies the six fixes "
+               "from the missed-opportunity review — it changes how every base "
+               "is measured, not which base you are looking at.")
     html = (f'<div class="base-switch" id="baseScoreSwitch" role="group" '
-            f'aria-label="Verdict base score" data-run="{run_mode}" '
-            f'data-saved="{saved}">'
+            f'aria-label="Verdict base score and scoring calibration" '
+            f'data-run="{run_mode}" data-saved="{saved}">'
             f'<span class="base-switch-label" title="{label_tip}">Base</span>'
-            + "".join(buttons) + "</div>")
+            + base_buttons
+            + '<span class="base-switch-sep" aria-hidden="true"></span>'
+            + f'<span class="base-switch-label" title="{cal_tip}">Scoring</span>'
+            + cal_buttons + "</div>")
     if interactive:
         html += ('<button type="button" class="refresh-btn base-default-btn" '
                  'id="baseDefaultBtn" hidden title="Save the viewed base score '
-                 'as the default for scheduled runs">★ Make default</button>')
+                 'and scoring as the default for scheduled runs">'
+                 '★ Make default</button>')
     return html
 
 
@@ -3978,8 +4367,13 @@ def _build_refresh_widget() -> tuple[str, str]:
     }
     function markSaved(mode) {
       sw.setAttribute("data-saved", mode);
-      sw.querySelectorAll("button[data-mode]").forEach(function(b) {
-        var isDefault = b.getAttribute("data-mode") === mode;
+      var suffix = window.BASE_CAL_SUFFIX || "-cal";
+      var savedCal = mode.slice(-suffix.length) === suffix ? "cal" : "std";
+      var savedBase = savedCal === "cal" ? mode.slice(0, -suffix.length) : mode;
+      sw.querySelectorAll("button[data-base], button[data-cal]").forEach(function(b) {
+        var isDefault = b.hasAttribute("data-base")
+          ? b.getAttribute("data-base") === savedBase
+          : b.getAttribute("data-cal") === savedCal;
         var mark = b.querySelector(".base-default-mark");
         if (isDefault && !mark) {
           mark = document.createElement("span");
@@ -5709,14 +6103,14 @@ def compare_base_modes(
     source = "saved default" if saved == active else "this run only"
     lines = [f"[base-score] Verdicts use the {BASE_SCORE_LABELS[active]} base "
              f"({source}). Side by side — same modifiers, different base:"]
-    header = f"  {'base':<12}"
+    header = f"  {'base':<16}"
     for name, _, labels in groups:
         header += f"{name + ' ' + '/'.join(labels):<34}"
     if show_prune:
         header += f"prune <{prune_threshold:g}"
     lines.append(header.rstrip())
     for mode in BASE_SCORE_MODES:
-        row = f"  {BASE_SCORE_LABELS[mode] + ('*' if mode == active else ''):<12}"
+        row = f"  {_short_mode_label(mode) + ('*' if mode == active else ''):<16}"
         for _, rows, labels in groups:
             got = [m[mode][0] for m in rows if mode in m]
             row += f"{'/'.join(str(got.count(lbl)) for lbl in labels):<34}"
@@ -5736,7 +6130,7 @@ def compare_base_modes(
     for mode in BASE_SCORE_MODES:
         if mode == active:
             continue
-        name = BASE_SCORE_LABELS[mode]
+        name = _short_mode_label(mode)
         changes = [f"{t} {m[active][0]}→{m[mode][0]}"
                    for t, m in zip(tickers, modes_by_ticker)
                    if active in m and mode in m and m[active][0] != m[mode][0]]
@@ -5879,6 +6273,14 @@ def _rec_factors(r: PositionAnalysis) -> dict:
         "score_insider": _r(r.score_insider, 1),
         "composite_score": _r(r.composite_score, 1),
         "composite_coverage": _r(r.composite_coverage, 3),
+        # The recalibrated twins, so the two calibrations can be graded against
+        # the same forward returns straight off the ledger. score_insider_cal
+        # is absent whenever the insider read carried no information — which is
+        # itself the measurement finding 1 rests on.
+        "score_value_cal": _r(r.score_value_cal, 1),
+        "score_insider_cal": _r(r.score_insider_cal, 1),
+        "composite_score_cal": _r(r.composite_score_cal, 1),
+        "quality_base_cal": _r(r.quality_base_cal, 1),
         # Quality base-score mode inputs, which base the verdict used, and what
         # every base said — so the modes can be graded against outcomes.
         "filter_score": _r(r.filter_score, 1),
@@ -6223,6 +6625,7 @@ def update_recs_history(
                 "last_verdict": cur["verdict"],
                 "last_verdict_score": cur.get("verdict_score"),
                 "last_alloc": cur["alloc"],
+                "last_held_date": run_date if (cur["alloc"] or 0) > 0 else None,
                 "last_why": cur.get("why", ""),
                 "last_news": cur.get("news"),
                 "last_factors": cur.get("factors") or {},
@@ -6258,6 +6661,10 @@ def update_recs_history(
         entry["last_verdict"] = cur["verdict"]
         entry["last_verdict_score"] = cur.get("verdict_score")
         entry["last_alloc"] = cur["alloc"]
+        if (cur["alloc"] or 0) > 0:
+            # When it was last actually a position — what recently_held_tickers
+            # keeps in the universe after it stops being one.
+            entry["last_held_date"] = run_date
         entry["last_why"] = cur.get("why", "")
         entry["last_news"] = cur.get("news")
         entry["last_factors"] = cur.get("factors") or {}
@@ -6449,6 +6856,43 @@ def _snapshot_label(by_mode: dict, mode: str, fallback: Optional[str]) -> Option
     verdict when that mode wasn't logged separately."""
     pair = by_mode.get(mode)
     return pair[0] if pair else fallback
+
+
+def recently_held_tickers(history: Optional[dict],
+                          within_days: int = PIN_RECENT_HOLDINGS_DAYS,
+                          today: Optional[date] = None) -> dict[str, str]:
+    """{ticker: name} for names held within `within_days` that the ledger has
+    stopped seeing as a position.
+
+    Finding 5: a name you sell leaves the holdings, and if it is also not on a
+    watchlist the run stops analyzing it — so the ledger's last_price freezes
+    at the day it dropped out and every later move is invisible. That is not a
+    scoring error, it is the universe quietly shrinking: META left the
+    Screening list twice in August 2026, once at the lowest price of the
+    window, and simply stopped being looked at. Re-adding these keeps the
+    position you just exited under the same scrutiny as the ones you hold.
+
+    `last_held_date` is stamped by update_recs_history whenever allocation is
+    above zero. An entry that predates that field falls back to first_date when
+    the first sighting was a real position, so names sold before this shipped
+    are still picked up."""
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    out: dict[str, str] = {}
+    for ticker, entry in ((history or {}).get("tickers") or {}).items():
+        if (entry.get("last_alloc") or 0) > 0:
+            continue                      # still held — already in the universe
+        held_on = entry.get("last_held_date")
+        if not held_on and (entry.get("first_alloc") or 0) > 0:
+            held_on = entry.get("first_date")
+        if not held_on:
+            continue
+        try:
+            age = (today - date.fromisoformat(held_on[:10])).days
+        except (ValueError, TypeError):
+            continue
+        if 0 <= age <= within_days:
+            out[ticker] = entry.get("name") or ticker
+    return out
 
 
 def compute_missed_opportunities(history: dict) -> list[dict]:
@@ -7661,6 +8105,8 @@ def generate_html_report(
         "// Base-score view: reopen the mode this browser last viewed, before the\n"
         "// tables render so they never flash another mode.\n"
         f"window.BASE_SCORE_MODES = {json.dumps(list(BASE_SCORE_MODES))};\n"
+        f"window.BASE_SCORE_BASES = {json.dumps(list(BASE_SCORE_BASES))};\n"
+        f"window.BASE_CAL_SUFFIX = {json.dumps(CALIBRATION_SUFFIX)};\n"
         "(function() {\n"
         "  try {\n"
         "    var v = localStorage.getItem('base-score-view');\n"
@@ -8013,7 +8459,8 @@ def generate_html_report(
                         color: var(--fg-chip-green);
                         border-color: var(--pos-up); }}
   /* Verdict base-score switch: a segmented pill matching .refresh-btn. */
-  .base-switch {{ height: 34px; flex: none; display: flex; align-items: center;
+  .base-switch {{ min-height: 34px; flex: none; display: flex; align-items: center;
+                  flex-wrap: wrap; row-gap: 2px;
                   gap: 2px; padding: 0 3px 0 12px; border-radius: 17px;
                   border: 1px solid var(--border-medium);
                   background: var(--bg-card); box-shadow: var(--shadow-card);
@@ -8027,13 +8474,16 @@ def generate_html_report(
   .base-switch button:not([aria-pressed="true"]):hover {{ background: var(--bg-card-hover); }}
   .base-switch button[aria-pressed="true"] {{ background: var(--bg-pill-active);
                                               color: var(--fg-pill-active); }}
+  .base-switch-sep {{ width: 1px; height: 16px; margin: 0 6px; flex: none;
+                      background: var(--border-medium); }}
   .base-default-mark {{ font-size: 9px; margin-left: 3px; opacity: 0.8; }}
   .base-default-btn[hidden] {{ display: none; }}
   /* Only the viewed base score's copy of each verdict-dependent piece shows. */
 {base_view_css}
-  @media (max-width: 360px) {{
+  @media (max-width: 560px) {{
     .base-switch-label {{ display: none; }}
     .base-switch {{ padding-left: 3px; }}
+    .base-switch-sep {{ margin: 0 3px; }}
   }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);
                      text-align: right; margin: -6px 0 10px; }}
@@ -8902,7 +9352,23 @@ Verdicts are framework outputs, not investment advice.
 // restores the table order, and remembers the choice in this browser.
 (function() {
   var MODES = window.BASE_SCORE_MODES || [];
+  var BASES = window.BASE_SCORE_BASES || [];
+  var CAL_SUFFIX = window.BASE_CAL_SUFFIX || '-cal';
   var VIEW_KEY = 'base-score-view';
+  // A mode key is "<base>" or "<base><CAL_SUFFIX>" — the two switch groups
+  // each set one half and leave the other alone.
+  function splitMode(mode) {
+    var cal = 'std', base = mode || '';
+    if (base.slice(-CAL_SUFFIX.length) === CAL_SUFFIX) {
+      base = base.slice(0, -CAL_SUFFIX.length);
+      cal = 'cal';
+    }
+    if (BASES.indexOf(base) === -1) base = BASES[0];
+    return {base: base, cal: cal};
+  }
+  function joinMode(base, cal) {
+    return base + (cal === 'cal' ? CAL_SUFFIX : '');
+  }
   var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax'];
   var root = document.documentElement;
   var sw = document.getElementById('baseScoreSwitch');
@@ -8953,8 +9419,14 @@ Verdicts are framework outputs, not investment advice.
     });
     document.querySelectorAll('table').forEach(function(t) { reorder(t, mode); });
     if (sw) {
-      sw.querySelectorAll('button[data-mode]').forEach(function(b) {
-        b.setAttribute('aria-pressed', b.getAttribute('data-mode') === mode ? 'true' : 'false');
+      var parts = splitMode(mode);
+      sw.querySelectorAll('button[data-base]').forEach(function(b) {
+        b.setAttribute('aria-pressed',
+          b.getAttribute('data-base') === parts.base ? 'true' : 'false');
+      });
+      sw.querySelectorAll('button[data-cal]').forEach(function(b) {
+        b.setAttribute('aria-pressed',
+          b.getAttribute('data-cal') === parts.cal ? 'true' : 'false');
       });
     }
     document.dispatchEvent(new CustomEvent('basescorechange', {detail: {mode: mode}}));
@@ -8966,8 +9438,12 @@ Verdicts are framework outputs, not investment advice.
   };
   if (sw) {
     sw.addEventListener('click', function(ev) {
-      var btn = ev.target.closest('button[data-mode]');
-      if (btn) window.setBaseView(btn.getAttribute('data-mode'));
+      var btn = ev.target.closest('button[data-base], button[data-cal]');
+      if (!btn) return;
+      var cur = splitMode(root.getAttribute('data-base-view'));
+      var base = btn.getAttribute('data-base') || cur.base;
+      var cal = btn.getAttribute('data-cal') || cur.cal;
+      window.setBaseView(joinMode(base, cal));
     });
   }
   // The early script may have restored another mode than the run's.
@@ -10064,6 +10540,12 @@ def main():
     ap.add_argument("--sync-dry-run", action="store_true",
                     help="With --sync-screening-watchlist, preview adds/removes "
                          "without writing.")
+    ap.add_argument("--no-pin-recent-holdings", dest="pin_recent_holdings",
+                    action="store_false",
+                    help="Don't keep recently-sold positions in the analyzed "
+                         f"universe (default: keep for "
+                         f"{PIN_RECENT_HOLDINGS_DAYS} days, so the ledger "
+                         f"keeps marking them to market after you exit).")
     ap.add_argument("--prune-watchlists", action="store_true",
                     help="With --include-watchlists: remove tickers whose verdict "
                          "score is below --prune-threshold from their Robinhood "
@@ -10326,6 +10808,22 @@ def main():
     print(f"Verdict base score: {BASE_SCORE_LABELS[_mode]}"
           + ("" if _mode == _saved_mode else
              f" (this run only; saved default {BASE_SCORE_LABELS[_saved_mode]})"))
+
+    # The ledger is read BEFORE any analysis now, because two things depend on
+    # it up front: the recalibrated verdict's hysteresis needs each name's
+    # label from last run, and the universe needs the names we held recently
+    # (finding 5). It is re-read below for the missed-opportunity tables, which
+    # must see this run's own results.
+    try:
+        _prior_history = load_recs_history()
+    except Exception as e:
+        print(f"[history] Could not read the ledger up front: {e}")
+        _prior_history = {}
+    _prior_n = load_prior_verdict_labels(_prior_history)
+    if _prior_n:
+        print(f"[verdict] Carrying last run's label for {_prior_n} ticker(s) "
+              f"(recalibrated scoring only).")
+
     print(f"Analyzing {len(rows)} positions...")
     results: list[PositionAnalysis] = analyze_positions_parallel(
         rows, use_robinhood_ratings=use_rh_ratings)
@@ -10333,6 +10831,25 @@ def main():
     # Analyze watchlists. Dedupe by ticker (a stock in multiple lists is
     # analyzed once), then fan the cached results back out per list.
     watchlists_analyzed: dict[str, list[PositionAnalysis]] = {}
+    # Finding 5: names held within the last PIN_RECENT_HOLDINGS_DAYS that are on
+    # no watchlist any more still get analyzed, under their own group, so
+    # selling a position does not silently end the analyzer's coverage of it.
+    if args.pin_recent_holdings:
+        try:
+            _held_now = {r["ticker"] for r in rows}
+            _on_a_list = {it["ticker"]
+                          for items in (watchlist_lookup or {}).values()
+                          for it in items}
+            _pin = {t: n for t, n in recently_held_tickers(_prior_history).items()
+                    if t not in _held_now and t not in _on_a_list}
+            if _pin:
+                watchlist_lookup = dict(watchlist_lookup or {})
+                watchlist_lookup[RECENTLY_HELD_GROUP] = [
+                    {"ticker": t, "name": n} for t, n in sorted(_pin.items())]
+                print(f"[universe] Keeping {len(_pin)} recently-held name(s) in "
+                      f"the run: {', '.join(sorted(_pin))}")
+        except Exception as e:
+            print(f"[universe] Could not pin recently-held names: {e}")
     if watchlist_lookup:
         held_set = {r.ticker for r in results}
         unique_rows: dict[str, dict] = {}
@@ -10407,6 +10924,8 @@ def main():
     missed_insights: dict = {}
     recs_tracked_count = 0
     try:
+        # Re-read rather than reuse `_prior_history`: nothing has written to it,
+        # but this keeps the tables reading exactly what is on disk.
         recs_history = load_recs_history()
         # Rank each ticker under the report's default sort, then diff against the
         # ledger's prior-DAY ranks (attaches r._rank_move for the ▲/▼ badges)
