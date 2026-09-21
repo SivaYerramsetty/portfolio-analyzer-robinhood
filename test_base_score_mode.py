@@ -1337,6 +1337,150 @@ def test_holdings_ytd_weighting() -> None:
               "no usable history returns None")
 
 
+def test_account_ytd_return() -> None:
+    section("account YTD: Modified Dietz, and the anchors it refuses")
+
+    import json as _json
+    from datetime import date as _date
+
+    TODAY = _date(2026, 7, 1)          # 181 days into a 365-day year
+
+    @contextlib.contextmanager
+    def _ledger(snaps: dict | None, env: str | None = None):
+        d = Path(tempfile.mkdtemp())
+        f = d / "equity_history.json"
+        if snaps is not None:
+            f.write_text(_json.dumps({"equity": snaps}))
+        old = os.environ.get("YTD_START_EQUITY")
+        if env is None:
+            os.environ.pop("YTD_START_EQUITY", None)
+        else:
+            os.environ["YTD_START_EQUITY"] = env
+        try:
+            yield f
+        finally:
+            if old is None:
+                os.environ.pop("YTD_START_EQUITY", None)
+            else:
+                os.environ["YTD_START_EQUITY"] = old
+            shutil.rmtree(d, ignore_errors=True)
+
+    # --- the arithmetic -------------------------------------------------------
+    # No flows: Modified Dietz collapses to a plain return.
+    with _ledger(None) as f:
+        r = ap.compute_account_ytd_return(11_000.0, [], today=TODAY,
+                                          start_equity=10_000.0, ledger_path=f)
+    check(round(r["pct"], 6), 10.0, "with no transfers it is just (V1-V0)/V0")
+
+    # A deposit is not performance. $10k start, $10k deposited exactly halfway,
+    # ending at $21k: the $1k gain was earned on $10k + half of $10k = $15k.
+    with _ledger(None) as f:
+        r = ap.compute_account_ytd_return(
+            21_000.0, [{"date": "2026-04-01", "amount": 10_000.0}],
+            today=TODAY, start_equity=10_000.0, ledger_path=f)
+    check(round(r["gain"], 2), 1_000.0, "a deposit is excluded from the gain")
+    # 181 days in the period, the deposit landing on day 90 → weight 91/181,
+    # so $10,000 of it counts as $5,027.62 of capital actually at work.
+    check(round(r["avg_capital"], 2), 15_027.62,
+          "the deposit is weighted by the fraction of the period it was invested")
+    check(round(r["pct"], 4), 6.6544, "the return is gain over average capital")
+
+    # The naive equity change would have called that +110%, which is the whole
+    # reason this exists — deposits dwarf performance on a funded account.
+    check(round((21_000.0 - 10_000.0) / 10_000.0 * 100, 1), 110.0,
+          "the unadjusted figure the tile must never show")
+
+    # A withdrawal moves the other way: same end equity, less capital at work.
+    with _ledger(None) as f:
+        r = ap.compute_account_ytd_return(
+            9_000.0, [{"date": "2026-04-01", "amount": -2_000.0}],
+            today=TODAY, start_equity=10_000.0, ledger_path=f)
+    check(round(r["gain"], 2), 1_000.0, "a withdrawal is excluded from the gain")
+    check(r["avg_capital"] < 10_000.0,
+          True, "a withdrawal lowers the average capital at work")
+
+    # Flows outside the year, and malformed rows, are ignored rather than fatal.
+    with _ledger(None) as f:
+        r = ap.compute_account_ytd_return(
+            11_000.0,
+            [{"date": "2025-06-01", "amount": 5_000.0},      # prior year
+             {"date": "2026-12-30", "amount": 5_000.0},      # after `today`
+             {"date": "nonsense", "amount": 1.0},            # unparseable
+             {"amount": 1.0}, {"date": "2026-03-01"}],       # incomplete
+            today=TODAY, start_equity=10_000.0, ledger_path=f)
+    check(round(r["pct"], 6), 10.0,
+          "out-of-period and malformed flows are skipped, not counted")
+
+    # --- what it refuses to report -------------------------------------------
+    with _ledger(None) as f:
+        check(ap.compute_account_ytd_return(11_000.0, None, today=TODAY,
+                                            start_equity=10_000.0, ledger_path=f),
+              None, "no flow data at all returns None")
+        check(ap.compute_account_ytd_return(None, [], today=TODAY,
+                                            start_equity=10_000.0, ledger_path=f),
+              None, "no current equity returns None")
+        check(ap.compute_account_ytd_return(11_000.0, [], today=TODAY,
+                                            ledger_path=f),
+              None, "no resolvable year-start anchor returns None")
+        # Withdrawals larger than the starting balance leave no meaningful base.
+        check(ap.compute_account_ytd_return(
+                  100.0, [{"date": "2026-01-02", "amount": -20_000.0}],
+                  today=TODAY, start_equity=1_000.0, ledger_path=f),
+              None, "a non-positive average capital returns None")
+
+    # --- anchor resolution ---------------------------------------------------
+    with _ledger(None, env="2026:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
+              "a year-tagged env anchor for this year is used")
+    with _ledger(None, env="2025:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "an env anchor tagged for another year is refused, not reused")
+    with _ledger(None, env="not-a-number") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "an unparseable env anchor is refused")
+    with _ledger(None, env="12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
+              "an untagged env anchor still works (with a warning)")
+
+    # The ledger wins over env, but only a snapshot from just before Jan 1.
+    with _ledger({"2025-12-31": 999.0}, env="2026:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 999.0,
+              "a Dec-31 ledger snapshot beats the env anchor")
+    with _ledger({"2025-12-01": 999.0}, env="2026:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
+              "a snapshot older than the anchor window is not trusted")
+    with _ledger({"2026-01-05": 999.0}, env="2026:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
+              "a snapshot from inside the year is refused — it holds performance")
+    with _ledger({"garbage": 999.0}, env="2026:12345.67") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
+              "an unparseable ledger date is skipped")
+
+    # --- the ledger itself ---------------------------------------------------
+    with _ledger(None) as f:
+        ap.record_account_equity(1_000.0, when="2025-12-31", path=f)
+        ap.record_account_equity(2_000.0, when="2026-01-02", path=f)
+        ap.record_account_equity(2_500.0, when="2026-01-02", path=f)
+        ap.record_account_equity(None, path=f)
+        ap.record_account_equity(-5.0, path=f)
+        stored = _json.loads(f.read_text())["equity"]
+    check(stored, {"2025-12-31": 1000.0, "2026-01-02": 2500.0},
+          "one equity per day, last write wins, junk values ignored")
+
+    # --- the tile ------------------------------------------------------------
+    acct = {"pct": 32.89, "start_equity": 22973.16, "end_equity": 62467.86,
+            "net_flows": 27562.70, "weighted_flows": 13300.03,
+            "avg_capital": 36273.19, "gain": 11932.0, "flow_count": 47,
+            "source": "YTD_START_EQUITY (2026)", "year": 2026}
+    html = ap._render_account_ytd_stat(acct, {"ytd_pct": 13.41})
+    check("+32.89%" in html, True, "the tile shows the adjusted figure")
+    check("account (after deposits)" in html, True,
+          "the tile says the figure is deposit-adjusted")
+    check(_tag_errors(html), [], "the tile is well-formed markup")
+    check(ap._render_account_ytd_stat(None, {"ytd_pct": 13.41}), "",
+          "no account data renders no tile")
+
+
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
@@ -1349,7 +1493,8 @@ def main() -> int:
               test_full_report, test_refresh_script_parses,
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
-              test_recently_held_universe, test_holdings_ytd_weighting):
+              test_recently_held_universe, test_holdings_ytd_weighting,
+              test_account_ytd_return):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)

@@ -14,3 +14,9 @@ portfolio_report.html
 # allocations/holdings, so it stays out of this public repo — it persists across
 # CI runs via the GitHub Actions cache instead (see .github/workflows/portfolio.yml).
 recs_history.json
+
+# Account-equity ledger for the cash-flow-adjusted YTD return. One equity value
+# per day, used to pin the year-start anchor each January. Real account values,
+# so like recs_history.json it stays out of this public repo and rides the CI
+# cache (see .github/workflows/portfolio.yml).
+equity_history.json

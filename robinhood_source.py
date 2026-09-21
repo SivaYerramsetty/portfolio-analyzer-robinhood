@@ -31,6 +31,7 @@ SECURITY NOTES:
 """
 
 import base64
+import datetime as _dt
 import json
 import os
 import sys
@@ -907,6 +908,77 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
         print(f"[tax-lots] Reconstructed lots for {len(lots_by_ticker)} ticker(s).")
     _save_instrument_cache()
     return lots_by_ticker
+
+
+def fetch_external_flows(year: Optional[int] = None,
+                         verbose: bool = True) -> Optional[list[dict]]:
+    """Completed external cash movements for `year` as
+    [{"date": "YYYY-MM-DD", "amount": float}, ...] — deposits POSITIVE,
+    withdrawals NEGATIVE, sorted by date.
+
+    These are the flows a real account return has to neutralize: money you add
+    is not performance. Robinhood used to serve portfolio historicals, but
+    /portfolios/historicals/ is now a current-snapshot protobuf service
+    (rosetta.portfolio.v1.GetAccountValueRequest, which accepts only `account`
+    and `bounds`), so robin_stocks' get_historical_portfolio() 404s and there is
+    no YTD figure to read off the API. The report computes its own instead and
+    needs the flows explicitly — see compute_account_ytd_return().
+
+    Reads the unified transfer feed, which covers ACH pulls/pushes and instant
+    deposits in one place. `pull` is money into Robinhood, `push` money out.
+    Only `completed` rows count: pending, cancelled, failed and reversed
+    transfers never settled, so counting them would invent cash that was not
+    there. Returns None if the feed can't be read at all, so the caller skips
+    the tile rather than reporting a return computed from partial flows.
+    """
+    _require_rh()
+    year = year or _dt.datetime.now().year
+    try:
+        from robin_stocks.robinhood.urls import unifiedtransfers_url
+        rows = rh.helper.request_get(unifiedtransfers_url(), 'pagination')
+    except Exception as e:
+        print(f"[flows] Could not fetch transfers: {e}")
+        return None
+    if not isinstance(rows, list):
+        print(f"[flows] Unexpected transfer payload: {type(rows).__name__}")
+        return None
+
+    flows: list[dict] = []
+    skipped = 0
+    for t in rows:
+        if not isinstance(t, dict):
+            continue
+        if (t.get("state") or "").lower() != "completed":
+            skipped += 1
+            continue
+        date_str = (t.get("record_date") or t.get("created_at") or "")[:10]
+        if not date_str.startswith(f"{year}-"):
+            continue
+        # net_amount is after any service fee; fall back to the gross amount.
+        raw = t.get("net_amount")
+        if raw in (None, ""):
+            raw = t.get("amount")
+        try:
+            amt = float(raw)
+        except (TypeError, ValueError):
+            continue
+        direction = (t.get("direction") or "").lower()
+        if direction == "pull":            # money into the account
+            flows.append({"date": date_str, "amount": amt})
+        elif direction == "push":          # money out of the account
+            flows.append({"date": date_str, "amount": -amt})
+        else:
+            print(f"[flows] Unknown transfer direction {direction!r} on "
+                  f"{date_str} — ignoring ${amt:,.2f}")
+
+    flows.sort(key=lambda f: f["date"])
+    if verbose:
+        net = sum(f["amount"] for f in flows)
+        inflow = sum(f["amount"] for f in flows if f["amount"] > 0)
+        print(f"[flows] {year}: {len(flows)} completed transfer(s), "
+              f"${inflow:,.2f} in, ${net - inflow:,.2f} out, net ${net:,.2f} "
+              f"({skipped} non-completed skipped)")
+    return flows
 
 
 def fetch_realized_ytd(year: Optional[int] = None,
