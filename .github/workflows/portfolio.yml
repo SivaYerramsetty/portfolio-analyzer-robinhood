@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # cron-job.org fires this workflow every 20 min on weekdays, but it has no way
+  # cron-job.org fires this workflow every 15 min on weekdays, but it has no way
   # to skip US market holidays. This gate handles that: on an NYSE full-day
   # holiday it reports the market closed and analyze/deploy skip cleanly (green,
   # no Robinhood login, no API spend). Weekends are already excluded upstream by
