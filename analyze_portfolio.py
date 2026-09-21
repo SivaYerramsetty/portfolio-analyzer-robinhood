@@ -6424,6 +6424,31 @@ def _alpha_fields(e: dict, move_pct: float) -> dict:
     }
 
 
+def _snapshot_verdicts(factors: Optional[dict]) -> dict[str, tuple]:
+    """{mode: (label, score)} for one ledger snapshot (first sight or latest),
+    from the per-mode verdicts _rec_factors logs.
+
+    This is what lets the Missed-Opportunities tables answer the question the
+    base switch raises — would another base have caught this? Empty for
+    snapshots taken before that logging landed, and for ETF/thematic names
+    whose verdict doesn't depend on the base; `_snapshot_label` then falls back
+    to the snapshot's single verdict."""
+    stored = (factors or {}).get("verdicts") or {}
+    out: dict[str, tuple] = {}
+    for mode in BASE_SCORE_MODES:
+        pair = stored.get(mode)
+        if isinstance(pair, (list, tuple)) and pair:
+            out[mode] = (pair[0], pair[1] if len(pair) > 1 else None)
+    return out
+
+
+def _snapshot_label(by_mode: dict, mode: str, fallback: Optional[str]) -> Optional[str]:
+    """`mode`'s verdict label in a snapshot, falling back to its single stored
+    verdict when that mode wasn't logged separately."""
+    pair = by_mode.get(mode)
+    return pair[0] if pair else fallback
+
+
 def compute_missed_opportunities(history: dict) -> list[dict]:
     """From the ledger, return tickers that ran up >= MISSED_OPP_GAIN_PCT since
     they were first seen while we still hold below MISSED_OPP_ALLOC_THRESHOLD.
@@ -6511,11 +6536,27 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
         #     at some point, but allocation never followed). These are different
         #     failures with different fixes, so the report shouldn't conflate
         #     them. `still_actionable` marks a call that is STILL live today. ---
-        ever_buy_graded = (verdict in BUY_GRADE_VERDICTS
-                           or last_verdict in BUY_GRADE_VERDICTS)
-        miss_type = "execution" if ever_buy_graded else "model"
-        still_actionable = (last_verdict in BUY_GRADE_VERDICTS
-                            and last_alloc < STILL_ACTIONABLE_ALLOC_PCT)
+        #     Classified per base-score mode, because a name the Composite base
+        #     never rated a buy may well have been an ADD under Quality — which
+        #     is exactly what the reader is switching bases to find out.
+        first_by_mode = _snapshot_verdicts(e.get("first_factors"))
+        last_by_mode = _snapshot_verdicts(e.get("last_factors"))
+
+        def _classify(mode):
+            fl = _snapshot_label(first_by_mode, mode, verdict)
+            ll = _snapshot_label(last_by_mode, mode, last_verdict)
+            ever_buy = fl in BUY_GRADE_VERDICTS or ll in BUY_GRADE_VERDICTS
+            return ("execution" if ever_buy else "model",
+                    ll in BUY_GRADE_VERDICTS and last_alloc < STILL_ACTIONABLE_ALLOC_PCT)
+
+        by_mode = {m: _classify(m) for m in BASE_SCORE_MODES}
+        miss_type_by_mode = {m: t for m, (t, _) in by_mode.items()}
+        actionable_by_mode = {m: a for m, (_, a) in by_mode.items()}
+        # The run's own mode stays the headline value the ledger stats, the AI
+        # post-mortem and the summary counts read.
+        run_mode = base_score_mode()
+        miss_type = miss_type_by_mode.get(run_mode)
+        still_actionable = actionable_by_mode.get(run_mode, False)
 
         # --- Numeric factors as of first sight (populated by _rec_factors on
         #     runs after that logging landed; older entries fall back to the
@@ -6547,6 +6588,10 @@ def compute_missed_opportunities(history: dict) -> list[dict]:
             "reason": reason,
             "miss_type": miss_type,
             "still_actionable": still_actionable,
+            "miss_type_by_mode": miss_type_by_mode,
+            "still_actionable_by_mode": actionable_by_mode,
+            "first_verdicts": first_by_mode,
+            "last_verdicts": last_by_mode,
             "w52_first": _factor("week52_position"),
             "trend_first": _factor("trend"),
             "composite_first": _factor("composite_score"),
@@ -6590,8 +6635,20 @@ def compute_avoided_losses(history: dict) -> list[dict]:
         date_str = _fmt_short_date(e.get("first_date"))
         when = f" on {date_str}" if date_str else ""
 
-        was_buy = verdict in BUY_GRADE_VERDICTS
-        dodge_type = "lucky" if was_buy else "caution"
+        # Per base-score mode, so the badge stays truthful under the switch:
+        # a name the Composite base never liked may have been a buy under
+        # Quality, which makes it a lucky dodge in that view and not a correct
+        # one. The run's mode supplies the headline value.
+        first_by_mode = _snapshot_verdicts(e.get("first_factors"))
+        last_by_mode = _snapshot_verdicts(e.get("last_factors"))
+        dodge_by_mode = {
+            m: ("lucky" if _snapshot_label(first_by_mode, m, verdict)
+                in BUY_GRADE_VERDICTS else "caution")
+            for m in BASE_SCORE_MODES}
+        dodge_type = dodge_by_mode.get(
+            base_score_mode(),
+            "lucky" if verdict in BUY_GRADE_VERDICTS else "caution")
+        was_buy = dodge_type == "lucky"
         if verdict in REC_VERDICT_LABELS:
             lead = f"Flagged <strong>{verdict}</strong>{when}"
         elif verdict:
@@ -6631,6 +6688,9 @@ def compute_avoided_losses(history: dict) -> list[dict]:
             "loss_pct": move_pct,
             "last_alloc": last_alloc,
             "dodge_type": dodge_type,
+            "dodge_type_by_mode": dodge_by_mode,
+            "first_verdicts": first_by_mode,
+            "last_verdicts": last_by_mode,
             "reason": reason,
             "w52_first": _factor("week52_position"),
             "trend_first": _factor("trend"),
@@ -6681,6 +6741,20 @@ def compute_missed_opp_insights(
     model_gap = sum(1 for m in missed if m.get("miss_type") == "model")
     exec_gap = sum(1 for m in missed if m.get("miss_type") == "execution")
     actionable = [m for m in missed if m.get("still_actionable")]
+    # The same two counts under every base, so the header strip keeps pace with
+    # the switch instead of stating the run's mode's split over swapped badges.
+    by_mode = {}
+    for mode in BASE_SCORE_MODES:
+        types = [(m.get("miss_type_by_mode") or {}).get(mode, m.get("miss_type"))
+                 for m in missed]
+        by_mode[mode] = {
+            "model_gap": sum(1 for t in types if t == "model"),
+            "execution_gap": sum(1 for t in types if t == "execution"),
+            "still_actionable": [
+                m["ticker"] for m in missed
+                if (m.get("still_actionable_by_mode") or {}).get(
+                    mode, m.get("still_actionable"))],
+        }
 
     return {
         "tracked_valid": valid,
@@ -6694,6 +6768,7 @@ def compute_missed_opp_insights(
         "model_gap": model_gap,
         "execution_gap": exec_gap,
         "still_actionable": [m["ticker"] for m in actionable],
+        "by_mode": by_mode,
         "window_start": min(first_dates) if first_dates else None,
         "window_end": max(last_dates) if last_dates else None,
     }
@@ -6920,6 +6995,82 @@ def _miss_verdict_chip(v_label: str, v_score: Optional[float]) -> str:
             f"{_miss_esc(v_label)}</span>{score_str}")
 
 
+_MISS_BADGE_STYLE = ("display:inline-block;padding:2px 7px;border-radius:10px;"
+                     "font-size:10px;font-weight:700;white-space:nowrap;")
+_MISS_LIVE_PILL = ("<span title='Still rated buy-grade today with token allocation' "
+                   "style='display:inline-block;margin-left:5px;padding:1px 5px;"
+                   "border-radius:8px;font-size:9px;font-weight:700;"
+                   "background:rgba(39,174,96,0.18);color:var(--pos-up);'>● LIVE</span>")
+
+
+def _miss_type_badge(miss_type: str) -> str:
+    """Model gap (never rated a buy) vs execution gap (rated a buy, never
+    sized up) — different failures with different fixes."""
+    if miss_type == "execution":
+        return (f"<span style='{_MISS_BADGE_STYLE}background:rgba(41,128,185,0.15);"
+                f"color:#2980b9;' title='Rated a buy at some point — allocation "
+                f"never followed'>Didn&#39;t act</span>")
+    return (f"<span style='{_MISS_BADGE_STYLE}background:rgba(230,126,34,0.15);"
+            f"color:var(--fg-chip-amber);' title='Never rated a buy — the score "
+            f"missed it'>Model gap</span>")
+
+
+def _miss_dodge_badge(dodge_type: str) -> str:
+    """Correct caution (never a buy) vs lucky dodge (rated a buy; only low
+    allocation avoided the loss)."""
+    if dodge_type == "lucky":
+        return (f"<span style='{_MISS_BADGE_STYLE}background:rgba(230,126,34,0.15);"
+                f"color:var(--fg-chip-amber);' title='Rated a buy — only low "
+                f"allocation avoided the loss'>Lucky dodge</span>")
+    return (f"<span style='{_MISS_BADGE_STYLE}background:rgba(39,174,96,0.15);"
+            f"color:var(--pos-up);' title='Never a buy signal — the caution was "
+            f"right'>Correct caution</span>")
+
+
+def _miss_base_line(by_mode: dict, mode: str) -> str:
+    """The muted "what the other bases called it" line under a verdict chip —
+    the same readout the holdings hover-card carries, in table form. Empty when
+    the snapshot has no per-mode verdicts logged."""
+    bits = []
+    for other in BASE_SCORE_MODES:
+        if other == mode or other not in by_mode:
+            continue
+        lbl, sc = by_mode[other]
+        name = BASE_SCORE_LABELS.get(other, other)
+        score = f" {sc:.0f}" if sc is not None else ""
+        bits.append(f"{name} base: {_miss_esc(lbl or '—')}{score}")
+    return (f"<span class='miss-alt'>{' · '.join(bits)}</span>") if bits else ""
+
+
+def _miss_verdict_td(by_mode: dict, label: Optional[str],
+                     score: Optional[float]) -> str:
+    """A missed/avoided verdict <td>: the viewed base's chip, with what the
+    other bases called the same name underneath. Both follow the base switch,
+    as does the column's sort value, so "would another base have caught this?"
+    is answerable without leaving the table. Snapshots logged before per-mode
+    verdicts existed render the single stored verdict, unswitched."""
+    shown = label or "—"
+
+    def _one(mode):
+        pair = by_mode.get(mode)
+        chip = (_miss_verdict_chip(pair[0] or "—", pair[1]) if pair
+                else _miss_verdict_chip(shown, score))
+        return chip + _miss_base_line(by_mode, mode)
+
+    if by_mode:
+        extra = "".join(
+            f" data-sort-{m}='{_miss_esc(_snapshot_label(by_mode, m, shown))}'"
+            for m in BASE_SCORE_MODES)
+    else:
+        # Says why this one chip sits still while the rest of the report
+        # switches, rather than leaving it looking like a stuck cell.
+        extra = (" title='Logged before the analyzer recorded a verdict per "
+                 "base score, so this is the single verdict from that run&#39;s "
+                 "own base — it does not switch.' style='cursor:help;'")
+    return (f"<td data-sort='{_miss_esc(shown)}'{extra}>"
+            f"{_mode_variants(_one)}</td>")
+
+
 def _miss_factor_cell(row: dict) -> str:
     """Compact 'as of first sight' cell: composite score, 52-week position, and
     trend arrow — the numeric factors now logged per ledger entry. Renders '—'
@@ -6961,9 +7112,14 @@ def _miss_summary_strip(insights: Optional[dict]) -> str:
         return ""
     up5, down5 = insights["up5"], insights["down5"]
     valid = insights["tracked_valid"]
-    model_gap = insights["model_gap"]
-    exec_gap = insights["execution_gap"]
-    actionable = insights["still_actionable"]
+    per_mode = insights.get("by_mode") or {}
+
+    def _gaps(mode):
+        d = per_mode.get(mode) or insights
+        return d["model_gap"], d["execution_gap"]
+
+    def _actionable(mode):
+        return (per_mode.get(mode) or insights)["still_actionable"]
 
     def card(big, label, tone="neutral", sub=""):
         tone_color = {"good": "var(--pos-up)", "bad": "var(--pos-down)",
@@ -6990,15 +7146,23 @@ def _miss_summary_strip(insights: Optional[dict]) -> str:
         card(f"{down5}<span style='font-size:13px;color:var(--fg-muted);'> / {valid}</span>",
              "Tracked names down ≥5%", "bad",
              f"{insights['down5_pct']:.0f}% — the misses' mirror image"),
-        card(f"{model_gap} <span style='font-size:13px;color:var(--fg-muted);'>·</span> {exec_gap}",
-             "Model gap · Execution gap", "neutral",
-             "never a buy · rated buy, under-sized"),
+        # The gap split is a verdict readout, so it follows the base switch.
+        _mode_variants(
+            lambda mode: card(
+                f"{_gaps(mode)[0]} <span style='font-size:13px;"
+                f"color:var(--fg-muted);'>·</span> {_gaps(mode)[1]}",
+                "Model gap · Execution gap", "neutral",
+                "never a buy · rated buy, under-sized"),
+            tag="div"),
     ])
-    actionable_html = ""
-    if actionable:
+
+    def _actionable_banner(mode):
+        actionable = _actionable(mode)
+        if not actionable:
+            return ""
         shown = ", ".join(_miss_esc(t) for t in actionable[:8])
         more = f" +{len(actionable) - 8} more" if len(actionable) > 8 else ""
-        actionable_html = (
+        return (
             "<div style='margin-top:12px;padding:10px 14px;border-radius:8px;"
             "background:rgba(39,174,96,0.08);border:1px solid rgba(39,174,96,0.35);"
             "font-size:12px;color:var(--fg-body);'>"
@@ -7008,6 +7172,8 @@ def _miss_summary_strip(insights: Optional[dict]) -> str:
             f"{STILL_ACTIONABLE_ALLOC_PCT:g}% allocation — "
             f"<strong>{shown}{more}</strong>. These are live, not hindsight.</div>"
         )
+
+    actionable_html = _mode_variants(_actionable_banner, tag="div")
     window = ""
     if insights.get("window_start") and insights.get("window_end"):
         window = (f"<span style='color:var(--fg-muted);font-size:11px;'>"
@@ -7155,26 +7321,20 @@ def _render_missed_opportunities(
         reason_attr = _miss_reason_attr(m.get("reason") or "")
         search_val = f"{m['ticker'].lower()} {m['name'].lower()} {(m.get('sector') or '').lower()}"
 
-        # Type badge: model gap vs execution gap.
-        if m.get("miss_type") == "execution":
-            type_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
-                          "font-size:10px;font-weight:700;background:rgba(41,128,185,0.15);"
-                          "color:#2980b9;white-space:nowrap;' title='Rated a buy at some "
-                          "point — allocation never followed'>Didn&#39;t act</span>")
-            type_sort = "execution"
-        else:
-            type_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
-                          "font-size:10px;font-weight:700;background:rgba(230,126,34,0.15);"
-                          "color:var(--fg-chip-amber);white-space:nowrap;' title='Never rated "
-                          "a buy — the score missed it'>Model gap</span>")
-            type_sort = "model"
+        # Type badge: model gap vs execution gap — per base, since a name
+        # one base never rated a buy can be an execution gap under another.
+        types = m.get("miss_type_by_mode") or {}
+        type_sort = m.get("miss_type") or "model"
+        type_badge = _mode_variants(
+            lambda mode: _miss_type_badge(types.get(mode, type_sort)))
+        type_per_mode = "".join(
+            f" data-sort-{mode}='{types.get(mode, type_sort)}'"
+            for mode in BASE_SCORE_MODES) if types else ""
 
-        live_pill = ""
-        if m.get("still_actionable"):
-            live_pill = ("<span title='Still rated buy-grade today with token allocation' "
-                         "style='display:inline-block;margin-left:5px;padding:1px 5px;"
-                         "border-radius:8px;font-size:9px;font-weight:700;"
-                         "background:rgba(39,174,96,0.18);color:var(--pos-up);'>● LIVE</span>")
+        live = m.get("still_actionable_by_mode") or {}
+        live_pill = _mode_variants(
+            lambda mode: (_MISS_LIVE_PILL
+                          if live.get(mode, m.get("still_actionable")) else ""))
 
         html += f"<tr data-search='{_esc(search_val)}'>"
         html += (f"<td class='ticker' data-sort='{ticker}'>"
@@ -7183,11 +7343,13 @@ def _render_missed_opportunities(
                  f"text-decoration-style:dotted;cursor:pointer;'>{ticker}</a>{live_pill}</td>")
         html += (f"<td data-sort='{_esc(m['name'])}'><div style='font-weight:500'>{_esc(m['name'])}</div>"
                  f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
-        html += f"<td data-sort='{type_sort}'>{type_badge}</td>"
+        html += f"<td data-sort='{type_sort}'{type_per_mode}>{type_badge}</td>"
         html += (f"<td data-sort='{date_iso}'>"
                  f"<span style='color:var(--fg-muted);font-size:11px;'>{date_display}</span></td>")
-        html += f"<td data-sort='{label}'>{_miss_verdict_chip(label, m.get('first_verdict_score'))}</td>"
-        html += f"<td data-sort='{cur_verdict}'>{_miss_verdict_chip(cur_verdict, m.get('last_verdict_score'))}</td>"
+        html += _miss_verdict_td(m.get("first_verdicts") or {}, label,
+                                 m.get("first_verdict_score"))
+        html += _miss_verdict_td(m.get("last_verdicts") or {}, cur_verdict,
+                                 m.get("last_verdict_score"))
         html += _miss_factor_cell(m)
         # Gain cell, with a muted peak give-back sub-line when the name has
         # round-tripped meaningfully off its high (invisible when sorted by
@@ -7254,18 +7416,15 @@ def _render_avoided_losses(avoided: list[dict]) -> str:
         reason_attr = _miss_reason_attr(a.get("reason") or "")
         search_val = f"{a['ticker'].lower()} {a['name'].lower()} {(a.get('sector') or '').lower()}"
 
-        if a.get("dodge_type") == "lucky":
-            dodge_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
-                           "font-size:10px;font-weight:700;background:rgba(230,126,34,0.15);"
-                           "color:var(--fg-chip-amber);white-space:nowrap;' title='Rated a buy "
-                           "— only low allocation avoided the loss'>Lucky dodge</span>")
-            dodge_sort = "lucky"
-        else:
-            dodge_badge = ("<span style='display:inline-block;padding:2px 7px;border-radius:10px;"
-                           "font-size:10px;font-weight:700;background:rgba(39,174,96,0.15);"
-                           "color:var(--pos-up);white-space:nowrap;' title='Never a buy signal "
-                           "— the caution was right'>Correct caution</span>")
-            dodge_sort = "caution"
+        # Per base, for the same reason the misses table splits its Type
+        # badge: another base may have rated this a buy.
+        dodges = a.get("dodge_type_by_mode") or {}
+        dodge_sort = a.get("dodge_type") or "caution"
+        dodge_badge = _mode_variants(
+            lambda mode: _miss_dodge_badge(dodges.get(mode, dodge_sort)))
+        dodge_per_mode = "".join(
+            f" data-sort-{mode}='{dodges.get(mode, dodge_sort)}'"
+            for mode in BASE_SCORE_MODES) if dodges else ""
 
         html += f"<tr data-search='{_esc(search_val)}'>"
         html += (f"<td class='ticker' data-sort='{ticker}'>"
@@ -7274,11 +7433,13 @@ def _render_avoided_losses(avoided: list[dict]) -> str:
                  f"text-decoration-style:dotted;cursor:pointer;'>{ticker}</a></td>")
         html += (f"<td data-sort='{_esc(a['name'])}'><div style='font-weight:500'>{_esc(a['name'])}</div>"
                  f"<div style='color:var(--fg-muted);font-size:11px;'>{sector}</div></td>")
-        html += f"<td data-sort='{dodge_sort}'>{dodge_badge}</td>"
+        html += f"<td data-sort='{dodge_sort}'{dodge_per_mode}>{dodge_badge}</td>"
         html += (f"<td data-sort='{date_iso}'>"
                  f"<span style='color:var(--fg-muted);font-size:11px;'>{date_display}</span></td>")
-        html += f"<td data-sort='{label}'>{_miss_verdict_chip(label, a.get('first_verdict_score'))}</td>"
-        html += f"<td data-sort='{cur_verdict}'>{_miss_verdict_chip(cur_verdict, a.get('last_verdict_score'))}</td>"
+        html += _miss_verdict_td(a.get("first_verdicts") or {}, label,
+                                 a.get("first_verdict_score"))
+        html += _miss_verdict_td(a.get("last_verdicts") or {}, cur_verdict,
+                                 a.get("last_verdict_score"))
         html += _miss_factor_cell(a)
         html += (f"<td class='num pos-down' data-sort='{a['loss_pct']:.2f}' style='font-weight:600;'>"
                  f"{_fmt_pct(a['loss_pct'], 1, True)}</td>")
@@ -8011,6 +8172,10 @@ def generate_html_report(
   .vcard.show {{ display: block; }}
   .miss-trigger {{ font-size: 11px; color: var(--fg-muted); cursor: help;
                   border-bottom: 1px dotted var(--fg-muted); white-space: nowrap; }}
+  /* What the other base scores called a missed/avoided name. */
+  .miss-alt {{ display: block; margin-top: 3px; font-size: 10px;
+               color: var(--fg-muted); white-space: nowrap;
+               font-variant-numeric: tabular-nums; }}
   .miss-vcard {{ width: 360px; }}
   .vcard-head {{ display: flex; align-items: baseline;
                  justify-content: space-between; gap: 10px; margin-bottom: 8px; }}

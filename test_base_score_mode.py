@@ -856,6 +856,145 @@ def test_refresh_script_parses() -> None:
           + (f": {proc.stderr.strip()}" if proc.returncode else ""))
 
 
+
+# ------------------------------------- 8. the missed-opportunity tables -----
+
+def _miss_ledger() -> dict:
+    """A ledger with one entry per case the tables must handle: bases that
+    disagree, an entry logged before per-mode verdicts existed, and a drop for
+    the Avoided Losses side."""
+    return {"tickers": {
+        "AAA": {                              # up 25%, bases disagree
+            "name": "Arch", "sector": "Financials",
+            "first_price": 80.0, "last_price": 100.0, "last_alloc": 0.4,
+            "first_date": "2026-08-01", "last_date": "2026-09-19",
+            "first_verdict": "HOLD", "first_verdict_score": 61.0,
+            "last_verdict": "HOLD", "last_verdict_score": 64.0,
+            "first_factors": {"verdicts": {"composite": ["HOLD", 61.0],
+                                           "quality": ["ADD", 84.0],
+                                           "blend": ["ADD", 72.5]}},
+            "last_factors": {"verdicts": {"composite": ["HOLD", 64.0],
+                                          "quality": ["ADD", 94.0],
+                                          "blend": ["ADD", 87.7]}},
+        },
+        "OLD": {                              # up 30%, logged before per-mode
+            "name": "Legacy", "sector": "Industrials",
+            "first_price": 10.0, "last_price": 13.0, "last_alloc": 0.0,
+            "first_date": "2026-07-01", "last_date": "2026-09-19",
+            "first_verdict": "TRIM", "first_verdict_score": 37.0,
+            "last_verdict": "TRIM", "last_verdict_score": 41.0,
+        },
+        "DWN": {                              # down 20%
+            "name": "Falling", "sector": "Energy",
+            "first_price": 50.0, "last_price": 40.0, "last_alloc": 0.0,
+            "first_date": "2026-08-10", "last_date": "2026-09-19",
+            "first_verdict": "HOLD", "first_verdict_score": 55.0,
+            "last_verdict": "SELL", "last_verdict_score": 30.0,
+            "first_factors": {"verdicts": {"composite": ["HOLD", 55.0],
+                                           "quality": ["ADD", 81.0],
+                                           "blend": ["HOLD", 68.0]}},
+            "last_factors": {"verdicts": {"composite": ["SELL", 30.0],
+                                          "quality": ["HOLD", 52.0],
+                                          "blend": ["TRIM", 41.0]}},
+        },
+    }}
+
+
+def test_missed_opps_per_mode() -> None:
+    section("missed opportunities: every base's call on the same name")
+    check(ap._snapshot_verdicts({"verdicts": {"quality": ["ADD", 84.0]}}),
+          {"quality": ("ADD", 84.0)}, "a snapshot's logged per-mode verdicts")
+    check((ap._snapshot_verdicts({}), ap._snapshot_verdicts(None)), ({}, {}),
+          "nothing for a snapshot that predates the logging")
+    check(ap._snapshot_label({}, "quality", "TRIM"), "TRIM",
+          "an unlogged mode falls back to the snapshot's single verdict")
+
+    hist = _miss_ledger()
+    with _mode_env(saved="composite"):
+        missed = {m["ticker"]: m for m in ap.compute_missed_opportunities(hist)}
+        avoided = {a["ticker"]: a for a in ap.compute_avoided_losses(hist)}
+        insights = ap.compute_missed_opp_insights(
+            hist, list(missed.values()), list(avoided.values()))
+    check(missed["AAA"]["last_verdicts"],
+          {"composite": ("HOLD", 64.0), "quality": ("ADD", 94.0),
+           "blend": ("ADD", 87.7)}, "a miss row carries every base's verdict")
+    check(missed["AAA"]["miss_type_by_mode"],
+          {"composite": "model", "quality": "execution", "blend": "execution"},
+          "and is a model gap only under the bases that never rated it a buy")
+    check((missed["AAA"]["miss_type"], missed["AAA"]["still_actionable"]),
+          ("model", False), "the headline values are the run's mode")
+    check(missed["OLD"]["first_verdicts"], {},
+          "an entry logged before per-mode verdicts has none to show")
+    check(missed["OLD"]["miss_type_by_mode"],
+          {m: "model" for m in ap.BASE_SCORE_MODES},
+          "and classifies the same under every base")
+    check(avoided["DWN"]["dodge_type_by_mode"],
+          {"composite": "caution", "quality": "lucky", "blend": "caution"},
+          "a dodge is only lucky under a base that rated the name a buy")
+    check({m: (d["model_gap"], d["execution_gap"], d["still_actionable"])
+           for m, d in insights["by_mode"].items()},
+          {"composite": (2, 0, []), "quality": (1, 1, ["AAA"]),
+           "blend": (1, 1, ["AAA"])},
+          "the summary strip's gap split and live list per base")
+
+    with _mode_env(saved="quality"):
+        m = {r["ticker"]: r for r in ap.compute_missed_opportunities(hist)}["AAA"]
+        a = {r["ticker"]: r for r in ap.compute_avoided_losses(hist)}["DWN"]
+    check((m["miss_type"], m["still_actionable"], a["dodge_type"]),
+          ("execution", True, "lucky"),
+          "running on another base moves the headline values with it")
+
+
+def test_missed_opps_markup() -> None:
+    section("missed opportunities: the cells follow the base switch")
+    by_mode = {"composite": ("HOLD", 64.0), "quality": ("ADD", 94.0),
+               "blend": ("ADD", 87.7)}
+    with _mode_env(saved="composite"):
+        td = ap._miss_verdict_td(by_mode, "HOLD", 64.0)
+        plain = ap._miss_verdict_td({}, "TRIM", 41.0)
+    check(re.findall(r"data-sort(?:-\w+)?='([A-Z]+)'", td),
+          ["HOLD", "HOLD", "ADD", "ADD"],
+          "the cell sorts by the run's label, with every mode's alongside")
+    check(td.count("class='verdict'"), 3, "and holds one chip per mode")
+    check("<span class='miss-alt'>Quality base: ADD 94 · Blend base: ADD 88</span>"
+          in td, True, "the viewed base's chip names what the others called it")
+    check(("Composite base: HOLD 64" in td, "Quality base: ADD 94 · Blend" in plain),
+          (True, False), "each copy names the other two; a ledger-only row none")
+    check((plain.count("class='verdict'"), "data-sort-quality" in plain),
+          (1, False), "which leaves one unswitched chip and no per-mode sort")
+    check("Logged before the analyzer recorded a verdict per base score" in plain,
+          True, "and says why that chip sits still while the report switches")
+
+    hist = _miss_ledger()
+    with _mode_env(saved="composite"):
+        missed = ap.compute_missed_opportunities(hist)
+        avoided = ap.compute_avoided_losses(hist)
+        html = ap._render_missed_opportunities(
+            missed, 3, avoided=avoided,
+            insights=ap.compute_missed_opp_insights(hist, missed, avoided))
+    check(_tag_errors(html), [], "the section is well-formed")
+    row = re.search(r"<tr data-search='aaa[^']*'>(.*?)</tr>", html, re.S).group(1)
+    check((row.count("Model gap"), row.count("Didn&#39;t act")), (1, 1),
+          "the miss-type badge carries both readings, one shown at a time")
+    check(row.count("● LIVE"), 1,
+          "so does the still-actionable pill — only the bases that earn it")
+    check(re.search(r"<td data-sort='model'((?: data-sort-\w+='\w+')+)>",
+                    row).group(1),
+          " data-sort-composite='model' data-sort-quality='execution'"
+          " data-sort-blend='execution'",
+          "and the column's sort value switches with the base")
+    dwn = re.search(r"<tr data-search='dwn[^']*'>(.*?)</tr>", html, re.S).group(1)
+    check((dwn.count("Correct caution"), dwn.count("Lucky dodge")), (1, 1),
+          "the avoided table's dodge badge splits the same way")
+    strip = html.split("<p style=", 1)[0]
+    check(re.findall(r"(\d+) <span[^>]*>·</span> (\d+)", strip),
+          [("2", "0"), ("1", "1")],
+          "the summary strip keeps each base's gap split")
+    check((strip.count("Still actionable:"),
+           "bmode-quality bmode-blend" in strip), (1, True),
+          "and the live banner only under the bases with a live call")
+
+
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
@@ -864,6 +1003,7 @@ def main() -> int:
               test_verdicts_per_mode, test_mode_resolution,
               test_rank_badges_per_mode, test_ledger_ranks_per_mode,
               test_compare_base_modes, test_mode_variants, test_report_markup,
+              test_missed_opps_per_mode, test_missed_opps_markup,
               test_full_report, test_refresh_script_parses):
         before = len(_results)
         t()
