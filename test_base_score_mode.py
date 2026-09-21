@@ -36,6 +36,9 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+from datetime import date
+from typing import Optional
+
 import analyze_portfolio as ap
 
 # ---------------------------------------------------------------- harness ----
@@ -304,23 +307,34 @@ def test_composite_regression() -> None:
 
 def test_verdicts_per_mode() -> None:
     section("verdicts_v2_for / set_v2_verdicts: every mode scored at once")
+    # The calibrated twins are set explicitly: a real run fills them in
+    # compute_composite_score, and a position that never got them (an older
+    # cached analysis) simply has no calibrated verdicts.
     pa = _position(composite_score=60.0, composite_coverage=1.0,
+                   composite_score_cal=72.0, composite_coverage_cal=0.85,
                    filters=_filters([1.0] * 9), score_analyst=70.0,
-                   score_insider=50.0, trend="sideways", upside_pct=12.0)
+                   score_insider=50.0, score_insider_cal=None,
+                   trend="sideways", upside_pct=12.0)
     ap.compute_quality_base(pa)
     check(pa.quality_base, 88.0, "0.70*100 + 0.15*70 + 0.15*50")
+    check(pa.quality_base_cal, 94.7,
+          "and with no insider score to carry, its 15% renormalizes away")
     verdicts = ap.verdicts_v2_for(pa, is_holding=True)
     check({m: (v.label, v.score) for m, v in verdicts.items()},
-          {"composite": ("HOLD", 63.0), "quality": ("ADD", 91.0), "blend": ("HOLD", 77.0)},
-          "each mode: its base + 3 for moderate upside")
+          {"composite": ("HOLD", 63.0), "quality": ("ADD", 91.0),
+           "blend": ("HOLD", 77.0), "composite-cal": ("HOLD", 75.6),
+           "quality-cal": ("ADD", 98.3), "blend-cal": ("ADD", 86.9)},
+          "every base x calibration: +3 for moderate upside, +3.6 on the ramp")
     check(verdicts["composite"].alternates,
-          {"quality": ("ADD", 91.0), "blend": ("HOLD", 77.0)},
-          "alternates carry the other modes' label and score")
+          {"quality": ("ADD", 91.0), "blend": ("HOLD", 77.0),
+           "composite-cal": ("HOLD", 75.6), "quality-cal": ("ADD", 98.3),
+           "blend-cal": ("ADD", 86.9)},
+          "alternates carry every other mode's label and score")
 
     with _mode_env(saved="quality"):
         ap.set_v2_verdicts(pa, is_holding=True, position_pct=16.0)
-    check(sorted(pa.verdicts), ["blend", "composite", "quality"],
-          "set_v2_verdicts keeps all three on the position")
+    check(sorted(pa.verdicts), sorted(ap.BASE_SCORE_MODES),
+          "set_v2_verdicts keeps every mode on the position")
     check((pa.verdict.base_mode, pa.verdict.label, pa.verdict.score),
           ("quality", "HOLD", 87.0),
           "pa.verdict is the run's mode (an overweight holding can't be ADD)")
@@ -338,11 +352,14 @@ def test_verdicts_per_mode() -> None:
 
     no_comp = _position(filters=_filters([1.0] * 9), score_analyst=70.0)
     ap.compute_quality_base(no_comp)
-    check(sorted(ap.verdicts_v2_for(no_comp, is_holding=True)), ["blend", "quality"],
-          "a mode with no base gets no verdict")
+    check(sorted(ap.verdicts_v2_for(no_comp, is_holding=True)),
+          ["blend", "blend-cal", "quality", "quality-cal"],
+          "a mode with no base gets no verdict, in either calibration")
     check((ap.has_verdict_base(no_comp, "composite"),
            ap.has_verdict_base(no_comp, "quality"),
-           ap.has_verdict_base(no_comp, "blend")), (False, True, True),
+           ap.has_verdict_base(no_comp, "blend"),
+           ap.has_verdict_base(no_comp, "composite-cal")),
+          (False, True, True, False),
           "has_verdict_base follows each mode's inputs")
 
 
@@ -372,9 +389,10 @@ def test_mode_resolution() -> None:
 def test_rank_badges_per_mode() -> None:
     section("_attach_rank_moves: each mode against its own history")
     today = "2026-09-17"
-    ranks = {"composite": {"AAA": {"group": "compounder", "rank": 1}},
-             "quality": {"AAA": {"group": "compounder", "rank": 2}},
-             "blend": {"AAA": {"group": "compounder", "rank": 3}}}
+    # Rank 1, 2, 3, ... in BASE_SCORE_MODES order, so composite=1, quality=2,
+    # blend=3 and every calibrated mode gets its own rank too.
+    ranks = {m: {"AAA": {"group": "compounder", "rank": i + 1}}
+             for i, m in enumerate(ap.BASE_SCORE_MODES)}
 
     def moves(entry):
         r = SimpleNamespace(ticker="AAA")
@@ -482,16 +500,22 @@ def _with_verdicts(ticker: str, by_mode: dict, run: str = "composite") -> ap.Pos
 def test_compare_base_modes() -> None:
     section("compare_base_modes: side-by-side counts and changed verdicts")
     pa = _with_verdicts
+
+    def both(std: dict) -> dict:
+        """The three std modes, mirrored onto their calibrated twins — so the
+        recalibrated rows are quiet and the assertions stay about the bases."""
+        return {**std, **{m + ap.CALIBRATION_SUFFIX: v for m, v in std.items()}}
+
     holdings = [
-        pa("AAA", {"composite": ("HOLD", 70.0), "quality": ("ADD", 82.0),
-                   "blend": ("HOLD", 76.0)}),
-        pa("BBB", {"composite": ("TRIM", 40.0), "quality": ("HOLD", 55.0),
-                   "blend": ("TRIM", 47.0)}),
+        pa("AAA", both({"composite": ("HOLD", 70.0), "quality": ("ADD", 82.0),
+                        "blend": ("HOLD", 76.0)})),
+        pa("BBB", both({"composite": ("TRIM", 40.0), "quality": ("HOLD", 55.0),
+                        "blend": ("TRIM", 47.0)})),
     ]
-    ccc = pa("CCC", {"composite": ("WAIT", 55.0), "quality": ("WATCH", 64.0),
-                     "blend": ("WAIT", 59.5)})
-    ddd = pa("DDD", {"composite": ("WATCH", 62.0), "quality": ("WAIT", 58.0),
-                     "blend": ("WATCH", 60.0)})
+    ccc = pa("CCC", both({"composite": ("WAIT", 55.0), "quality": ("WATCH", 64.0),
+                          "blend": ("WAIT", 59.5)}))
+    ddd = pa("DDD", both({"composite": ("WATCH", 62.0), "quality": ("WAIT", 58.0),
+                          "blend": ("WATCH", 60.0)}))
     watch = {"Tech": [ccc, ddd, holdings[0]],     # a held name: not a watchlist row
              "More": [ccc]}
     with _mode_env():
@@ -507,10 +531,12 @@ def test_compare_base_modes() -> None:
     check(rows["Blend"], ["0/1/1/0", "0/1/1/0", "1"], "blend matches composite here")
     check("Quality would change 4: AAA HOLD→ADD, BBB TRIM→HOLD, CCC WAIT→WATCH, "
           "DDD WATCH→WAIT" in text, True, "the changed verdicts are listed once per ticker")
+    check("Composite+cal would change no verdicts." in text, True,
+          "a calibration that lands on the same labels says so")
     check(lines[lines.index(next(ln for ln in lines if ln.startswith("  Quality would"))) + 1],
           "    and would also prune DDD; keep CCC",
           "a different prune set is spelled out by ticker")
-    check(lines[-1], "  Blend would change no verdicts.",
+    check(lines[-1], "  Blend+cal would change no verdicts.",
           "a quiet mode says so, with no prune line when the set is the same")
 
     with _mode_env(saved="composite", override="quality"):
@@ -532,17 +558,21 @@ def test_mode_variants() -> None:
     section("_mode_variants: one copy per distinct rendering")
     with _mode_env(saved="quality"):
         same = ap._mode_variants(lambda m: "<b>7</b>")
-        diff = ap._mode_variants(lambda m: {"composite": "A", "quality": "B",
-                                            "blend": "A"}[m])
-        empty = ap._mode_variants(lambda m: "" if m == "blend" else m, tag="div")
+        diff = ap._mode_variants(
+            lambda m: "B" if ap.split_base_mode(m)[0] == "quality" else "A")
+        empty = ap._mode_variants(
+            lambda m: "" if ap.split_base_mode(m)[0] == "blend"
+            else ap.split_base_mode(m)[0], tag="div")
     check(same, "<b>7</b>", "identical renderings come back unwrapped")
     check(diff,
-          "<span class='bmode bmode-composite bmode-blend' style='display:none'>A</span>"
-          "<span class='bmode bmode-quality'>B</span>",
+          "<span class='bmode bmode-composite bmode-blend bmode-composite-cal "
+          "bmode-blend-cal' style='display:none'>A</span>"
+          "<span class='bmode bmode-quality bmode-quality-cal'>B</span>",
           "modes sharing a rendering share a copy; copies the run doesn't use start hidden")
     check(empty,
-          "<div class='bmode bmode-composite' style='display:none'>composite</div>"
-          "<div class='bmode bmode-quality'>quality</div>",
+          "<div class='bmode bmode-composite bmode-composite-cal' "
+          "style='display:none'>composite</div>"
+          "<div class='bmode bmode-quality bmode-quality-cal'>quality</div>",
           "an empty rendering gets no copy at all")
     css = ap._base_view_css()
     check(all(f"html[data-base-view='{m}'] .bmode:not(.bmode-{m})" in css
@@ -557,20 +587,24 @@ def test_report_markup() -> None:
         html = ap._base_switch_html(interactive=True)
     check('data-run="quality" data-saved="quality"' in html, True,
           "the switch knows the run's and the saved mode")
-    check(re.findall(r'data-mode="(\w+)" aria-pressed="true"', html), ["quality"],
-          "the run's mode starts pressed")
-    check(re.findall(r'data-mode="(\w+)"[^>]*>\w+<span class=\'base-default-mark\'', html),
-          ["quality"], "★ marks the saved default")
+    check(re.findall(r'data-(?:base|cal)="([\w-]+)" aria-pressed="true"', html),
+          ["quality", "std"],
+          "the run's base and calibration each start pressed")
+    check(re.findall(
+        r'data-(?:base|cal)="([\w-]+)"[^>]*>[\w ()]+<span class=\'base-default-mark\'',
+        html), ["quality", "std"], "★ marks the saved default on both groups")
     check('id="baseDefaultBtn" hidden' in html and " disabled" not in html, True,
           "segments are always live; Make default starts hidden")
+    check(html.count("base-switch-sep"), 1, "the two groups are separated")
 
-    with _mode_env(saved="composite", override="blend"):
+    with _mode_env(saved="composite", override="blend-cal"):
         html = ap._base_switch_html(interactive=False)
-    check((re.findall(r'data-mode="(\w+)" aria-pressed="true"', html),
-           re.findall(r'data-mode="(\w+)"[^>]*>\w+<span', html)),
-          (["blend"], ["composite"]),
-          "a one-off run starts on its mode, with ★ still on the saved default")
-    check(("This run used Blend" in html, "baseDefaultBtn" in html), (True, False),
+    check((re.findall(r'data-(?:base|cal)="([\w-]+)" aria-pressed="true"', html),
+           re.findall(r'data-(?:base|cal)="([\w-]+)"[^>]*>[\w ()]+<span', html)),
+          (["blend", "cal"], ["composite", "std"]),
+          "a one-off run starts on its own base AND calibration, ★ on the saved pair")
+    check(("This run used Blend (Recalibrated)" in html,
+           "baseDefaultBtn" in html), (True, False),
           "the label explains the override; no repo means no Make default")
 
     v = ap.Verdict(label="HOLD", color="#2c3e50", score=70.0, base_mode="composite",
@@ -631,13 +665,23 @@ def test_report_markup() -> None:
 
 def _scored(ticker: str, composite: float, credits: list, *, value: float = 1000.0,
             shares: float = 10, analyst: float = 70.0, insider: float = 50.0,
+            composite_cal: Optional[float] = None,
+            insider_cal: Optional[float] = None,
             **kw) -> ap.PositionAnalysis:
-    """A compounder with every mode's verdict, as analyze_position leaves it."""
+    """A compounder with every mode's verdict, as analyze_position leaves it.
+
+    The calibrated composite defaults to the standard one, so a fixture that
+    doesn't care about the calibration still renders all six modes; pass
+    composite_cal to make them diverge."""
     pa = _position(ticker=ticker, shares=shares, statement_market_value=value,
                    live_market_value=value, current_price=value / max(shares, 1),
                    composite_score=composite, composite_coverage=1.0,
+                   composite_score_cal=(composite if composite_cal is None
+                                        else composite_cal),
+                   composite_coverage_cal=1.0,
                    filters=_filters(credits), score_analyst=analyst,
-                   score_insider=insider, trend="sideways", **kw)
+                   score_insider=insider, score_insider_cal=insider_cal,
+                   trend="sideways", **kw)
     ap.compute_quality_base(pa)
     ap.set_v2_verdicts(pa, is_holding=shares > 0)
     return pa
@@ -666,6 +710,14 @@ class _TagChecker(HTMLParser):
         self.errors.append(f"</{tag}> at {self.getpos()} inside {self.stack[-3:]}")
         if tag in self.stack:
             del self.stack[len(self.stack) - 1 - self.stack[::-1].index(tag):]
+
+
+def _both_cals(*bases: str) -> str:
+    """The .bmode class list for `bases` and their calibrated twins, in
+    BASE_SCORE_MODES order — how _mode_variants groups modes that render
+    identically when a fixture feeds both calibrations the same inputs."""
+    wanted = set(bases) | {b + ap.CALIBRATION_SUFFIX for b in bases}
+    return " ".join(f"bmode-{m}" for m in ap.BASE_SCORE_MODES if m in wanted)
 
 
 def _tag_errors(html: str) -> list[str]:
@@ -743,12 +795,18 @@ def test_full_report() -> None:
 
     labels = {p.ticker: {m: v.label for m, v in p.verdicts.items()}
               for p in holdings[:3] + watch["Tech"]}
+    def mirrored(std: dict) -> dict:
+        """The fixture feeds both calibrations the same inputs, so each
+        calibrated mode lands on its base's label — the bases are what this
+        test is about."""
+        return {**std, **{m + ap.CALIBRATION_SUFFIX: v for m, v in std.items()}}
+
     check(labels,
-          {"AAA": {"composite": "ADD", "quality": "ADD", "blend": "ADD"},
-           "BBB": {"composite": "TRIM", "quality": "ADD", "blend": "HOLD"},
-           "CCC": {"composite": "HOLD", "quality": "SELL", "blend": "TRIM"},
-           "WWW": {"composite": "WAIT", "quality": "BUY", "blend": "WATCH"},
-           "XXX": {"composite": "BUY", "quality": "PASS", "blend": "WAIT"}},
+          {"AAA": mirrored({"composite": "ADD", "quality": "ADD", "blend": "ADD"}),
+           "BBB": mirrored({"composite": "TRIM", "quality": "ADD", "blend": "HOLD"}),
+           "CCC": mirrored({"composite": "HOLD", "quality": "SELL", "blend": "TRIM"}),
+           "WWW": mirrored({"composite": "WAIT", "quality": "BUY", "blend": "WATCH"}),
+           "XXX": mirrored({"composite": "BUY", "quality": "PASS", "blend": "WAIT"})},
           "the fixture's verdicts differ by mode (after the size overlay)")
     check('<html data-base-view="composite">' in html, True,
           "the page opens on the run's mode")
@@ -768,8 +826,9 @@ def test_full_report() -> None:
                        r"padding:14px 16px;margin-bottom:14px;'><div[^>]*>"
                        r"<span class='ticker'[^>]*>(\w+)</span>", html)
     check(sorted((t, c) for c, t in cards),
-          [("BBB", "bmode-blend"), ("BBB", "bmode-composite"),
-           ("CCC", "bmode-blend"), ("CCC", "bmode-composite"), ("CCC", "bmode-quality")],
+          [("BBB", _both_cals("blend")), ("BBB", _both_cals("composite")),
+           ("CCC", _both_cals("blend")), ("CCC", _both_cals("composite")),
+           ("CCC", _both_cals("quality"))],
           "tax cards show only in the modes that flag them, one per verdict pill")
     check("No positions are flagged under" in html, False,
           "every mode flags something here, so no empty-section note")
@@ -779,11 +838,13 @@ def test_full_report() -> None:
           "a count that's the same in every mode renders once (BBB, CCC, CCC)")
     adds = re.search(r"<strong>(.*?)</strong>Add candidates", html).group(1)
     check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", adds),
-          [("bmode-composite bmode-blend", "1"), ("bmode-quality", "7")],
+          [(_both_cals("composite", "blend"), "1"),
+           (_both_cals("quality"), "7")],
           "one that differs renders per mode")
     buys = re.search(r"<strong>(.*?)</strong>Watchlist BUY signals", html).group(1)
     check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", buys),
-          [("bmode-composite bmode-quality", "1"), ("bmode-blend", "0")],
+          [(_both_cals("composite", "quality"), "1"),
+           (_both_cals("blend"), "0")],
           "watchlist BUY count per mode")
     check(all(f'id="healthMeter-{m}"' in html for m in ap.BASE_SCORE_MODES), True,
           "a health gauge per mode")
@@ -870,12 +931,20 @@ def _miss_ledger() -> dict:
             "first_date": "2026-08-01", "last_date": "2026-09-19",
             "first_verdict": "HOLD", "first_verdict_score": 61.0,
             "last_verdict": "HOLD", "last_verdict_score": 64.0,
+            # The recalibrated bases rate it a buy where the composite never
+            # does — the shape of the META miss the calibration was built from.
             "first_factors": {"verdicts": {"composite": ["HOLD", 61.0],
                                            "quality": ["ADD", 84.0],
-                                           "blend": ["ADD", 72.5]}},
+                                           "blend": ["ADD", 72.5],
+                                           "composite-cal": ["ADD", 79.0],
+                                           "quality-cal": ["ADD", 92.0],
+                                           "blend-cal": ["ADD", 85.5]}},
             "last_factors": {"verdicts": {"composite": ["HOLD", 64.0],
                                           "quality": ["ADD", 94.0],
-                                          "blend": ["ADD", 87.7]}},
+                                          "blend": ["ADD", 87.7],
+                                          "composite-cal": ["ADD", 82.0],
+                                          "quality-cal": ["ADD", 99.0],
+                                          "blend-cal": ["ADD", 90.5]}},
         },
         "OLD": {                              # up 30%, logged before per-mode
             "name": "Legacy", "sector": "Industrials",
@@ -892,10 +961,16 @@ def _miss_ledger() -> dict:
             "last_verdict": "SELL", "last_verdict_score": 30.0,
             "first_factors": {"verdicts": {"composite": ["HOLD", 55.0],
                                            "quality": ["ADD", 81.0],
-                                           "blend": ["HOLD", 68.0]}},
+                                           "blend": ["HOLD", 68.0],
+                                           "composite-cal": ["ADD", 74.0],
+                                           "quality-cal": ["ADD", 88.0],
+                                           "blend-cal": ["ADD", 81.0]}},
             "last_factors": {"verdicts": {"composite": ["SELL", 30.0],
                                           "quality": ["HOLD", 52.0],
-                                          "blend": ["TRIM", 41.0]}},
+                                          "blend": ["TRIM", 41.0],
+                                          "composite-cal": ["TRIM", 45.0],
+                                          "quality-cal": ["HOLD", 58.0],
+                                          "blend-cal": ["TRIM", 51.0]}},
         },
     }}
 
@@ -917,9 +992,13 @@ def test_missed_opps_per_mode() -> None:
             hist, list(missed.values()), list(avoided.values()))
     check(missed["AAA"]["last_verdicts"],
           {"composite": ("HOLD", 64.0), "quality": ("ADD", 94.0),
-           "blend": ("ADD", 87.7)}, "a miss row carries every base's verdict")
+           "blend": ("ADD", 87.7), "composite-cal": ("ADD", 82.0),
+           "quality-cal": ("ADD", 99.0), "blend-cal": ("ADD", 90.5)},
+          "a miss row carries every base and calibration's verdict")
     check(missed["AAA"]["miss_type_by_mode"],
-          {"composite": "model", "quality": "execution", "blend": "execution"},
+          {"composite": "model", "quality": "execution", "blend": "execution",
+           "composite-cal": "execution", "quality-cal": "execution",
+           "blend-cal": "execution"},
           "and is a model gap only under the bases that never rated it a buy")
     check((missed["AAA"]["miss_type"], missed["AAA"]["still_actionable"]),
           ("model", False), "the headline values are the run's mode")
@@ -929,12 +1008,15 @@ def test_missed_opps_per_mode() -> None:
           {m: "model" for m in ap.BASE_SCORE_MODES},
           "and classifies the same under every base")
     check(avoided["DWN"]["dodge_type_by_mode"],
-          {"composite": "caution", "quality": "lucky", "blend": "caution"},
+          {"composite": "caution", "quality": "lucky", "blend": "caution",
+           "composite-cal": "lucky", "quality-cal": "lucky",
+           "blend-cal": "lucky"},
           "a dodge is only lucky under a base that rated the name a buy")
     check({m: (d["model_gap"], d["execution_gap"], d["still_actionable"])
            for m, d in insights["by_mode"].items()},
-          {"composite": (2, 0, []), "quality": (1, 1, ["AAA"]),
-           "blend": (1, 1, ["AAA"])},
+          {"composite": (2, 0, []),
+           **{m: (1, 1, ["AAA"]) for m in ap.BASE_SCORE_MODES
+              if m != "composite"}},
           "the summary strip's gap split and live list per base")
 
     with _mode_env(saved="quality"):
@@ -948,18 +1030,24 @@ def test_missed_opps_per_mode() -> None:
 def test_missed_opps_markup() -> None:
     section("missed opportunities: the cells follow the base switch")
     by_mode = {"composite": ("HOLD", 64.0), "quality": ("ADD", 94.0),
-               "blend": ("ADD", 87.7)}
+               "blend": ("ADD", 87.7), "composite-cal": ("ADD", 82.0),
+               "quality-cal": ("ADD", 99.0), "blend-cal": ("ADD", 90.5)}
     with _mode_env(saved="composite"):
         td = ap._miss_verdict_td(by_mode, "HOLD", 64.0)
         plain = ap._miss_verdict_td({}, "TRIM", 41.0)
-    check(re.findall(r"data-sort(?:-\w+)?='([A-Z]+)'", td),
-          ["HOLD", "HOLD", "ADD", "ADD"],
+    check(re.findall(r"data-sort(?:-[\w-]+)?='([A-Z]+)'", td),
+          ["HOLD"] + [by_mode[m][0] for m in ap.BASE_SCORE_MODES],
           "the cell sorts by the run's label, with every mode's alongside")
-    check(td.count("class='verdict'"), 3, "and holds one chip per mode")
-    check("<span class='miss-alt'>Quality base: ADD 94 · Blend base: ADD 88</span>"
-          in td, True, "the viewed base's chip names what the others called it")
+    check(td.count("class='verdict'"), len(ap.BASE_SCORE_MODES),
+          "and holds one chip per base x calibration")
+    check(re.findall(r"<span class='miss-alt'>(.*?)</span>", td)[0],
+          "Quality base: ADD 94 · Blend base: ADD 88 · "
+          "Composite (Recalibrated) base: ADD 82 · "
+          "Quality (Recalibrated) base: ADD 99 · "
+          "Blend (Recalibrated) base: ADD 90",
+          "the viewed base's chip names what every other mode called it")
     check(("Composite base: HOLD 64" in td, "Quality base: ADD 94 · Blend" in plain),
-          (True, False), "each copy names the other two; a ledger-only row none")
+          (True, False), "each copy names the others; a ledger-only row none")
     check((plain.count("class='verdict'"), "data-sort-quality" in plain),
           (1, False), "which leaves one unswitched chip and no per-mode sort")
     check("Logged before the analyzer recorded a verdict per base score" in plain,
@@ -978,11 +1066,12 @@ def test_missed_opps_markup() -> None:
           "the miss-type badge carries both readings, one shown at a time")
     check(row.count("● LIVE"), 1,
           "so does the still-actionable pill — only the bases that earn it")
-    check(re.search(r"<td data-sort='model'((?: data-sort-\w+='\w+')+)>",
+    check(re.search(r"<td data-sort='model'((?: data-sort-[\w-]+='\w+')+)>",
                     row).group(1),
           " data-sort-composite='model' data-sort-quality='execution'"
-          " data-sort-blend='execution'",
-          "and the column's sort value switches with the base")
+          " data-sort-blend='execution' data-sort-composite-cal='execution'"
+          " data-sort-quality-cal='execution' data-sort-blend-cal='execution'",
+          "and the column's sort value switches with the base and calibration")
     dwn = re.search(r"<tr data-search='dwn[^']*'>(.*?)</tr>", html, re.S).group(1)
     check((dwn.count("Correct caution"), dwn.count("Lucky dodge")), (1, 1),
           "the avoided table's dodge badge splits the same way")
@@ -991,8 +1080,198 @@ def test_missed_opps_markup() -> None:
           [("2", "0"), ("1", "1")],
           "the summary strip keeps each base's gap split")
     check((strip.count("Still actionable:"),
-           "bmode-quality bmode-blend" in strip), (1, True),
+           "bmode-quality bmode-blend bmode-composite-cal bmode-quality-cal "
+           "bmode-blend-cal" in strip), (1, True),
           "and the live banner only under the bases with a live call")
+
+
+
+# ------------------------------------------------- 8. the recalibration -----
+
+def _cal_verdict(**kw):
+    """compute_verdict_v2 on the recalibrated composite base, with only the
+    inputs a case cares about."""
+    base = dict(composite_score=70.0, coverage=1.0, base_mode="composite-cal",
+                is_holding=False)
+    return ap.compute_verdict_v2(**{**base, **kw})
+
+
+def _std_verdict(**kw):
+    base = dict(composite_score=70.0, coverage=1.0, base_mode="composite",
+                is_holding=False)
+    return ap.compute_verdict_v2(**{**base, **kw})
+
+
+def test_calibration_insider() -> None:
+    section("finding 1: a no-information insider read scores nothing")
+    from insider_trading import insider_score
+    cap = 1e12
+    noise = {"buy_count": 0, "sell_count": 4, "sell_value": 2e8,
+             "buy_value": 0.0, "plan_value": 2e8, "discretionary_sell_value": 0.0,
+             "tax_withhold_value": 0.0}
+    check(insider_score(noise, market_cap=cap), 48,
+          "selling too small to register still scores 48 as before")
+    check(insider_score(noise, market_cap=cap, neutral_as_missing=True), None,
+          "and scores nothing at all under the recalibration")
+
+    withholding = {"buy_count": 0, "sell_count": 0, "sell_value": 0.0,
+                   "buy_value": 0.0, "plan_value": 0.0,
+                   "discretionary_sell_value": 0.0, "tax_withhold_value": 5e9}
+    check((insider_score(withholding, market_cap=cap),
+           insider_score(withholding, market_cap=cap, neutral_as_missing=True)),
+          (40, None), "RSU tax withholding is compensation mechanics, not a view")
+
+    comp_only = {"buy_count": 0, "sell_count": 0, "sell_value": 0.0,
+                 "buy_value": 0.0, "plan_value": 0.0,
+                 "discretionary_sell_value": 0.0, "tax_withhold_value": 0.0}
+    check((insider_score(comp_only, market_cap=cap),
+           insider_score(comp_only, market_cap=cap, neutral_as_missing=True)),
+          (50, None), "so is compensation-only activity")
+
+    real_selling = {"buy_count": 0, "sell_count": 6, "sell_value": 6e9,
+                    "buy_value": 0.0, "plan_value": 0.0,
+                    "discretionary_sell_value": 6e9, "tax_withhold_value": 0.0}
+    check(insider_score(real_selling, market_cap=cap, neutral_as_missing=True), 20,
+          "discretionary selling at scale is a signal and still scores")
+    buying = {"buy_count": 3, "sell_count": 0, "sell_value": 0.0,
+              "buy_value": 2e9, "plan_value": 0.0,
+              "discretionary_sell_value": 0.0, "tax_withhold_value": 0.0}
+    check(insider_score(buying, market_cap=cap, neutral_as_missing=True), 95,
+          "and so is open-market buying")
+    check(insider_score(None, market_cap=cap, neutral_as_missing=True), None,
+          "no filings at all is still None")
+
+
+def test_calibration_value() -> None:
+    section("finding 2: the value scale treats the quality gate as average")
+    std = lambda pe, peg: ap._value_sub_score(pe, peg, calibrated=False)
+    cal = lambda pe, peg: ap._value_sub_score(pe, peg, calibrated=True)
+    check((std(30.0, 2.0), cal(30.0, 2.0)), (0.0, 50.0),
+          "a name sitting exactly on both gates scored 0; it now scores 50")
+    check(cal(15.0, 0.5), 100.0, "half the gate on both is a full score")
+    check((std(20.8, 0.88), cal(20.8, 0.88)), (51.0, 84.0),
+          "a 21x forward multiple with a sub-1 PEG is no longer below average")
+    check(cal(45.0, 3.5), 0.0, "and the scale still bottoms out on a real stretch")
+    check((cal(None, 0.5), cal(45.0, None), cal(None, None)),
+          (100.0, 0.0, None),
+          "either input alone drives the score; neither leaves no score")
+    check(cal(-5.0, 0.9), cal(None, 0.9),
+          "a negative P/E is not a cheap one — it drops out")
+
+
+def test_calibration_modifiers() -> None:
+    section("findings 3a/3b/6: ramped upside, realized strength, event risk")
+    # 3a: the step function vs the ramp, either side of the 20% edge.
+    step = [_std_verdict(upside_pct=u).score for u in (19.0, 21.0)]
+    ramp = [_cal_verdict(upside_pct=u).score for u in (19.0, 21.0)]
+    check((step[1] - step[0], round(ramp[1] - ramp[0], 1)), (3.0, 0.3),
+          "crossing the 20% edge moved the score 3; on the ramp, 0.3")
+    mid_step = [_std_verdict(upside_pct=u).score for u in (10.0, 12.0)]
+    mid_ramp = [_cal_verdict(upside_pct=u).score for u in (10.0, 12.0)]
+    check((mid_step[1] - mid_step[0], round(mid_ramp[1] - mid_ramp[0], 1)),
+          (0.0, 0.6),
+          "and inside a band the step function ignores upside entirely")
+    check(_cal_verdict(upside_pct=40.0).score, 76.0,
+          "the ramp still tops out at +6")
+    check(_cal_verdict(upside_pct=-40.0).score, 64.0, "and bottoms at -6")
+
+    # 3b: realized strength, and the axis scored only once.
+    check(_cal_verdict(pct_above_ma200=19.0, trend="sideways").score, 74.0,
+          "price well above its 200-day earns +4 the trend bucket cannot give")
+    up = _cal_verdict(pct_above_ma200=19.0, trend="uptrend")
+    check(up.score, 80.0, "an uptrend still scores +10, and momentum stands down")
+    check("Momentum not re-scored" in up.reason, True,
+          "the breakdown says so rather than dropping the factor silently")
+    check(_cal_verdict(pct_above_ma200=-20.0, trend="sideways").score, 66.0,
+          "and the credit runs negative below the line")
+    check(_cal_verdict(pct_above_ma200=19.0, trend="sideways",
+                       week52_position=95.0).score,
+          _std_verdict(pct_above_ma200=19.0, trend="sideways",
+                       week52_position=95.0).score,
+          "at a 52-week extreme that rule owns the axis, in both calibrations")
+
+    # 6: event risk, fresh money only.
+    check([_cal_verdict(days_to_earnings=d).score for d in (1, 5, 30)],
+          [66.0, 68.0, 70.0], "a print in 1 day costs 4, in 5 days costs 2")
+    hold = ap.compute_verdict_v2(composite_score=70.0, coverage=1.0,
+                                 base_mode="composite-cal", is_holding=True,
+                                 days_to_earnings=1)
+    check((hold.score, "event risk noted, not scored" in hold.reason), (70.0, True),
+          "for a holding it is an annotation — this model doesn't sell into prints")
+    check(_std_verdict(days_to_earnings=1).score, 70.0,
+          "the standard scoring ignores earnings entirely, as before")
+
+
+def test_calibration_hysteresis() -> None:
+    section("finding 4: a label holds through a near miss")
+    lab = ap._verdict_label
+    check(lab(74.0, False)[0], "WATCH", "74 is a WATCH with no history")
+    check(lab(74.0, False, prior_label="BUY", hysteresis=3.0)[0], "BUY",
+          "but a name already rated BUY holds it one point under the bar")
+    check(lab(71.0, False, prior_label="BUY", hysteresis=3.0)[0], "WATCH",
+          "4 points under, it gives way")
+    check(lab(74.0, False, prior_label="BUY", hysteresis=0.0)[0], "WATCH",
+          "no hysteresis, no patience")
+    check(lab(74.0, False, prior_label="WATCH", hysteresis=3.0)[0], "WATCH",
+          "the margin never promotes — earning BUY still takes a clean 75")
+    check(lab(74.0, True, prior_label="BUY", hysteresis=3.0)[0], "HOLD",
+          "a watchlist label means nothing in holding vocabulary")
+    check(lab(80.0, False, prior_label="WATCH", hysteresis=3.0)[0], "BUY",
+          "and a genuine upgrade is never held back")
+
+    # End to end: the store the run fills from the ledger.
+    hist = {"tickers": {
+        "AAA": {"last_verdict": "BUY",
+                "last_factors": {"verdicts": {"composite-cal": ["BUY", 76.0]}}},
+        "BBB": {"last_verdict": "WATCH",
+                "last_factors": {"base_mode": "composite", "verdicts": {}}}}}
+    try:
+        check(ap.load_prior_verdict_labels(hist), 2, "both entries carry a label")
+        check(ap.prior_verdict_label("AAA", "composite-cal"), "BUY",
+              "a per-mode label is read straight off the snapshot")
+        check(ap.prior_verdict_label("AAA", "quality"), None,
+              "and never stands in for a mode it wasn't logged under")
+        check((ap.prior_verdict_label("BBB", "composite"),
+               ap.prior_verdict_label("BBB", "blend")), ("WATCH", None),
+              "a pre-per-mode entry counts only for the mode that recorded it")
+        v = _cal_verdict(composite_score=74.0, prior_label="BUY")
+        check((v.label, "within 3 points of the 75 bar" in v.reason),
+              ("BUY", True), "and the held label explains itself in the breakdown")
+    finally:
+        ap.load_prior_verdict_labels({})
+
+
+def test_recently_held_universe() -> None:
+    section("finding 5: a name you just sold stays in the universe")
+    today = date(2026, 9, 21)
+    hist = {"tickers": {
+        "SOLD": {"name": "Sold Co", "last_alloc": 0.0,
+                 "last_held_date": "2026-07-29"},
+        "HELD": {"name": "Held Co", "last_alloc": 4.2,
+                 "last_held_date": "2026-09-21"},
+        "OLD": {"name": "Long Gone", "last_alloc": 0.0,
+                "last_held_date": "2025-01-05"},
+        "LEGACY": {"name": "Pre-field", "last_alloc": 0.0, "first_alloc": 12.2,
+                   "first_date": "2026-08-01"},
+        "NEVER": {"name": "Watch Only", "last_alloc": 0.0, "first_alloc": 0.0,
+                  "first_date": "2026-08-01"},
+    }}
+    got = ap.recently_held_tickers(hist, today=today)
+    check(sorted(got), ["LEGACY", "SOLD"],
+          "recently sold names come back; still-held, long-gone and "
+          "never-held ones don't")
+    check(got["SOLD"], "Sold Co", "with the name the ledger already knows")
+    check(sorted(ap.recently_held_tickers(hist, within_days=30, today=today)), [],
+          "a shorter window lets them go")
+    check(ap.recently_held_tickers(None, today=today), {},
+          "and no ledger is not an error")
+
+    pa = _position(ticker="SOLD", verdict=ap.Verdict(label="PASS", color="#000",
+                                                     reason="x", score=20.0))
+    check(ap.select_watchlist_prune_candidates({ap.RECENTLY_HELD_GROUP: [pa]}), {},
+          "the synthetic group is never pruned — there is no such list to prune")
+    check(ap.select_watchlist_prune_candidates({"Screening": [pa]}),
+          {"Screening": ["SOLD"]}, "a real list still prunes normally")
 
 
 # -------------------------------------------------------------------- main ----
@@ -1004,7 +1283,10 @@ def main() -> int:
               test_rank_badges_per_mode, test_ledger_ranks_per_mode,
               test_compare_base_modes, test_mode_variants, test_report_markup,
               test_missed_opps_per_mode, test_missed_opps_markup,
-              test_full_report, test_refresh_script_parses):
+              test_full_report, test_refresh_script_parses,
+              test_calibration_insider, test_calibration_value,
+              test_calibration_modifiers, test_calibration_hysteresis,
+              test_recently_held_universe):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)
