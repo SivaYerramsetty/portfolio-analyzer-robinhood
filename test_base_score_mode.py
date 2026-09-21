@@ -1274,6 +1274,69 @@ def test_recently_held_universe() -> None:
           {"Screening": ["SOLD"]}, "a real list still prunes normally")
 
 
+def test_holdings_ytd_weighting() -> None:
+    section("YTD tile: start-of-year weights, not live market value")
+
+    import pandas as pd
+
+    class _FakeRaw:
+        """Stands in for yf.download()'s frame — only ["Close"] is read."""
+
+        def __init__(self, closes: dict):
+            self._df = pd.DataFrame(closes)
+
+        def __getitem__(self, key):
+            assert key == "Close", key
+            return self._df
+
+    @contextlib.contextmanager
+    def _closes(series: dict):
+        real = ap.yf.download
+        ap.yf.download = lambda *a, **k: _FakeRaw(series)
+        try:
+            yield
+        finally:
+            ap.yf.download = real
+
+    def _held(ticker: str, shares: float, price: float):
+        return _position(ticker=ticker, shares=shares, current_price=price,
+                         live_market_value=price * shares)
+
+    # WIN tripled (+200%), FLAT went nowhere. Both opened the year at $1,000,
+    # so the basket's true return is +100% ($2,000 -> $4,000) and each name
+    # carries an equal start-of-year weight. Live-market-value weights would
+    # score WIN at 75% of the book (it is only that large *because* it tripled)
+    # and report +150% — the bug this guards.
+    holdings = [_held("WIN", 10, 300.0), _held("FLAT", 10, 100.0)]
+    series = {"WIN": [100.0, 300.0], "FLAT": [100.0, 100.0]}
+
+    with _closes(series):
+        got = ap._compute_holdings_ytd_return(holdings)
+    check(round(got, 6), 100.0,
+          "a tripled name weighted by its start-of-year value, not its live value")
+
+    # The same number the account statement would show: dollar gain / start value.
+    start_value = sum(10 * 100.0 for _ in holdings)
+    gain = sum(r.live_market_value for r in holdings) - start_value
+    check(round(got, 6), round(gain / start_value * 100, 6),
+          "the figure equals dollar gain over start-of-year value")
+
+    # A holding whose history never arrived is dropped, and the rest renormalize
+    # — it must not be silently valued at a zero return.
+    with _closes(series):
+        got_missing = ap._compute_holdings_ytd_return(
+            holdings + [_held("NOHIST", 50, 80.0)])
+    check(round(got_missing, 6), 100.0,
+          "a holding with no YTD history drops out and weights renormalize")
+
+    # Cash-only / empty books have nothing to report rather than a bogus 0%.
+    with _closes(series):
+        check(ap._compute_holdings_ytd_return([]), None,
+              "no holdings returns None")
+        check(ap._compute_holdings_ytd_return([_held("NOHIST", 5, 10.0)]), None,
+              "no usable history returns None")
+
+
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
@@ -1286,7 +1349,7 @@ def main() -> int:
               test_full_report, test_refresh_script_parses,
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
-              test_recently_held_universe):
+              test_recently_held_universe, test_holdings_ytd_weighting):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)

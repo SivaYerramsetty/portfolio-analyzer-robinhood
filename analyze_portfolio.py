@@ -522,13 +522,26 @@ def fetch_benchmark_returns() -> Optional[dict]:
 
 
 def _compute_holdings_ytd_return(results) -> Optional[float]:
-    """Market-value-weighted YTD price return (%) of the CURRENT holdings — a
-    like-for-like counterpart to the S&P 500 YTD figure. Each holding's live
-    price is compared to its first close of the calendar year, weighted by live
-    market value; holdings whose YTD history is unavailable are dropped and the
-    weights renormalize over the rest. This is an approximation of 'how the
-    stocks I hold now have done this year', not a true time-weighted account
-    return (it ignores intra-year buys/sells). Returns None if no history."""
+    """YTD price return (%) of the CURRENT holdings, weighted by each holding's
+    START-OF-YEAR value (shares x first close of the year) — a like-for-like
+    counterpart to the S&P 500 YTD figure. Each holding's live price is compared
+    to its first close of the calendar year; holdings whose YTD history is
+    unavailable are dropped and the weights renormalize over the rest.
+
+    Beginning-of-period weights are what make this a real return: a basket's
+    return equals the start-weighted average of its constituents' returns, and
+    reduces to (dollar gain / start value) — the same shape as the Today tile,
+    which divides today's dollar move by the prior-day total. Weighting by LIVE
+    market value instead (as this once did) over-weights whatever rose, since a
+    name is a large slice today *because* it went up. That inflated the figure
+    badly: one holding up +232% YTD held a 15% live weight against a 5.7%
+    start-of-year weight, pushing a true +20.4% to +45.1%.
+
+    This remains a hypothetical, not an account return: it asks what today's
+    exact basket would have returned had it been held, in these proportions,
+    since Jan 1. It ignores intra-year buys and sells, positions closed during
+    the year, uninvested cash and any margin loan, so it will not match a
+    broker's YTD number. Returns None if no history."""
     holdings = [r for r in results
                 if getattr(r, "current_price", None)
                 and getattr(r, "live_market_value", None)
@@ -565,8 +578,12 @@ def _compute_holdings_ytd_return(results) -> Optional[float]:
         sp = start_prices.get(r.ticker)
         if not sp or sp <= 0:
             continue
-        acc += r.live_market_value * ((r.current_price - sp) / sp)
-        total_w += r.live_market_value
+        # Weight by start-of-year value, NOT live market value — see docstring.
+        w = (r.shares or 0) * sp
+        if w <= 0:
+            continue
+        acc += w * ((r.current_price - sp) / sp)
+        total_w += w
     if total_w <= 0:
         return None
     return acc / total_w * 100
@@ -575,8 +592,8 @@ def _compute_holdings_ytd_return(results) -> Optional[float]:
 def _render_benchmark_stat(port_today_pct: Optional[float],
                            port_ytd_pct: Optional[float],
                            bench: Optional[dict]) -> str:
-    """Two standalone summary tiles — 'Today · your holdings' and 'YTD · your
-    holdings' — matching the single-value layout of the other stats in the row.
+    """Two standalone summary tiles — 'Today · your holdings' and 'YTD · if held
+    since Jan 1' — matching the single-value layout of the other stats in the row.
     The big figure is YOUR holdings' return (green when it beats the index for
     that horizon, red when it lags); the S&P 500's own return sits on a muted
     sub-line so the two can't be confused. A tile appears only when both sides
@@ -587,14 +604,17 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
     tip = ("The big figure is your current holdings' price return; the S&P 500 "
            "(^GSPC) return is shown below it for comparison. Today = vs prior "
            "close; YTD = vs the first close of the year. Green = your holdings "
-           "beat the index. YTD is value-weighted over holdings with available "
-           "history (ignores intra-year trades).")
+           "beat the index. Both are weighted by start-of-period value over "
+           "holdings with available history. NOTE: YTD is a hypothetical — what "
+           "today's basket would have returned if held in these proportions "
+           "since Jan 1. It ignores intra-year trades, positions you closed, "
+           "cash and margin, so it will NOT match your broker's YTD figure.")
     cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
                  "text-transform:none;letter-spacing:0;margin-top:2px;")
     blocks = []
     for label, port_val, spx in (
-        ("Today", port_today_pct, bench.get("today_pct")),
-        ("YTD", port_ytd_pct, bench.get("ytd_pct")),
+        ("Today &middot; your holdings", port_today_pct, bench.get("today_pct")),
+        ("YTD &middot; if held since Jan 1", port_ytd_pct, bench.get("ytd_pct")),
     ):
         if port_val is None or spx is None:
             continue
@@ -602,7 +622,7 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
         blocks.append(
             f'<div class="stat" title="{tip}">'
             f'<strong style="color:{color};">{_fmt_pct(port_val, 2, True)}</strong>'
-            f'{label} · your holdings'
+            f'{label}'
             f'<div style="{cap_style}">S&amp;P 500: {_fmt_pct(spx, 2, True)}</div>'
             f'</div>'
         )
