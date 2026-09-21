@@ -132,7 +132,9 @@ COMMAND REFERENCE — every way to run this script
       within a group and AND across groups; every numeric metric (upside, gain,
       composite/verdict/quality score, position size, days held, …) has a
       min/max range slider. Active filters show as removable chips with live
-      per-option counts.
+      per-option counts. ☆ Save names the current combo and pins it to the bar
+      (rename or delete it from the same button); the ✕ on any pill takes it
+      off the bar. All of it lives in your browser's localStorage, per browser.
     • Live prices via yfinance; analyst ratings via Robinhood/Finnhub/yfinance.
 
 --- GITHUB ACTIONS (manual trigger, see portfolio.yml) --------------------
@@ -8326,19 +8328,32 @@ def generate_html_report(
   .flt-count {{ font-size: 12px; color: var(--fg-muted); margin-left: auto;
                font-variant-numeric: tabular-nums; white-space: nowrap; }}
 
-  /* ---- Most-used combos (learned from your usage; seeded with suggestions) ---- */
+  /* ---- Saved + most-used combos (★ = one you named, ☆ = learned/suggested) ---- */
   .flt-used {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
               margin-top: 9px; }}
   .flt-used-label {{ font-size: 10px; color: var(--fg-faint); font-weight: 700;
                     text-transform: uppercase; letter-spacing: .6px; }}
-  .flt-combo {{ background: var(--bg-pill); border: 1px solid var(--border-strong);
-               border-radius: 14px; padding: 3px 11px; font-size: 12px; cursor: pointer;
+  .flt-combo {{ display: inline-flex; align-items: center; gap: 4px;
+               background: var(--bg-pill); border: 1px solid var(--border-strong);
+               border-radius: 14px; padding: 3px 6px 3px 11px; font-size: 12px; cursor: pointer;
                color: var(--fg-pill); font-weight: 500; white-space: nowrap; transition: all .15s; }}
-  .flt-combo::before {{ content: "★ "; color: var(--accent, #e6a817); font-size: 10px; }}
+  .flt-combo::before {{ content: "☆"; color: var(--accent, #e6a817); font-size: 10px; }}
+  .flt-combo.named::before {{ content: "★"; }}
   .flt-combo:hover {{ background: var(--bg-pill-hover); border-color: var(--fg-faint); }}
   .flt-combo.on {{ background: var(--bg-pill-active); color: var(--fg-pill-active);
                   border-color: var(--bg-pill-active); }}
   .flt-combo.on::before {{ color: rgba(255,255,255,.9); }}
+  /* Remove-from-bar ✕: revealed on hover (always visible on touch). */
+  .flt-combo-x {{ display: inline-flex; align-items: center; justify-content: center;
+                 width: 14px; height: 14px; border-radius: 50%; font-size: 10px;
+                 line-height: 1; color: inherit; opacity: 0; transition: opacity .12s; }}
+  .flt-combo:hover .flt-combo-x, .flt-combo.on .flt-combo-x {{ opacity: .6; }}
+  .flt-combo:hover .flt-combo-x:hover,
+  .flt-combo.on .flt-combo-x:hover {{ opacity: 1; background: rgba(0,0,0,.16); }}
+  @media (hover: none) {{ .flt-combo-x {{ opacity: .5; }} }}
+  .flt-restore {{ color: var(--fg-faint); }}
+  .flt-restore::before {{ content: "↺"; }}
+  .flt-save.saved {{ color: var(--accent, #e6a817); border-color: var(--accent, #e6a817); }}
 
   /* ---- Active-filter chips ---- */
   .flt-chips {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 9px; }}
@@ -8648,6 +8663,7 @@ def generate_html_report(
       <button class="flt-x" id="fltSearchX" title="Clear search" aria-label="Clear search">✕</button>
     </span>
     <button class="flt-btn" id="fltToggle" aria-expanded="false">Filters ▾</button>
+    <button class="flt-btn flt-save" id="fltSave">☆ Save</button>
     <button class="flt-btn flt-clear" id="clearFilters">✕ Clear all</button>
     <span class="flt-count" id="filterStatus"></span>
   </div>
@@ -9058,6 +9074,8 @@ Verdicts are framework outputs, not investment advice.
   var toggleBtn   = document.getElementById('fltToggle');
   var panel       = document.getElementById('fltPanel');
   var usedEl      = document.getElementById('fltUsed');
+  var usedLabel   = usedEl ? usedEl.querySelector('.flt-used-label') : null;
+  var saveBtn     = document.getElementById('fltSave');
   var chipsEl     = document.getElementById('fltChips');
   var statusEl    = document.getElementById('filterStatus');
   if (!searchInput || !panel) return;
@@ -9135,8 +9153,10 @@ Verdicts are framework outputs, not investment advice.
     { key:'earnings-soon', label:'📅 Reports ≤7d', ranges:{'earnings-days':[0,7]} },
     { key:'tax-loss',      label:'Loss harvest',          ranges:{'gain-pct':[null,-5]} },
   ];
-  var USAGE_KEY = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
-  var MAX_SHOWN = 12;                // most-used combos to render
+  var USAGE_KEY  = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
+  var SAVED_KEY  = 'fltSavedViews';   // [{ sig, name, t }] — combos you named; pinned first
+  var HIDDEN_KEY = 'fltHiddenCombos'; // { signature: 1 } — combos you took off the bar
+  var MAX_SHOWN  = 12;                // learned combos to render alongside saved ones
 
   // ---------- State ----------
   var state = { facets: {}, ranges: {} };   // facets: attr->Set; ranges: attr->{min,max}
@@ -9415,6 +9435,77 @@ Verdicts are framework outputs, not investment advice.
   function loadUsage() { try { return JSON.parse(localStorage.getItem(USAGE_KEY)) || {}; } catch (e) { return {}; } }
   function saveUsage(u) { try { localStorage.setItem(USAGE_KEY, JSON.stringify(u)); } catch (e) {} }
 
+  // ---------- Saved (named) combos ----------
+  // A saved view is one you named: it pins to the front of the bar and only you
+  // remove it. Learned combos fill the rest and can be dropped with the same ✕,
+  // which also forgets their usage so they don't drift straight back in. All
+  // three stores are per-browser localStorage — nothing goes in the HTML.
+  function loadSaved() {
+    try { var a = JSON.parse(localStorage.getItem(SAVED_KEY)); return (a instanceof Array) ? a : []; }
+    catch (e) { return []; }
+  }
+  function storeSaved(list) { try { localStorage.setItem(SAVED_KEY, JSON.stringify(list)); } catch (e) {} }
+  function savedEntry(sig) {
+    var l = loadSaved();
+    for (var i = 0; i < l.length; i++) if (l[i].sig === sig) return l[i];
+    return null;
+  }
+  function loadHidden() { try { return JSON.parse(localStorage.getItem(HIDDEN_KEY)) || {}; } catch (e) { return {}; } }
+  function storeHidden(h) { try { localStorage.setItem(HIDDEN_KEY, JSON.stringify(h)); } catch (e) {} }
+
+  // A combo only makes sense in this report if every range it names exists here
+  // — a missing metric would filter every row away. (Same rule buildSeeds uses.)
+  function usableSig(sig) {
+    var st = parseSignature(sig);
+    for (var a in st.ranges) if (!domains[a]) return false;
+    return true;
+  }
+
+  // Name / rename / delete, all in one prompt: a blank name deletes the view.
+  function promptSave(sig) {
+    if (!sig) return;
+    var ent = savedEntry(sig);
+    var fallback = seedLabel[sig] || comboLabel(parseSignature(sig)) || 'My filter';
+    var name = window.prompt(
+      ent ? 'Rename this saved filter (blank deletes it):'
+          : 'Name these filters — saved in this browser only:',
+      ent ? ent.name : fallback);
+    if (name === null) return;                       // cancelled
+    name = name.replace(/\s+/g, ' ').trim().slice(0, 40);
+    var list = loadSaved(), at = -1;
+    for (var i = 0; i < list.length; i++) if (list[i].sig === sig) at = i;
+    if (!name) { if (at >= 0) list.splice(at, 1); }
+    else if (at >= 0) list[at].name = name;
+    else list.push({ sig: sig, name: name, t: Date.now() });
+    storeSaved(list);
+    if (name) { var h = loadHidden(); delete h[sig]; storeHidden(h); }   // naming un-hides
+    renderUsed(); syncSaveBtn();
+  }
+
+  // ✕ on a pill: off the bar. A saved view is unsaved; every combo is hidden and
+  // its usage forgotten, so nothing you removed comes back on its own.
+  function removeCombo(sig) {
+    var list = loadSaved(), kept = list.filter(function(v) { return v.sig !== sig; });
+    if (kept.length !== list.length) storeSaved(kept);
+    var h = loadHidden(); h[sig] = 1; storeHidden(h);
+    var u = loadUsage(); if (u[sig]) { delete u[sig]; saveUsage(u); }
+    renderUsed(); syncSaveBtn();
+  }
+
+  // The Save button doubles as the rename/delete entry point for whatever combo
+  // is showing, so a saved view needs no control of its own beyond the pill's ✕.
+  function syncSaveBtn() {
+    if (!saveBtn) return;
+    var sig = signature(state), ent = sig ? savedEntry(sig) : null;
+    saveBtn.textContent = ent ? '★ Saved' : '☆ Save';
+    saveBtn.classList.toggle('saved', !!ent);
+    saveBtn.style.opacity = sig ? '1' : '.4';
+    saveBtn.style.pointerEvents = sig ? 'auto' : 'none';
+    saveBtn.title = !sig ? 'Pick some filters first, then save them under a name'
+      : ent ? 'Rename or delete “' + ent.name + '”'
+            : 'Save these filters under a name (this browser only)';
+  }
+
   var recTimer = null, lastRecSig = '';
   function scheduleRecord() {
     clearTimeout(recTimer);
@@ -9433,33 +9524,65 @@ Verdicts are framework outputs, not investment advice.
     }, 1200);
   }
 
+  // Bar order: your saved views first (never crowded out), then the combos you
+  // actually use, then the seeded suggestions — minus anything you removed.
   function renderUsed() {
-    var u = loadUsage();
-    var combos = Object.keys(u).map(function(sig) { return { sig: sig, c: u[sig].c, t: u[sig].t }; })
-      .sort(function(a, b) { return (b.c - a.c) || (b.t - a.t); });
-    var seen = {}; combos.forEach(function(c) { seen[c.sig] = 1; });
-    seedSigs.forEach(function(sig) { if (!seen[sig]) { combos.push({ sig: sig, c: 0, t: 0 }); seen[sig] = 1; } });
+    var saved = loadSaved(), hidden = loadHidden(), u = loadUsage();
+    var seen = {}, combos = [];
+    saved.forEach(function(v) {
+      if (seen[v.sig] || !usableSig(v.sig)) return;
+      seen[v.sig] = 1; combos.push({ sig: v.sig, name: v.name, saved: true });
+    });
+    Object.keys(u).map(function(sig) { return { sig: sig, c: u[sig].c, t: u[sig].t }; })
+      .sort(function(a, b) { return (b.c - a.c) || (b.t - a.t); })
+      .forEach(function(c) {
+        if (seen[c.sig] || hidden[c.sig] || !usableSig(c.sig)) return;
+        seen[c.sig] = 1; combos.push({ sig: c.sig, c: c.c });
+      });
+    seedSigs.forEach(function(sig) {
+      if (seen[sig] || hidden[sig]) return;
+      seen[sig] = 1; combos.push({ sig: sig, c: 0 });
+    });
 
     // rebuild (keep the label span, drop old pills)
     usedEl.querySelectorAll('.flt-combo').forEach(function(b) { b.remove(); });
     var cur = signature(state), shown = 0;
     combos.forEach(function(c) {
-      if (shown >= MAX_SHOWN) return;
-      var label = seedLabel[c.sig] || comboLabel(parseSignature(c.sig));
+      if (!c.saved && shown >= MAX_SHOWN) return;
+      var label = c.name || seedLabel[c.sig] || comboLabel(parseSignature(c.sig));
       if (!label) return;
       var b = document.createElement('button');
-      b.className = 'flt-combo' + (c.sig === cur && cur !== '' ? ' on' : '');
+      b.className = 'flt-combo' + (c.saved ? ' named' : '') +
+                    (c.sig === cur && cur !== '' ? ' on' : '');
       b.setAttribute('data-sig', c.sig);
-      b.textContent = label;
-      b.title = c.c ? ('Used ' + c.c + '× — click to apply, click again to clear')
-                    : 'Suggested combo — click to apply';
+      b.title = c.saved ? 'Saved filter — click to apply, ✕ to delete'
+              : c.c ? ('Used ' + c.c + '× — click to apply, ✕ to remove from the bar')
+                    : 'Suggested combo — click to apply, ✕ to remove from the bar';
+      var txt = document.createElement('span');
+      txt.textContent = label;
+      b.appendChild(txt);
+      var x = document.createElement('span');
+      x.className = 'flt-combo-x';
+      x.textContent = '✕';
+      x.title = c.saved ? 'Delete this saved filter' : 'Remove from the bar';
+      x.addEventListener('click', function(ev) { ev.stopPropagation(); removeCombo(c.sig); });
+      b.appendChild(x);
       b.addEventListener('click', function() {
-        var target = parseSignature(c.sig);
-        applyState(signature(state) === c.sig ? { facets:{}, ranges:{} } : target);
+        applyState(signature(state) === c.sig ? { facets:{}, ranges:{} } : parseSignature(c.sig));
       });
       usedEl.appendChild(b);
-      shown++;
+      if (!c.saved) shown++;
     });
+
+    if (Object.keys(hidden).length) {              // way back from an over-zealous ✕
+      var r = document.createElement('button');
+      r.className = 'flt-combo flt-restore';
+      r.title = 'Bring back the quick filters you removed';
+      r.appendChild(document.createTextNode('Restore removed'));
+      r.addEventListener('click', function() { storeHidden({}); renderUsed(); });
+      usedEl.appendChild(r);
+    }
+    if (usedLabel) usedLabel.textContent = saved.length ? 'Saved & most used' : 'Most used';
   }
 
   // ---------- Refresh everything ----------
@@ -9534,6 +9657,7 @@ Verdicts are framework outputs, not investment advice.
     var hasAny = activeN > 0 || searchOn;
     clearBtn.style.opacity = hasAny ? '1' : '.4';
     clearBtn.style.pointerEvents = hasAny ? 'auto' : 'none';
+    syncSaveBtn();
     if (searchWrap) searchWrap.classList.toggle('has-val', searchOn);
 
     // learn the combos you actually settle on
@@ -9587,6 +9711,7 @@ Verdicts are framework outputs, not investment advice.
     try { localStorage.setItem(LS.open, open ? '1' : '0'); } catch (e) {}
     refresh();
   }
+  if (saveBtn) saveBtn.addEventListener('click', function() { promptSave(signature(state)); });
   toggleBtn.addEventListener('click', function() { setOpen(!panel.classList.contains('show')); });
   try { if (localStorage.getItem(LS.open) === '1') panel.classList.add('show'); } catch (e) {}
 
