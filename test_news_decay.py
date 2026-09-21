@@ -396,8 +396,12 @@ def test_batch_harvest_as_of() -> None:
         _isolated_cache({})
         client = _FakeBatchesClient({
             "news-0": {"score": 0.9, "label": "bullish", "rationale": "beat"}})
-        submitted_ts = time.time() - 3 * 86400
-        submitted_day = ap._et_date_iso(submitted_ts)
+        # Three *trading* days back, which is the only unit the age policy
+        # counts in. "now - 3 * 86400" is three calendar days, and those two
+        # only coincide on a Wed/Thu/Fri run: on a Monday it lands on Friday,
+        # one session old, and the age check below read 1 instead of 3.
+        today = _REAL_ET_NOW().date()
+        submitted_day = _as_of_aged(3, today)
 
         n = ap._store_batch_results(
             client, "batch_x", {"news-0": "AAA"}, {"AAA": ["h1"]},
