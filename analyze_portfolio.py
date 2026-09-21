@@ -629,6 +629,219 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
     return "".join(blocks)
 
 
+# --- True account YTD return (cash-flow adjusted) -----------------------------
+# The benchmark tile above is a price return on the CURRENT basket. It is not
+# what a broker shows you, and on an account that takes regular deposits the two
+# are not close: money you add is not performance. This computes the real thing.
+#
+# Robinhood cannot be asked for it. /portfolios/historicals/ is now a
+# current-snapshot protobuf service (rosetta.portfolio.v1.GetAccountValueRequest
+# accepts only `account` and `bounds`), so robin_stocks' get_historical_portfolio
+# 404s and no endpoint returns an equity time series or a YTD percentage. What
+# the API does give, exactly, is current equity and the full transfer feed — so
+# the only missing input is the account's equity at the start of the year, which
+# the ledger below accumulates and YTD_START_EQUITY seeds.
+_EQUITY_LEDGER_PATH = Path(__file__).resolve().parent / "equity_history.json"
+
+# A year-start anchor is only trustworthy if it was taken just before the year
+# turned; an older snapshot is missing real performance and flows.
+_ANCHOR_MAX_AGE_DAYS = 14
+
+
+def record_account_equity(equity: Optional[float], when: Optional[str] = None,
+                          path: Optional[Path] = None) -> None:
+    """Append today's account equity to the equity ledger, so that next January
+    the year-start anchor is already on disk and no manual value is needed.
+
+    Keyed by date, last write of the day wins — several runs a day just refresh
+    today's figure. Holds real account values, so like recs_history.json it is
+    gitignored and rides the Actions cache rather than this public repo. Never
+    raises: a ledger write failing must not cost you the report.
+    """
+    if equity is None or equity <= 0:
+        return
+    path = path or _EQUITY_LEDGER_PATH
+    when = when or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    try:
+        ledger = {}
+        if path.exists():
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                ledger = loaded.get("equity") or {}
+        ledger[when] = round(float(equity), 2)
+        path.write_text(json.dumps({"equity": dict(sorted(ledger.items()))},
+                                   indent=1))
+    except Exception as e:
+        print(f"[equity-ledger] Could not record equity: {e}")
+
+
+def _resolve_year_start_equity(year: int, path: Optional[Path] = None
+                               ) -> tuple[Optional[float], str]:
+    """The account's equity as the year began, plus a one-line provenance note.
+
+    Two sources, ledger first:
+      * the newest ledger snapshot taken within _ANCHOR_MAX_AGE_DAYS *before*
+        Jan 1 — a snapshot from inside the year already contains performance and
+        deposits, so it would understate the return and is refused;
+      * YTD_START_EQUITY, which you set once from the Dec-31 account statement.
+        Prefer the "YEAR:AMOUNT" form (e.g. "2026:22973.16") — a bare amount
+        cannot be checked against the year and would be silently reused next
+        January, quietly reporting a wrong number, so it is accepted with a
+        warning and a year-tagged value for the wrong year is refused outright.
+
+    Returns (None, reason) when neither is usable; the caller then skips the
+    tile instead of showing a return built on a guess.
+    """
+    path = path or _EQUITY_LEDGER_PATH
+    jan1 = date(year, 1, 1)
+
+    try:
+        if path.exists():
+            loaded = json.loads(path.read_text())
+            snaps = (loaded or {}).get("equity") or {}
+            best: Optional[tuple[date, float]] = None
+            for ds, val in snaps.items():
+                try:
+                    d = date.fromisoformat(ds)
+                except ValueError:
+                    continue
+                age = (jan1 - d).days
+                if 0 < age <= _ANCHOR_MAX_AGE_DAYS:
+                    if best is None or d > best[0]:
+                        best = (d, float(val))
+            if best:
+                return best[1], f"ledger snapshot {best[0].isoformat()}"
+    except Exception as e:
+        print(f"[equity-ledger] Could not read ledger: {e}")
+
+    raw = (os.environ.get("YTD_START_EQUITY") or "").strip()
+    if not raw:
+        return None, ("no year-start equity — set YTD_START_EQUITY to "
+                      f'"{year}:<your Dec-31 equity>"')
+    if ":" in raw:
+        y, _, amt = raw.partition(":")
+        try:
+            if int(y.strip()) != year:
+                return None, (f"YTD_START_EQUITY is tagged {y.strip()}, not "
+                              f"{year} — update it from the Dec-31 statement")
+            return float(amt), f"YTD_START_EQUITY ({year})"
+        except ValueError:
+            return None, f"YTD_START_EQUITY is not parseable: {raw!r}"
+    try:
+        val = float(raw)
+    except ValueError:
+        return None, f"YTD_START_EQUITY is not parseable: {raw!r}"
+    print("[account-ytd] YTD_START_EQUITY has no year tag — cannot verify it "
+          f'belongs to {year}. Prefer "{year}:{val:g}".')
+    return val, "YTD_START_EQUITY (untagged)"
+
+
+def compute_account_ytd_return(equity_now: Optional[float],
+                               flows: Optional[list[dict]],
+                               year: Optional[int] = None,
+                               today: Optional[date] = None,
+                               start_equity: Optional[float] = None,
+                               ledger_path: Optional[Path] = None
+                               ) -> Optional[dict]:
+    """Modified Dietz YTD return for the account — the cash-flow-adjusted figure
+    a broker reports, and the only one comparable to Robinhood's.
+
+        R = (V1 - V0 - C) / (V0 + sum(w_i * C_i)),  w_i = (D - d_i) / D
+
+    V0/V1 are start/end equity, C the net external flows, and each flow is
+    weighted by the fraction of the period it was actually invested — a deposit
+    landing in December barely had a chance to earn, so it barely counts in the
+    denominator. Withdrawals carry negative amounts and work the same way.
+
+    Returns None (never a wrong number) when an input is missing or the
+    denominator is not positive — the latter happens on an account whose
+    deposits dominate a tiny starting balance, where no period return is
+    meaningful. Otherwise a dict carrying the figure and every input behind it,
+    so the tile can show its own arithmetic.
+    """
+    if equity_now is None or equity_now <= 0 or flows is None:
+        return None
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    year = year or today.year
+    jan1 = date(year, 1, 1)
+    days = (today - jan1).days
+    if days <= 0:
+        return None
+
+    if start_equity is None:
+        start_equity, source = _resolve_year_start_equity(year, ledger_path)
+    else:
+        source = "caller-supplied"
+    if start_equity is None or start_equity <= 0:
+        print(f"[account-ytd] Skipping account return: {source}")
+        return None
+
+    net = weighted = 0.0
+    for f in flows:
+        try:
+            amt = float(f["amount"])
+            d = date.fromisoformat(f["date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (jan1 <= d <= today):
+            continue
+        net += amt
+        weighted += amt * ((days - (d - jan1).days) / days)
+
+    denom = start_equity + weighted
+    if denom <= 0:
+        print("[account-ytd] Skipping account return: average invested capital "
+              f"is not positive (${denom:,.2f}) — deposits dominate the period.")
+        return None
+
+    gain = equity_now - start_equity - net
+    return {
+        "pct": gain / denom * 100,
+        "start_equity": start_equity,
+        "end_equity": equity_now,
+        "net_flows": net,
+        "weighted_flows": weighted,
+        "avg_capital": denom,
+        "gain": gain,
+        "flow_count": sum(1 for f in flows
+                          if isinstance(f, dict) and "date" in f),
+        "source": source,
+        "year": year,
+    }
+
+
+def _render_account_ytd_stat(acct: Optional[dict],
+                             bench: Optional[dict]) -> str:
+    """One tile for the real, cash-flow-adjusted account return — the number
+    that lines up with what the brokerage app shows. Sits beside the basket
+    tiles, which measure something different on purpose."""
+    if not acct:
+        return ""
+    spx = (bench or {}).get("ytd_pct")
+    color = ("var(--pos-up)" if spx is None or acct["pct"] >= spx
+             else "var(--pos-down)")
+    tip = (f"Modified Dietz return for {acct['year']}: your gain divided by the "
+           "average capital you had invested, so deposits and withdrawals do "
+           "not count as performance. This is the figure comparable to your "
+           f"broker's YTD. Start equity {_fmt_money(acct['start_equity'])} "
+           f"({acct['source']}); now {_fmt_money(acct['end_equity'])}; "
+           f"net transfers {_fmt_money(acct['net_flows'])} over "
+           f"{acct['flow_count']} movement(s), worth "
+           f"{_fmt_money(acct['weighted_flows'])} time-weighted; gain "
+           f"{_fmt_money(acct['gain'])} on average capital of "
+           f"{_fmt_money(acct['avg_capital'])}.")
+    cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
+                 "text-transform:none;letter-spacing:0;margin-top:2px;")
+    caption = (f"{_fmt_money(acct['gain'])} gain &middot; "
+               f"{_fmt_money(acct['net_flows'])} added")
+    return (f'<div class="stat" title="{tip}">'
+            f'<strong style="color:{color};">'
+            f'{_fmt_pct(acct["pct"], 2, True)}</strong>'
+            f'YTD &middot; account (after deposits)'
+            f'<div style="{cap_style}">{caption}</div>'
+            f'</div>')
+
+
 def _zone_color(score: float) -> str:
     """Red (low) → green (high). Shared by every top-of-report gauge, so
     'needle to the right / greener' always reads as the healthier end."""
@@ -8006,6 +8219,7 @@ def generate_html_report(
     missed_insights: Optional[dict] = None,
     missed_analysis_md: Optional[str] = None,
     account_summary: Optional[dict] = None,
+    account_ytd: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -8246,7 +8460,12 @@ def generate_html_report(
     # with holdings, and hides itself if the benchmark can't be fetched.
     benchmark_stat_html = ""
     if has_holdings:
-        benchmark_stat_html = _render_benchmark_stat(
+        # The account tile leads: it is the real, deposit-adjusted return and the
+        # only one comparable to the brokerage app. The basket tiles follow as
+        # price-return context, which is a different question on purpose.
+        benchmark_stat_html = _render_account_ytd_stat(
+            account_ytd, fetch_benchmark_returns())
+        benchmark_stat_html += _render_benchmark_stat(
             day_change_pct,
             _compute_holdings_ytd_return(results),
             fetch_benchmark_returns(),
@@ -10728,6 +10947,7 @@ def main():
     tax_lots_lookup: dict[str, list[dict]] = {}
     realized_ytd = None   # populated only when --tax is set
     account_summary = None  # cash/margin snapshot; only the robinhood source has it
+    account_ytd = None     # cash-flow-adjusted account return; needs a year-start anchor
 
     # Optional lot-level purchase history (CSV mode). Builds the same
     # ticker -> [{date, shares, price, cost}] structure that the Robinhood
@@ -10774,6 +10994,24 @@ def main():
         except Exception as e:
             print(f"[robinhood] Account summary fetch skipped: {e}")
             account_summary = None
+        # Real, deposit-adjusted account return. Equity is snapshotted every run
+        # so next January's year-start anchor is already on disk; until a year
+        # has been ledgered end to end, YTD_START_EQUITY supplies it.
+        if account_summary:
+            record_account_equity(account_summary.get("equity"))
+            try:
+                account_ytd = compute_account_ytd_return(
+                    account_summary.get("equity"),
+                    rhs.fetch_external_flows(verbose=True),
+                )
+                if account_ytd:
+                    print(f"[account-ytd] {account_ytd['year']} return "
+                          f"{account_ytd['pct']:+.2f}% "
+                          f"(gain ${account_ytd['gain']:,.2f} on average "
+                          f"capital ${account_ytd['avg_capital']:,.2f}; "
+                          f"start equity from {account_ytd['source']})")
+            except Exception as e:
+                print(f"[account-ytd] Skipped: {e}")
         use_rh_ratings = True
         if args.include_watchlists:
             print("[robinhood] Fetching watchlists...")
@@ -11140,6 +11378,7 @@ def main():
         missed_insights=missed_insights,
         missed_analysis_md=_miss_analysis_md,
         account_summary=account_summary,
+        account_ytd=account_ytd,
     )
 
     out = Path(args.out)
