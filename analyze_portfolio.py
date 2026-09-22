@@ -11087,11 +11087,21 @@ def main():
                     rhs.fetch_external_flows(verbose=True),
                 )
                 if account_ytd:
+                    # Log the figure the TILE shows first. The log used to
+                    # print Modified Dietz while the tile showed the broker
+                    # rate, so the two disagreed by points with no hint why.
+                    _b = account_ytd.get("pct_broker")
                     print(f"[account-ytd] {account_ytd['year']} return "
-                          f"{account_ytd['pct']:+.2f}% "
-                          f"(gain ${account_ytd['gain']:,.2f} on average "
-                          f"capital ${account_ytd['avg_capital']:,.2f}; "
-                          f"start equity from {account_ytd['source']})")
+                          f"{_b:+.2f}% (broker convention, shown in the tile) "
+                          f"/ {account_ytd['pct']:+.2f}% (Modified Dietz) — "
+                          f"gain ${account_ytd['gain']:,.2f}, deposits "
+                          f"${account_ytd['net_flows']:,.2f}, start equity "
+                          f"${account_ytd['start_equity']:,.2f} from "
+                          f"{account_ytd['source']}"
+                          if _b is not None else
+                          f"[account-ytd] {account_ytd['year']} return "
+                          f"{account_ytd['pct']:+.2f}% (Modified Dietz; no "
+                          f"broker rate — nothing was invested)")
             except Exception as e:
                 print(f"[account-ytd] Skipped: {e}")
         use_rh_ratings = True
