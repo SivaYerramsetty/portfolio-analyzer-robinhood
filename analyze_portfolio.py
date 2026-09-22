@@ -889,38 +889,6 @@ def compute_account_ytd_return(equity_now: Optional[float],
     }
 
 
-def _render_account_ytd_stat(acct: Optional[dict],
-                             bench: Optional[dict]) -> str:
-    """One tile for the real, cash-flow-adjusted account return — the number
-    that lines up with what the brokerage app shows. Sits beside the basket
-    tiles, which measure something different on purpose."""
-    if not acct:
-        return ""
-    spx = (bench or {}).get("ytd_pct")
-    color = ("var(--pos-up)" if spx is None or acct["pct"] >= spx
-             else "var(--pos-down)")
-    tip = (f"Modified Dietz return for {acct['year']}: your gain divided by the "
-           "average capital you had invested, so deposits and withdrawals do "
-           "not count as performance. This is the figure comparable to your "
-           f"broker's YTD. Start equity {_fmt_money(acct['start_equity'])} "
-           f"({acct['source']}); now {_fmt_money(acct['end_equity'])}; "
-           f"net transfers {_fmt_money(acct['net_flows'])} over "
-           f"{acct['flow_count']} movement(s), worth "
-           f"{_fmt_money(acct['weighted_flows'])} time-weighted; gain "
-           f"{_fmt_money(acct['gain'])} on average capital of "
-           f"{_fmt_money(acct['avg_capital'])}.")
-    cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
-                 "text-transform:none;letter-spacing:0;margin-top:2px;")
-    caption = (f"{_fmt_money(acct['gain'])} gain &middot; "
-               f"{_fmt_money(acct['net_flows'])} added")
-    return (f'<div class="stat" title="{tip}">'
-            f'<strong style="color:{color};">'
-            f'{_fmt_pct(acct["pct"], 2, True)}</strong>'
-            f'YTD &middot; account (after deposits)'
-            f'<div style="{cap_style}">{caption}</div>'
-            f'</div>')
-
-
 def _zone_color(score: float) -> str:
     """Red (low) → green (high). Shared by every top-of-report gauge, so
     'needle to the right / greener' always reads as the healthier end."""
@@ -8298,7 +8266,6 @@ def generate_html_report(
     missed_insights: Optional[dict] = None,
     missed_analysis_md: Optional[str] = None,
     account_summary: Optional[dict] = None,
-    account_ytd: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -8539,12 +8506,7 @@ def generate_html_report(
     # with holdings, and hides itself if the benchmark can't be fetched.
     benchmark_stat_html = ""
     if has_holdings:
-        # The account tile leads: it is the real, deposit-adjusted return and the
-        # only one comparable to the brokerage app. The basket tiles follow as
-        # price-return context, which is a different question on purpose.
-        benchmark_stat_html = _render_account_ytd_stat(
-            account_ytd, fetch_benchmark_returns())
-        benchmark_stat_html += _render_benchmark_stat(
+        benchmark_stat_html = _render_benchmark_stat(
             day_change_pct,
             _compute_holdings_ytd_return(results),
             fetch_benchmark_returns(),
@@ -11026,7 +10988,6 @@ def main():
     tax_lots_lookup: dict[str, list[dict]] = {}
     realized_ytd = None   # populated only when --tax is set
     account_summary = None  # cash/margin snapshot; only the robinhood source has it
-    account_ytd = None     # cash-flow-adjusted account return; needs a year-start anchor
 
     # Optional lot-level purchase history (CSV mode). Builds the same
     # ticker -> [{date, shares, price, cost}] structure that the Robinhood
@@ -11461,7 +11422,6 @@ def main():
         missed_insights=missed_insights,
         missed_analysis_md=_miss_analysis_md,
         account_summary=account_summary,
-        account_ytd=account_ytd,
     )
 
     out = Path(args.out)
