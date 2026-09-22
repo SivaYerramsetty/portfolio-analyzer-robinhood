@@ -1524,6 +1524,109 @@ def test_account_ytd_return() -> None:
           "no account data renders no tile")
 
 
+def test_external_flow_scoping() -> None:
+    section("transfers: one account's flows, not every account on the login")
+
+    import robinhood_source as rs
+
+    ACCT = "884358995"
+
+    def row(amount, *, orig=None, recv=None, direction="pull",
+            state="completed", date="2026-03-01", orig_type="rhs_account"):
+        return {"amount": f"{amount}", "net_amount": f"{amount}",
+                "direction": direction, "state": state, "record_date": date,
+                "originating_account_id": orig, "receiving_account_id": recv,
+                "originating_account_type": orig_type}
+
+    @contextlib.contextmanager
+    def _feed(rows):
+        real_req = rs.rh.helper.request_get
+        real_prof = rs.rh.account.load_account_profile
+        real_req_rh = rs._require_rh
+        rs.rh.helper.request_get = lambda *a, **k: rows
+        rs.rh.account.load_account_profile = lambda *a, **k: ACCT
+        rs._require_rh = lambda: None
+        try:
+            yield
+        finally:
+            rs.rh.helper.request_get = real_req
+            rs.rh.account.load_account_profile = real_prof
+            rs._require_rh = real_req_rh
+
+    # The unified feed carries every account the login can see. Counting a joint
+    # tenancy or a second brokerage account as this account's deposits was worth
+    # a 36% overstatement on a real login, landing entirely on the return.
+    rows = [
+        row(7000, orig=ACCT),                                  # ours: in
+        row(3200, orig=ACCT),                                  # ours: in
+        row(500,  orig=ACCT, direction="push"),                # ours: out
+        row(124.60, orig="800714", recv=ACCT, direction="push",
+            orig_type="rct_firm_account"),                     # into ours: in
+        row(3575.30, orig="116011403932",
+            orig_type="rhs_joint_tenancy_with_ros"),           # joint account
+        row(3800, orig="181788708186"),                        # second account
+        row(100,  orig="992152389"),                           # third account
+    ]
+    with _feed(rows):
+        got = rs.fetch_external_flows(year=2026, verbose=False)
+    check(round(sum(f["amount"] for f in got), 2), 9824.60,
+          "only the analysed account's transfers are counted")
+    check(len(got), 4, "rows belonging to other accounts are dropped entirely")
+
+    # A push *from* a firm account into this one is money in. Signing by the
+    # direction field alone gets it backwards.
+    with _feed([row(124.60, orig="800714", recv=ACCT, direction="push",
+                    orig_type="rct_firm_account")]):
+        got = rs.fetch_external_flows(year=2026, verbose=False)
+    check([f["amount"] for f in got], [124.60],
+          "an inbound push is positive, not negative")
+
+    # Only settled money counts; the year filter is on the transfer's own date.
+    with _feed([row(1000, orig=ACCT, state="pending"),
+                row(2000, orig=ACCT, state="cancelled"),
+                row(3000, orig=ACCT, state="failed"),
+                row(4000, orig=ACCT, state="reversed"),
+                row(500,  orig=ACCT, state="completed")]):
+        got = rs.fetch_external_flows(year=2026, verbose=False)
+    check([f["amount"] for f in got], [500.0],
+          "pending, cancelled, failed and reversed transfers are excluded")
+
+    with _feed([row(900, orig=ACCT, date="2025-12-31"),
+                row(800, orig=ACCT, date="2026-01-02")]):
+        got = rs.fetch_external_flows(year=2026, verbose=False)
+    check([f["amount"] for f in got], [800.0],
+          "transfers from another year are excluded")
+
+    with _feed([row(300, orig=ACCT, date="2026-05-02"),
+                row(100, orig=ACCT, date="2026-02-01")]):
+        got = rs.fetch_external_flows(year=2026, verbose=False)
+    check([f["date"] for f in got], ["2026-02-01", "2026-05-02"],
+          "flows come back sorted by date")
+
+    # A feed that cannot be read must yield None, not an empty flow list — an
+    # empty list would look like "no deposits" and inflate the return.
+    real_req = rs.rh.helper.request_get
+    real_prof = rs.rh.account.load_account_profile
+    real_req_rh = rs._require_rh
+    rs.rh.account.load_account_profile = lambda *a, **k: ACCT
+    rs._require_rh = lambda: None
+    try:
+        rs.rh.helper.request_get = lambda *a, **k: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            check(rs.fetch_external_flows(year=2026), None,
+                  "an unreadable transfer feed returns None, not zero flows")
+        def _boom(*a, **k):
+            raise RuntimeError("network down")
+        rs.rh.helper.request_get = _boom
+        with contextlib.redirect_stdout(io.StringIO()):
+            check(rs.fetch_external_flows(year=2026), None,
+                  "a failing transfer fetch returns None")
+    finally:
+        rs.rh.helper.request_get = real_req
+        rs.rh.account.load_account_profile = real_prof
+        rs._require_rh = real_req_rh
+
+
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
@@ -1537,7 +1640,7 @@ def main() -> int:
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
               test_recently_held_universe, test_holdings_ytd_weighting,
-              test_account_ytd_return):
+              test_account_ytd_return, test_external_flow_scoping):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)

@@ -649,7 +649,9 @@ _ANCHOR_MAX_AGE_DAYS = 14
 
 
 def record_account_equity(equity: Optional[float], when: Optional[str] = None,
-                          path: Optional[Path] = None) -> None:
+                          path: Optional[Path] = None,
+                          market_value: Optional[float] = None,
+                          margin_used: Optional[float] = None) -> None:
     """Append today's account equity to the equity ledger, so that next January
     the year-start anchor is already on disk and no manual value is needed.
 
@@ -657,20 +659,37 @@ def record_account_equity(equity: Optional[float], when: Optional[str] = None,
     today's figure. Holds real account values, so like recs_history.json it is
     gitignored and rides the Actions cache rather than this public repo. Never
     raises: a ledger write failing must not cost you the report.
+
+    `equity` is the NET account value — positions plus cash, minus any margin
+    loan — because that is what the return is measured on. When the gross
+    position value and the loan are known they are recorded alongside it under
+    "detail", which is what makes a future anchor unambiguous: on a margin
+    account "portfolio value" and "equity" differ by the loan, and reading the
+    wrong one off a statement silently shifts the whole year's return.
     """
     if equity is None or equity <= 0:
         return
     path = path or _EQUITY_LEDGER_PATH
     when = when or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     try:
-        ledger = {}
+        equities, detail = {}, {}
         if path.exists():
             loaded = json.loads(path.read_text())
             if isinstance(loaded, dict):
-                ledger = loaded.get("equity") or {}
-        ledger[when] = round(float(equity), 2)
-        path.write_text(json.dumps({"equity": dict(sorted(ledger.items()))},
-                                   indent=1))
+                equities = loaded.get("equity") or {}
+                detail = loaded.get("detail") or {}
+        equities[when] = round(float(equity), 2)
+        if market_value is not None or margin_used is not None:
+            row = {"equity": round(float(equity), 2)}
+            if market_value is not None:
+                row["market_value"] = round(float(market_value), 2)
+            if margin_used is not None:
+                row["margin_used"] = round(float(margin_used), 2)
+            detail[when] = row
+        out = {"equity": dict(sorted(equities.items()))}
+        if detail:
+            out["detail"] = dict(sorted(detail.items()))
+        path.write_text(json.dumps(out, indent=1))
     except Exception as e:
         print(f"[equity-ledger] Could not record equity: {e}")
 
@@ -704,6 +723,11 @@ def _resolve_year_start_equity(year: int, path: Optional[Path] = None
         is accepted with a warning, because nothing can check it belongs to this
         year and it would be silently reused next January. A tag for the *prior*
         year is refused with the fix spelled out — it is the easy misreading.
+
+        On a margin account, give the NET equity (total account value after the
+        loan), not the gross "portfolio value" the statement leads with — they
+        differ by the loan, and the wrong one shifts the entire year's return by
+        that amount with nothing to flag it.
 
     Returns (None, reason) when neither is usable; the caller then skips the
     tile instead of showing a return built on a guess.
@@ -11053,7 +11077,11 @@ def main():
         # so next January's year-start anchor is already on disk; until a year
         # has been ledgered end to end, YTD_START_EQUITY supplies it.
         if account_summary:
-            record_account_equity(account_summary.get("equity"))
+            record_account_equity(
+                account_summary.get("equity"),
+                market_value=account_summary.get("market_value"),
+                margin_used=account_summary.get("margin_used"),
+            )
             try:
                 account_ytd = compute_account_ytd_return(
                     account_summary.get("equity"),
