@@ -1442,6 +1442,49 @@ def test_account_ytd_return() -> None:
         check(ap._resolve_year_start_equity(2026, f)[0], 12345.67,
               "an untagged env anchor still works (with a warning)")
 
+    # Money as a person copies it off a statement. Refusing a comma would mean
+    # silently dropping the tile over punctuation, so every form is accepted.
+    for raw, want, label in (
+        ("2026:25,643.49",        25643.49, "a comma in the amount"),
+        ("2026:$25,643.49",       25643.49, "a currency symbol"),
+        ("2026: 25 643.49",       25643.49, "spaces inside the amount"),
+        ("2025-12-31:25,643.49",  25643.49, "a statement-date tag"),
+        ("$25,643.49",            25643.49, "an untagged money string"),
+    ):
+        with _ledger(None, env=raw) as f:
+            check(ap._resolve_year_start_equity(2026, f)[0], want,
+                  f"the anchor accepts {label}")
+
+    # The date form is checked against the same window as a ledger snapshot.
+    with _ledger(None, env="2026-03-01:25643.49") as f:
+        got, why = ap._resolve_year_start_equity(2026, f)
+        check(got, None, "a statement date inside the year is refused")
+        check("inside 2026" in why, True, "and says why it is refused")
+    with _ledger(None, env="2025-11-01:25643.49") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "a statement date long before Jan 1 is refused")
+    with _ledger(None, env="2025-02-30:25643.49") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "an impossible statement date is refused")
+
+    # Tagging with the prior year is the easy misreading — the tag names the year
+    # the return covers, not the year the balance came from. Say so, don't guess.
+    with _ledger(None, env="2025:25643.49") as f:
+        got, why = ap._resolve_year_start_equity(2026, f)
+        check(got, None, "a prior-year tag is refused rather than assumed")
+        check("2025-12-31:25643.49" in why, True,
+              "and the refusal spells out the correct form")
+
+    with _ledger(None, env="junk:5") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "an unrecognised tag is refused")
+    with _ledger(None, env="2026:0") as f:
+        check(ap._resolve_year_start_equity(2026, f)[0], None,
+              "a non-positive amount is refused")
+
+    check(ap._parse_anchor_amount("nope"), None,
+          "the money parser returns None on nonsense")
+
     # The ledger wins over env, but only a snapshot from just before Jan 1.
     with _ledger({"2025-12-31": 999.0}, env="2026:12345.67") as f:
         check(ap._resolve_year_start_equity(2026, f)[0], 999.0,
