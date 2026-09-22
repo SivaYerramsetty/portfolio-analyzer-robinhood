@@ -591,30 +591,56 @@ def _compute_holdings_ytd_return(results) -> Optional[float]:
 
 def _render_benchmark_stat(port_today_pct: Optional[float],
                            port_ytd_pct: Optional[float],
-                           bench: Optional[dict]) -> str:
-    """Two standalone summary tiles — 'Today · your holdings' and 'YTD · if held
-    since Jan 1' — matching the single-value layout of the other stats in the row.
-    The big figure is YOUR holdings' return (green when it beats the index for
-    that horizon, red when it lags); the S&P 500's own return sits on a muted
-    sub-line so the two can't be confused. A tile appears only when both sides
-    have data; nothing renders if the benchmark is unavailable or no horizon
-    can be shown."""
+                           bench: Optional[dict],
+                           account_ytd: Optional[dict] = None) -> str:
+    """Two summary tiles, 'Today' and 'YTD', matching the single-value layout of
+    the other stats in the row. The big figure is yours, the S&P 500's own
+    return sits on a muted sub-line, and green means you beat the index over
+    that horizon. A tile appears only when both sides have data.
+
+    Today is the holdings' price move against the prior close.
+
+    YTD prefers the ACCOUNT return from `account_ytd` — the deposit-adjusted
+    figure computed the way the broker computes it, so the tile agrees with the
+    brokerage app. It falls back to the basket's price return only when no
+    year-start anchor is available, and the tooltip says which one is showing,
+    because the two answer different questions and can differ by tens of points
+    on an account that takes regular deposits.
+    """
     if not bench:
         return ""
-    tip = ("The big figure is your current holdings' price return; the S&P 500 "
-           "(^GSPC) return is shown below it for comparison. Today = vs prior "
-           "close; YTD = vs the first close of the year. Green = your holdings "
-           "beat the index. Both are weighted by start-of-period value over "
-           "holdings with available history. NOTE: YTD is a hypothetical — what "
-           "today's basket would have returned if held in these proportions "
-           "since Jan 1. It ignores intra-year trades, positions you closed, "
-           "cash and margin, so it will NOT match your broker's YTD figure.")
     cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
                  "text-transform:none;letter-spacing:0;margin-top:2px;")
+    today_tip = ("Your holdings' price move today against the prior close, "
+                 "weighted by yesterday's value, with the S&P 500 (^GSPC) below "
+                 "for comparison. Green = you beat the index.")
+
+    ytd_val = None
+    if account_ytd and account_ytd.get("pct_broker") is not None:
+        a = account_ytd
+        ytd_val = a["pct_broker"]
+        ytd_tip = (
+            f"Your {a['year']} account return, computed the way the brokerage "
+            "app computes it: the gain divided by everything that is not gain "
+            "(starting equity plus every dollar deposited). Deposits are not "
+            f"performance. Start equity {_fmt_money(a['start_equity'])} "
+            f"({a['source']}); now {_fmt_money(a['end_equity'])}; net transfers "
+            f"{_fmt_money(a['net_flows'])} over {a['flow_count']} movement(s); "
+            f"gain {_fmt_money(a['gain'])}. Time-weighting the deposits instead "
+            f"(Modified Dietz) gives {a['pct']:+.2f}%.")
+    elif port_ytd_pct is not None:
+        ytd_val = port_ytd_pct
+        ytd_tip = ("No year-start account value is available, so this falls "
+                   "back to a price return on the holdings you hold now, as if "
+                   "you had held them in these proportions since Jan 1. It "
+                   "ignores intra-year trades, positions you closed, cash and "
+                   "margin, so it will NOT match your broker's YTD. Set "
+                   "YTD_START_EQUITY to get the real account return here.")
+
     blocks = []
-    for label, port_val, spx in (
-        ("Today &middot; your holdings", port_today_pct, bench.get("today_pct")),
-        ("YTD &middot; if held since Jan 1", port_ytd_pct, bench.get("ytd_pct")),
+    for label, port_val, spx, tip in (
+        ("Today", port_today_pct, bench.get("today_pct"), today_tip),
+        ("YTD", ytd_val, bench.get("ytd_pct"), ytd_tip if ytd_val is not None else ""),
     ):
         if port_val is None or spx is None:
             continue
@@ -874,8 +900,17 @@ def compute_account_ytd_return(equity_now: Optional[float],
         return None
 
     gain = equity_now - start_equity - net
+    # Robinhood divides the gain by everything that is NOT gain — the starting
+    # equity plus every dollar deposited, undiscounted. Verified against the
+    # app: value $62,259.98 with a $15,239.48 YTD gain is shown as 32.41%, and
+    # 15,239.48 / (62,259.98 - 15,239.48) = 32.41%. It is a cruder rate than
+    # Modified Dietz (a dollar added in December counts the same as one that
+    # worked all year, so it understates a funded account), but it is the one
+    # the app shows, so it is the one the tile must report.
+    invested = start_equity + net
     return {
         "pct": gain / denom * 100,
+        "pct_broker": (gain / invested * 100) if invested > 0 else None,
         "start_equity": start_equity,
         "end_equity": equity_now,
         "net_flows": net,
@@ -8266,6 +8301,7 @@ def generate_html_report(
     missed_insights: Optional[dict] = None,
     missed_analysis_md: Optional[str] = None,
     account_summary: Optional[dict] = None,
+    account_ytd: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -8510,6 +8546,7 @@ def generate_html_report(
             day_change_pct,
             _compute_holdings_ytd_return(results),
             fetch_benchmark_returns(),
+            account_ytd,
         )
 
     holdings_summary = ""
@@ -10988,6 +11025,7 @@ def main():
     tax_lots_lookup: dict[str, list[dict]] = {}
     realized_ytd = None   # populated only when --tax is set
     account_summary = None  # cash/margin snapshot; only the robinhood source has it
+    account_ytd = None     # broker-convention account return; needs a year-start anchor
 
     # Optional lot-level purchase history (CSV mode). Builds the same
     # ticker -> [{date, shares, price, cost}] structure that the Robinhood
@@ -11422,6 +11460,7 @@ def main():
         missed_insights=missed_insights,
         missed_analysis_md=_miss_analysis_md,
         account_summary=account_summary,
+        account_ytd=account_ytd,
     )
 
     out = Path(args.out)
