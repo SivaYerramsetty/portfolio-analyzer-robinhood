@@ -17,6 +17,10 @@ on:
         description: "Embed a Claude AI post-mortem of the Missed Opportunities (uses ANTHROPIC_API_KEY; off by default)"
         type: boolean
         default: false
+      rescan:
+        description: "Re-run the S&P 500/400 screen even if today's scan is already cached (the first run of each market day scans anyway)"
+        type: boolean
+        default: false
       base_score_mode:
         description: "Base score this run acts on for pruning, tax flags and history (the report shows all three either way). 'default' = the BASE_SCORE_MODE repository variable (composite when unset)"
         type: choice
@@ -104,8 +108,10 @@ jobs:
     runs-on: ubuntu-latest
     # A stale session used to leave robin_stocks polling for a device
     # approval for ~25 min before Robinhood rate-limited it. The code now
-    # fails fast instead, but cap the job as a backstop.
-    timeout-minutes: 30
+    # fails fast instead, but cap the job as a backstop. The headroom over a
+    # normal ~10-min run is for the first run of each market day, which pays
+    # for the S&P 500/400 scan before the rest of the day reads its cache.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -130,10 +136,11 @@ jobs:
           key: robinhood-session-${{ github.run_id }}
           restore-keys: robinhood-session-
 
-      # .cache holds instrument-URL -> ticker mappings (never change) and
-      # SEC insider-scan results (12h TTL) — carrying them across runs skips
-      # hundreds of rate-gated SEC requests. run_id keying means each run
-      # saves a fresh copy; restore-keys picks up the most recent previous one.
+      # .cache holds instrument-URL -> ticker mappings (never change), SEC
+      # insider-scan results (12h TTL) and the day's S&P 500/400 screen —
+      # carrying them across runs skips hundreds of rate-gated SEC requests and
+      # keeps the universe scan to once per market day. run_id keying means each
+      # run saves a fresh copy; restore-keys picks up the most recent previous one.
       - name: Restore analyzer cache
         uses: actions/cache@v4
         with:
@@ -221,10 +228,20 @@ jobs:
           case "${{ inputs.base_score_mode }}" in
             composite|quality|blend) BASE_FLAG="--base-score ${{ inputs.base_score_mode }}" ;;
           esac
+          # --screen scans the S&P 500/400 once per market day (the result is
+          # cached in .cache/, which rides the Actions cache), appends the best
+          # passers to the "Screening" watchlist and analyzes them the same
+          # run. --prune-watchlists is the other half: it removes them again
+          # when the verdict decays, so the list needs no hand-curation.
+          RESCAN_FLAG=""
+          if [ "${{ inputs.rescan }}" = "true" ]; then RESCAN_FLAG="--rescan"; fi
           python analyze_portfolio.py \
             --source robinhood \
             --include-watchlists \
+            --screen \
+            --sync-screening-watchlist \
             --prune-watchlists \
+            $RESCAN_FLAG \
             $TAX_FLAG \
             $MISS_FLAG \
             $BASE_FLAG \
