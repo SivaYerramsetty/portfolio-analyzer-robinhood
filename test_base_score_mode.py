@@ -1274,6 +1274,53 @@ def test_recently_held_universe() -> None:
           {"Screening": ["SOLD"]}, "a real list still prunes normally")
 
 
+def test_screen_additions() -> None:
+    section("the scan adds names to the watchlist; pruning still owns removal")
+    today = date(2026, 9, 21)
+
+    def passer(ticker: str, composite: float) -> SimpleNamespace:
+        return SimpleNamespace(ticker=ticker, name=f"{ticker} Inc",
+                               score_composite=composite)
+
+    # Passers arrive sorted by composite, as split_passers_and_near_misses does.
+    passed = [passer("AAA", 91.0), passer("BBB", 88.0), passer("CCC", 84.0),
+              passer("DDD", 80.0)]
+    hist = {"tickers": {
+        # Pruned three weeks ago for a weak verdict — inside the cooldown.
+        "BBB": {"last_verdict_score": 41.0, "last_date": "2026-08-31"},
+        # Scored weak, but long enough ago to be worth another look.
+        "CCC": {"last_verdict_score": 38.0, "last_date": "2026-01-10"},
+        # Seen recently and scored well: no reason to hold it back.
+        "DDD": {"last_verdict_score": 77.0, "last_date": "2026-09-20"},
+    }}
+
+    picks, skipped = select(passed, {"AAA"}, hist, limit=25, today=today)
+    check(picks, ["CCC", "DDD"],
+          "held names and recently-pruned ones are passed over")
+    check(skipped["AAA"], "already held", "and each skip says why")
+    check("under the 60 prune bar" in skipped["BBB"], True,
+          "a name pruned inside the cooldown names the bar it missed")
+
+    check(select(passed, set(), hist, limit=2, today=today)[0], ["AAA", "CCC"],
+          "the cap keeps the highest composites")
+    check(select(passed, set(), hist, limit=2, today=today)[1]["DDD"],
+          "past the top 2", "and says what the rest were cut by")
+    check(select(passed, set(), None, today=today)[0],
+          ["AAA", "BBB", "CCC", "DDD"],
+          "with no ledger every passer is fair game")
+
+    stale = {"tickers": {"BBB": {"last_verdict_score": 41.0,
+                                 "last_date": "not-a-date"}}}
+    check(select(passed, set(), stale, today=today)[0],
+          ["AAA", "BBB", "CCC", "DDD"],
+          "an unparseable ledger date doesn't silently block a name")
+
+
+def select(passed, held, hist, limit=25, today=None):
+    return ap.select_screen_additions(passed, held, hist, limit=limit,
+                                      threshold=60.0, today=today)
+
+
 def test_holdings_ytd_weighting() -> None:
     section("YTD tile: start-of-year weights, not live market value")
 
@@ -1673,7 +1720,8 @@ def main() -> int:
               test_full_report, test_refresh_script_parses,
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
-              test_recently_held_universe, test_holdings_ytd_weighting,
+              test_recently_held_universe, test_screen_additions,
+              test_holdings_ytd_weighting,
               test_account_ytd_return, test_external_flow_scoping):
         before = len(_results)
         t()

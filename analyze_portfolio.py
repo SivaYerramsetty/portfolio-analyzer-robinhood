@@ -44,6 +44,12 @@ COMMAND REFERENCE — every way to run this script
     python analyze_portfolio.py --source robinhood --include-watchlists \
         --save-positions positions.csv --out report.html --email
 
+    # Self-maintaining watchlist: scan the S&P 500/400 once a market day, append
+    # the best passers to the "Screening" list, analyze them in the same run,
+    # and prune them again when their verdict decays. Nothing to add by hand.
+    python analyze_portfolio.py --source robinhood --include-watchlists \
+        --screen --sync-screening-watchlist --prune-watchlists --out report.html
+
     # Then open the report (macOS)
     open report.html
 
@@ -110,8 +116,13 @@ COMMAND REFERENCE — every way to run this script
     --out FILE             Output HTML path (default: portfolio_report.html).
     --email                Also send the report via SMTP (uses env vars).
     --screen               Run S&P 500/400 screen; adds Screening section.
+                           Scans at most once per market day (cached in .cache/).
     --screen-limit N       Cap screened universe for testing.
-    --sync-screening-watchlist  Sync passing tickers to "Screening" watchlist.
+    --rescan               Ignore today's cached scan and screen again.
+    --sync-screening-watchlist  Append the scan's best passers to the
+                           "Screening" watchlist and analyze them this run.
+                           Append-only; --prune-watchlists removes them later.
+    --screen-add-limit N   Most names one scan may add (default 25).
     --add-to-watchlist NAME  Append --tickers to a Robinhood watchlist (no report).
     --sync-dry-run         Preview --add-to-watchlist / --sync without writing.
     --debug-insider TICKER Diagnose insider data sources for one stock.
@@ -4436,6 +4447,63 @@ def select_watchlist_prune_candidates(
         if ticks:
             out[wl_name] = ticks
     return out
+
+
+# The Robinhood watchlist the universe scan feeds. Pruning already owns the
+# removal half of this list, so the scan only ever appends: a destructive sync
+# would delete names you added by hand in the app.
+SCREEN_WATCHLIST = "Screening"
+# A name pruned for a weak verdict must not be re-added by the next morning's
+# scan — the two rules would fight and churn the list daily. The scan passes
+# over anything the ledger scored below the prune threshold this recently.
+SCREEN_READD_COOLDOWN_DAYS = 30
+# A real scan covers ~900 names. Anything far below that means the universe
+# fetch fell back to its hardcoded mega-cap sample (screener.fetch_sp500_sp400),
+# and "passed the screen" would then mean "is one of 30 huge companies" — not a
+# basis for writing to a live watchlist.
+MIN_SCREEN_UNIVERSE = 100
+
+
+def select_screen_additions(
+    passed: list,
+    held_tickers: set[str],
+    history: Optional[dict] = None,
+    limit: int = 25,
+    threshold: float = 60.0,
+    today: Optional[date] = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Pick the scan's passers worth adding to the Screening watchlist.
+
+    Returns (tickers, skipped) — tickers highest-composite first and capped at
+    `limit`, and {ticker: why} for the ones passed over. Every added name costs
+    a full analysis on each later run, so the cap is what keeps a scan that
+    happens to pass 80 names from doubling the runtime of every run that day.
+    """
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    entries = (history or {}).get("tickers") or {}
+    picks: list[str] = []
+    skipped: dict[str, str] = {}
+    for r in passed:                      # already sorted by composite desc
+        t = r.ticker
+        if t in held_tickers:
+            skipped[t] = "already held"
+            continue
+        entry = entries.get(t) or {}
+        score, seen = entry.get("last_verdict_score"), entry.get("last_date")
+        if score is not None and score < threshold and seen:
+            try:
+                age = (today - date.fromisoformat(seen[:10])).days
+            except (ValueError, TypeError):
+                age = None
+            if age is not None and age <= SCREEN_READD_COOLDOWN_DAYS:
+                skipped[t] = (f"scored {score:.0f} {age}d ago, under the "
+                              f"{threshold:g} prune bar")
+                continue
+        if len(picks) >= limit:
+            skipped[t] = f"past the top {limit}"
+            continue
+        picks.append(t)
+    return picks, skipped
 
 
 def _gh_repo_slug() -> str:
@@ -10846,16 +10914,32 @@ def main():
                          "e.g. 'AAPL,MSFT,GOOGL'). Skips Robinhood/holdings entirely "
                          "— no auth needed. Useful for quick stock lookups.")
     ap.add_argument("--screen", action="store_true",
-                    help="Run S&P 500/400 screening and add the screening section. "
-                         "Slow (~15-25 min for full universe).")
+                    help="Run S&P 500/400 screening and add the screening "
+                         "section. The scan runs at most once per market day "
+                         "and is cached in .cache/, so the first run of the "
+                         "day pays for it (~3-5 min) and the rest reuse it.")
     ap.add_argument("--screen-limit", type=int, default=None,
-                    help="Cap the screening universe size (e.g. 50 for a fast test).")
+                    help="Cap the screening universe size (e.g. 50 for a fast "
+                         "test). A limited run never reads or writes the "
+                         "day's cache.")
+    ap.add_argument("--rescan", action="store_true",
+                    help="With --screen, ignore today's cached scan and screen "
+                         "the universe again.")
     ap.add_argument("--sync-screening-watchlist", action="store_true",
-                    help="When --screen is used and --source is robinhood, "
-                         "sync the passing tickers to the 'Screening' watchlist "
-                         "in Robinhood (read-write).")
+                    help=f"When --screen is used and --source is robinhood, "
+                         f"append the scan's best passers to the "
+                         f"'{SCREEN_WATCHLIST}' watchlist in Robinhood "
+                         f"(read-write) and analyze them in the same run. "
+                         f"Append-only: removal is --prune-watchlists' job, "
+                         f"and a name it pruned is not re-added for "
+                         f"{SCREEN_READD_COOLDOWN_DAYS} days.")
+    ap.add_argument("--screen-add-limit", type=int, default=25,
+                    help="Most names one scan may add to the watchlist, "
+                         "highest composite first (default 25). Every added "
+                         "name is analyzed on every later run, so this is the "
+                         "knob that bounds run time.")
     ap.add_argument("--sync-dry-run", action="store_true",
-                    help="With --sync-screening-watchlist, preview adds/removes "
+                    help="With --sync-screening-watchlist, preview the adds "
                          "without writing.")
     ap.add_argument("--no-pin-recent-holdings", dest="pin_recent_holdings",
                     action="store_false",
@@ -11174,6 +11258,72 @@ def main():
         print(f"[verdict] Carrying last run's label for {_prior_n} ticker(s) "
               f"(recalibrated scoring only).")
 
+    # ---------- Optional: screen the S&P 500/400 universe ----------
+    # Runs before watchlist analysis so a name the scan finds this morning is
+    # analyzed, scored and ranked in this same report rather than the next one.
+    screening_results = None
+    if args.screen:
+        try:
+            import screener as scr
+            print("\n" + "=" * 60)
+            print("S&P 500/400 screen (scans once per market day)")
+            print("=" * 60)
+            screening_results = scr.screen_universe(
+                limit=args.screen_limit, force=args.rescan, verbose=True)
+            passed = screening_results["passed"]
+            print(f"[screen] Passed: {len(passed)}  "
+                  f"Near-miss: {len(screening_results['near_miss'])}")
+
+            # Append the best passers to the Screening watchlist, then put them
+            # straight into this run's universe. Pruning removes them again
+            # once their verdict decays, so the list maintains itself.
+            syncing = (args.sync_screening_watchlist
+                       and args.source == "robinhood")
+            if syncing and screening_results["universe_size"] < MIN_SCREEN_UNIVERSE:
+                syncing = False
+                print(f"[screen] Only {screening_results['universe_size']} "
+                      f"tickers in the universe — the Wikipedia fetch fell back "
+                      f"to its mega-cap sample. Not touching the "
+                      f"'{SCREEN_WATCHLIST}' watchlist on a partial scan.")
+            if syncing:
+                import robinhood_source as rhs
+                adds, skipped = select_screen_additions(
+                    passed,
+                    held_tickers={r["ticker"] for r in rows},
+                    history=_prior_history,
+                    limit=args.screen_add_limit,
+                    threshold=args.prune_threshold,
+                )
+                for t, why in skipped.items():
+                    print(f"[screen] skip {t}: {why}")
+                if not adds:
+                    print("[screen] Nothing new to add to the "
+                          f"'{SCREEN_WATCHLIST}' watchlist.")
+                else:
+                    res = rhs.add_to_watchlist(
+                        watchlist_name=SCREEN_WATCHLIST,
+                        tickers=adds,
+                        dry_run=args.sync_dry_run,
+                        verbose=True,
+                    )
+                    if res.get("watchlist_missing"):
+                        print(f"[screen] No '{SCREEN_WATCHLIST}' watchlist in "
+                              f"Robinhood — create it in the app and the scan "
+                              f"will fill it.")
+                    landed = res["to_add"] if args.sync_dry_run else res["added"]
+                    if landed:
+                        names = {r.ticker: (r.name or r.ticker) for r in passed}
+                        watchlist_lookup = dict(watchlist_lookup or {})
+                        existing = list(watchlist_lookup.get(SCREEN_WATCHLIST) or [])
+                        seen = {it["ticker"] for it in existing}
+                        existing += [{"ticker": t, "name": names.get(t, t)}
+                                     for t in landed if t not in seen]
+                        watchlist_lookup[SCREEN_WATCHLIST] = existing
+                        print(f"[screen] Analyzing {len(landed)} newly screened "
+                              f"name(s) in this run: {', '.join(landed)}")
+        except Exception as e:
+            print(f"[screen] Error: {e}")
+
     print(f"Analyzing {len(rows)} positions...")
     results: list[PositionAnalysis] = analyze_positions_parallel(
         rows, use_robinhood_ratings=use_rh_ratings)
@@ -11422,43 +11572,6 @@ def main():
         print(f"[tax] Skipped tax analysis: {e}")
 
     total_value = sum(r.live_market_value or 0 for r in results)
-
-    # ---------- Optional: screen the S&P 500/400 universe ----------
-    screening_results = None
-    if args.screen:
-        try:
-            import screener as scr
-            print("\n" + "=" * 60)
-            print("Running S&P 500/400 screen — this takes ~15-25 minutes")
-            print("=" * 60)
-            universe = scr.fetch_sp500_sp400(verbose=True)
-            if args.screen_limit:
-                print(f"[screen] Limiting to first {args.screen_limit} for speed test")
-                universe = universe[:args.screen_limit]
-            raw_results = scr.run_screen(universe, verbose=True)
-            passed, near = scr.split_passers_and_near_misses(raw_results)
-            screening_results = {
-                "passed": passed,
-                "near_miss": near,
-                "universe_size": len(universe),
-            }
-            print(f"\n[screen] Passed: {len(passed)}  Near-miss: {len(near)}")
-
-            # Optional: sync to Robinhood "Screening" watchlist
-            if args.sync_screening_watchlist and args.source == "robinhood":
-                target = [r.ticker for r in passed]
-                if target:
-                    import robinhood_source as rhs
-                    rhs.sync_watchlist(
-                        watchlist_name="Screening",
-                        target_tickers=target,
-                        dry_run=args.sync_dry_run,
-                        verbose=True,
-                    )
-                else:
-                    print("[sync] No tickers passed — skipping sync.")
-        except Exception as e:
-            print(f"[screen] Error: {e}")
 
     html = generate_html_report(
         results, watchlists=watchlists_analyzed or None,

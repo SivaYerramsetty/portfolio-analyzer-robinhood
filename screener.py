@@ -26,14 +26,26 @@ Per-stock metrics surfaced to the HTML report:
 Allows shows in the screen output:
     - "passed" (0 failed): primary list
     - "near_miss" (1-2 failed): runners-up for visibility
+
+screen_universe() is the entry point the report uses. It scans at most once
+per market day (cached in .cache/screen.json) and in two passes: fundamentals
+for all ~900 names, then the expensive SEC insider read for the few dozen that
+survive. That is what makes the scan cheap enough to run inside a report that
+regenerates every 15 minutes.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
+import json
+import os
 import time
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -260,6 +272,7 @@ class ScreenResult:
     sector: Optional[str] = None
     industry: Optional[str] = None
     price: Optional[float] = None
+    market_cap: Optional[float] = None
     week52_high: Optional[float] = None
     week52_low: Optional[float] = None
     week52_pos: Optional[float] = None
@@ -295,8 +308,13 @@ class ScreenResult:
     error: Optional[str] = None
 
 
-def screen_one(ticker: str) -> ScreenResult:
-    """Pull fundamentals for one ticker and apply the 9 filters."""
+def screen_one(ticker: str, include_insider: bool = True) -> ScreenResult:
+    """Pull fundamentals for one ticker and apply the 9 filters.
+
+    The insider read costs ~10x the rest of the pull (it walks every recent
+    Form 4 at the SEC), so a universe-wide pass leaves it out and enriches only
+    the shortlist afterwards — see add_insider_scores().
+    """
     r = ScreenResult(ticker=ticker)
     try:
         t = yf.Ticker(ticker)
@@ -309,6 +327,7 @@ def screen_one(ticker: str) -> ScreenResult:
         r.sector = info.get("sector")
         r.industry = info.get("industry")
         r.price = _safe(info, "regularMarketPrice") or _safe(info, "currentPrice")
+        r.market_cap = _safe(info, "marketCap")
         r.week52_high = _safe(info, "fiftyTwoWeekHigh")
         r.week52_low = _safe(info, "fiftyTwoWeekLow")
         if r.price and r.week52_high and r.week52_low and r.week52_high > r.week52_low:
@@ -357,35 +376,72 @@ def screen_one(ticker: str) -> ScreenResult:
         r.score_value = _value_subscore(r)
         r.score_analyst = _analyst_subscore(r)
 
-        # Insider activity (optional — only if module available)
-        try:
-            from insider_trading import get_insider_activity, insider_score
-            r.insider_activity = get_insider_activity(ticker, lookback_days=90)
-            r.score_insider = insider_score(
-                r.insider_activity,
-                market_cap=info.get("marketCap"),
-            )
-            if r.insider_activity is not None:
-                r.insider_activity["_score"] = r.score_insider
-        except Exception:
-            pass
-
-        # Composite weights (matches analyze_portfolio.py)
-        weights = {
-            "quality": 0.30, "growth": 0.20,
-            "value": 0.20, "analyst": 0.15, "insider": 0.15,
-        }
-        parts, total_w = 0.0, 0.0
-        for k, w in weights.items():
-            sub = getattr(r, f"score_{k}")
-            if sub is not None:
-                parts += sub * w
-                total_w += w
-        r.score_composite = round(parts / total_w, 1) if total_w > 0 else None
+        if include_insider:
+            add_insider_score(r)
+        _set_composite(r)
 
     except Exception as e:
         r.error = f"{type(e).__name__}: {e}"
     return r
+
+
+def _set_composite(r: ScreenResult) -> None:
+    """Composite over whichever sub-scores exist (weights match
+    analyze_portfolio.py). A missing sub-score drops out of the denominator
+    rather than scoring zero, so a name with no insider read is not penalised
+    for it."""
+    weights = {
+        "quality": 0.30, "growth": 0.20,
+        "value": 0.20, "analyst": 0.15, "insider": 0.15,
+    }
+    parts, total_w = 0.0, 0.0
+    for k, w in weights.items():
+        sub = getattr(r, f"score_{k}")
+        if sub is not None:
+            parts += sub * w
+            total_w += w
+    r.score_composite = round(parts / total_w, 1) if total_w > 0 else None
+
+
+def add_insider_score(r: ScreenResult) -> None:
+    """Fill in the insider sub-score for one result (no-op if unavailable)."""
+    try:
+        from insider_trading import get_insider_activity, insider_score
+        r.insider_activity = get_insider_activity(r.ticker, lookback_days=90)
+        r.score_insider = insider_score(r.insider_activity,
+                                        market_cap=r.market_cap)
+        if r.insider_activity is not None:
+            r.insider_activity["_score"] = r.score_insider
+    except Exception:
+        pass
+
+
+def _workers(max_workers: Optional[int] = None) -> int:
+    """Thread-pool size for the scan. Moderate by default: Yahoo rate-limits
+    aggressive bursts and SEC EDGAR allows ~10 req/s."""
+    if max_workers is not None:
+        return max(1, max_workers)
+    try:
+        return max(1, int(os.environ.get("SCREEN_MAX_WORKERS", "6")))
+    except ValueError:
+        return 6
+
+
+def add_insider_scores(results: list[ScreenResult],
+                       max_workers: Optional[int] = None,
+                       verbose: bool = True) -> None:
+    """Enrich a shortlist with insider reads, in place, and rescore."""
+    if not results:
+        return
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=min(_workers(max_workers),
+                                            len(results))) as ex:
+        list(ex.map(add_insider_score, results))
+    for r in results:
+        _set_composite(r)
+    if verbose:
+        print(f"[screen] Insider reads for {len(results)} shortlisted name(s) "
+              f"in {time.time() - start:.0f}s")
 
 
 def _clip01(x: float) -> float:
@@ -445,30 +501,49 @@ def _analyst_subscore(r: ScreenResult) -> Optional[float]:
 
 def run_screen(
     tickers: list[str],
-    sleep_sec: float = 0.05,
+    max_workers: Optional[int] = None,
     log_every: int = 25,
     max_tickers: Optional[int] = None,
     verbose: bool = True,
+    include_insider: bool = True,
 ) -> list[ScreenResult]:
-    """Screen all tickers. yfinance is rate-friendly but we sleep a bit anyway."""
+    """Screen all tickers concurrently, preserving input order.
+
+    screen_one() is almost entirely network wait, so a small thread pool turns
+    a ~20-minute serial pass over the full universe into a few minutes. Workers
+    stay moderate: Yahoo rate-limits aggressive bursts (same reason
+    analyze_positions_parallel defaults to 6).
+    """
     if max_tickers:
         tickers = tickers[:max_tickers]
+    max_workers = _workers(max_workers)
     total = len(tickers)
-    out: list[ScreenResult] = []
+    if not total:
+        return []
+    max_workers = max(1, min(max_workers, total))
+
+    out: list[Optional[ScreenResult]] = [None] * total
     start = time.time()
-    for i, tk in enumerate(tickers, 1):
-        r = screen_one(tk)
-        out.append(r)
-        if verbose and (i % log_every == 0 or i == total):
-            elapsed = time.time() - start
-            rate = i / elapsed if elapsed > 0 else 0
-            eta = (total - i) / rate if rate > 0 else 0
-            passers = sum(1 for s in out if s.num_passed == 9)
-            print(f"  [{i:>4}/{total}]  {rate:.1f}/s  ETA {eta/60:.1f}m  "
-                  f"passers so far: {passers}")
-        if sleep_sec > 0:
-            time.sleep(sleep_sec)
-    return out
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(screen_one, tk, include_insider): i
+                   for i, tk in enumerate(tickers)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                out[i] = fut.result()
+            except Exception as e:
+                out[i] = ScreenResult(ticker=tickers[i],
+                                      error=f"{type(e).__name__}: {e}")
+            done += 1
+            if verbose and (done % log_every == 0 or done == total):
+                elapsed = time.time() - start
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                passers = sum(1 for s in out if s and s.num_passed == 9)
+                print(f"  [{done:>4}/{total}]  {rate:.1f}/s  ETA {eta/60:.1f}m  "
+                      f"passers so far: {passers}")
+    return [r for r in out if r is not None]
 
 
 def split_passers_and_near_misses(
@@ -483,11 +558,111 @@ def split_passers_and_near_misses(
     return passed, near_miss
 
 
+# ============================================================
+# Once-a-day universe scan
+# ============================================================
+# The scan is the slowest thing the analyzer can do — a fundamentals pull for
+# every S&P 500/400 name. Scheduled report runs fire every 15 minutes, so the
+# result is cached per market day in .cache/ (gitignored; carried across CI
+# runs by the Actions cache). The first run of the day pays for the scan and
+# the rest of the day reads it back.
+
+_SCREEN_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "screen.json"
+_ET = ZoneInfo("America/New_York")
+
+
+def _market_today() -> str:
+    """Today's date in market time — the cache key for a day's scan."""
+    return _dt.datetime.now(_ET).date().isoformat()
+
+
+def _load_screen_cache(verbose: bool = True) -> Optional[dict]:
+    try:
+        cached = json.loads(_SCREEN_CACHE_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(cached, dict) or cached.get("date") != _market_today():
+        return None
+    try:
+        out = {
+            "passed": [ScreenResult(**d) for d in cached.get("passed") or []],
+            "near_miss": [ScreenResult(**d) for d in cached.get("near_miss") or []],
+            "universe_size": cached.get("universe_size", 0),
+            "scanned_at": cached.get("scanned_at"),
+            "from_cache": True,
+        }
+    except TypeError:
+        return None      # cache written by an older ScreenResult shape
+    if verbose:
+        print(f"[screen] Reusing today's scan from {_SCREEN_CACHE_PATH} "
+              f"({len(out['passed'])} passed, {len(out['near_miss'])} near-miss, "
+              f"scanned {out['scanned_at']}).")
+    return out
+
+
+def _save_screen_cache(out: dict, verbose: bool = True) -> None:
+    try:
+        _SCREEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SCREEN_CACHE_PATH.write_text(json.dumps({
+            "date": _market_today(),
+            "scanned_at": out.get("scanned_at"),
+            "universe_size": out.get("universe_size", 0),
+            "passed": [asdict(r) for r in out.get("passed") or []],
+            "near_miss": [asdict(r) for r in out.get("near_miss") or []],
+        }))
+    except OSError as e:
+        if verbose:
+            print(f"[screen] Could not write scan cache ({e})")
+
+
+def screen_universe(
+    limit: Optional[int] = None,
+    max_workers: Optional[int] = None,
+    force: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Scan the S&P 500 + 400 universe, at most once per market day.
+
+    Returns {"passed", "near_miss", "universe_size", "scanned_at", "from_cache"}.
+    `limit` caps the universe for a fast test and neither reads nor writes the
+    day's cache, so a test run can't stand in for the real scan.
+    """
+    if not force and not limit:
+        cached = _load_screen_cache(verbose=verbose)
+        if cached:
+            return cached
+
+    universe = fetch_sp500_sp400(verbose=verbose)
+    if limit:
+        universe = universe[:limit]
+        if verbose:
+            print(f"[screen] Limiting to first {limit} tickers (test run; "
+                  f"not cached).")
+    # Two passes: fundamentals for the whole universe, then insider reads for
+    # the handful that survive. One insider read costs about as much as twenty
+    # fundamentals pulls, and it only ever affects names the report shows.
+    raw = run_screen(universe, max_workers=max_workers, verbose=verbose,
+                     include_insider=False)
+    passed, near = split_passers_and_near_misses(raw)
+    add_insider_scores(passed + near, max_workers=max_workers, verbose=verbose)
+    passed, near = split_passers_and_near_misses(passed + near)
+    out = {
+        "passed": passed,
+        "near_miss": near,
+        "universe_size": len(universe),
+        "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
+        "from_cache": False,
+    }
+    if not limit:
+        _save_screen_cache(out, verbose=verbose)
+    return out
+
+
 if __name__ == "__main__":
     # Quick manual test: screen a handful of known tickers
     test = ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "MU", "TSLA", "JNJ"]
     print(f"Screening {len(test)} test tickers...")
-    res = run_screen(test, sleep_sec=0, log_every=1)
+    res = run_screen(test, log_every=1)
     passed, near = split_passers_and_near_misses(res)
     print(f"\nPassed (9/9): {[r.ticker for r in passed]}")
     print(f"Near-miss (7-8/9): {[(r.ticker, r.num_passed) for r in near]}")

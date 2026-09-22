@@ -10,6 +10,11 @@ venv/
 .DS_Store
 .cache/
 portfolio_report.html
+
+# Index membership fetched from Wikipedia by screener.fetch_sp500_sp400. Purely
+# derived, and a committed copy would freeze the universe: the fetch reads this
+# file instead of the network whenever it exists.
+universe_cache.json
 # Recommendation-history ledger for the Missed Opportunities section. Holds real
 # allocations/holdings, so it stays out of this public repo — it persists across
 # CI runs via the GitHub Actions cache instead (see .github/workflows/portfolio.yml).
