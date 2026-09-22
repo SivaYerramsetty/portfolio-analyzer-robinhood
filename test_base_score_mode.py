@@ -1510,11 +1510,52 @@ def test_account_ytd_return() -> None:
     check(stored, {"2025-12-31": 1000.0, "2026-01-02": 2500.0},
           "one equity per day, last write wins, junk values ignored")
 
-    # The figure is no longer rendered as a tile — the summary row carries only
-    # Today and YTD. It is still computed, logged, and ledgered, so the report
-    # can show it again without rebuilding any of this.
     check(hasattr(ap, "_render_account_ytd_stat"), False,
-          "the account tile renderer is gone from the report")
+          "the standalone account tile renderer is gone")
+
+    # --- the broker-convention rate, and the tile that must agree with the app -
+    # Reproduces the real app screenshot: value $62,259.98, YTD +$15,239.48
+    # shown as 32.41%. Robinhood divides the gain by everything that is not
+    # gain, undiscounted, which is a cruder rate than Modified Dietz — but it
+    # is what the app shows, so it is what the tile must report.
+    with _ledger(None) as f:
+        r = ap.compute_account_ytd_return(
+            62259.98, [{"date": "2026-03-01", "amount": 21377.01}],
+            today=_date(2026, 9, 22), start_equity=25643.49, ledger_path=f)
+    check(round(r["gain"], 2), 15239.48, "the gain matches the brokerage app")
+    check(round(r["pct_broker"], 2), 32.41,
+          "the broker-convention rate matches the app to the basis point")
+    check(round(r["pct_broker"], 2) != round(r["pct"], 2), True,
+          "and it differs from Modified Dietz, which time-weights the deposits")
+
+    bench = {"today_pct": 1.04, "ytd_pct": 13.41}
+    html = ap._render_benchmark_stat(1.52, 20.35, bench, r)
+    check("+32.41%" in html, True, "YTD reports the account return when there is one")
+    check("+20.35%" not in html, True, "and not the basket price return")
+    check("</strong>Today<div" in html, True,
+          "the Today tile is labelled just Today")
+    check("</strong>YTD<div" in html, True,
+          "the YTD tile is labelled just YTD")
+    check("your holdings" not in html and "if held since" not in html, True,
+          "the old qualifier labels are gone")
+    check(_tag_errors(html), [], "the tiles are well-formed markup")
+
+    # Without an anchor the account figure cannot be computed; falling back to
+    # the basket return is fine, but the tooltip has to say so — the two differ
+    # by tens of points on a funded account.
+    fallback = ap._render_benchmark_stat(1.52, 20.35, bench, None)
+    check("+20.35%" in fallback, True,
+          "YTD falls back to the basket return with no anchor")
+    check("will NOT match your broker" in fallback, True,
+          "and the fallback tooltip says it will not match the broker")
+
+    # A zero or negative invested base leaves no rate to quote.
+    with _ledger(None) as f:
+        r0 = ap.compute_account_ytd_return(
+            5000.0, [{"date": "2026-02-01", "amount": -1000.0}],
+            today=_date(2026, 9, 22), start_equity=1000.0, ledger_path=f)
+    check(r0 is None or r0["pct_broker"] is None, True,
+          "no broker rate is invented when nothing was invested")
 
 
 def test_external_flow_scoping() -> None:
