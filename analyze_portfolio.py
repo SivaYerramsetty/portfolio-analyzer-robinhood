@@ -675,6 +675,18 @@ def record_account_equity(equity: Optional[float], when: Optional[str] = None,
         print(f"[equity-ledger] Could not record equity: {e}")
 
 
+def _parse_anchor_amount(raw: str) -> Optional[float]:
+    """A dollar figure the way a person copies it off a statement — "25,643.49",
+    "$25,643.49", "25 643.49" all mean the same thing. Refusing a comma here
+    would only mean silently skipping the tile over punctuation."""
+    import re as _re
+    cleaned = _re.sub(r"[$,\s_]", "", raw or "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def _resolve_year_start_equity(year: int, path: Optional[Path] = None
                                ) -> tuple[Optional[float], str]:
     """The account's equity as the year began, plus a one-line provenance note.
@@ -683,11 +695,15 @@ def _resolve_year_start_equity(year: int, path: Optional[Path] = None
       * the newest ledger snapshot taken within _ANCHOR_MAX_AGE_DAYS *before*
         Jan 1 — a snapshot from inside the year already contains performance and
         deposits, so it would understate the return and is refused;
-      * YTD_START_EQUITY, which you set once from the Dec-31 account statement.
-        Prefer the "YEAR:AMOUNT" form (e.g. "2026:22973.16") — a bare amount
-        cannot be checked against the year and would be silently reused next
-        January, quietly reporting a wrong number, so it is accepted with a
-        warning and a year-tagged value for the wrong year is refused outright.
+      * YTD_START_EQUITY, which you set once from the Dec-31 account statement,
+        in either tagged form:
+            "2025-12-31:25643.49"  the statement date the figure came from —
+                                   prefer this, it says which balance this is;
+            "2026:25643.49"        the year the return covers.
+        Amounts may be written as money ("$25,643.49"). A bare untagged amount
+        is accepted with a warning, because nothing can check it belongs to this
+        year and it would be silently reused next January. A tag for the *prior*
+        year is refused with the fix spelled out — it is the easy misreading.
 
     Returns (None, reason) when neither is usable; the caller then skips the
     tile instead of showing a return built on a guess.
@@ -714,26 +730,65 @@ def _resolve_year_start_equity(year: int, path: Optional[Path] = None
     except Exception as e:
         print(f"[equity-ledger] Could not read ledger: {e}")
 
+    import re as _re
     raw = (os.environ.get("YTD_START_EQUITY") or "").strip()
     if not raw:
         return None, ("no year-start equity — set YTD_START_EQUITY to "
-                      f'"{year}:<your Dec-31 equity>"')
-    if ":" in raw:
-        y, _, amt = raw.partition(":")
-        try:
-            if int(y.strip()) != year:
-                return None, (f"YTD_START_EQUITY is tagged {y.strip()}, not "
-                              f"{year} — update it from the Dec-31 statement")
-            return float(amt), f"YTD_START_EQUITY ({year})"
-        except ValueError:
-            return None, f"YTD_START_EQUITY is not parseable: {raw!r}"
-    try:
-        val = float(raw)
-    except ValueError:
+                      f'"{year - 1}-12-31:<closing account value>"')
+
+    tag, sep, amt_raw = raw.partition(":")
+    if sep:
+        amount = _parse_anchor_amount(amt_raw)
+        if amount is None:
+            return None, ("YTD_START_EQUITY amount is not a number: "
+                          f"{amt_raw.strip()!r}")
+        if amount <= 0:
+            return None, f"YTD_START_EQUITY amount is not positive: {amount}"
+        tag = tag.strip()
+
+        # "YYYY-MM-DD:AMOUNT" — the statement date the figure was read from.
+        # Unambiguous, and the form to prefer: it says which balance this is
+        # rather than which year it is meant to serve.
+        if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", tag):
+            try:
+                d = date.fromisoformat(tag)
+            except ValueError:
+                return None, f"YTD_START_EQUITY date is not a real date: {tag!r}"
+            age = (jan1 - d).days
+            if age <= 0:
+                return None, (f"YTD_START_EQUITY is dated {tag}, inside {year} — "
+                              "it already contains this year's performance and "
+                              f"deposits. Use the {year - 1}-12-31 statement.")
+            if age > _ANCHOR_MAX_AGE_DAYS:
+                return None, (f"YTD_START_EQUITY is dated {tag}, {age} days "
+                              f"before {year} began — too early to stand in for "
+                              "the year-start balance")
+            return amount, f"YTD_START_EQUITY (as of {tag})"
+
+        # "YEAR:AMOUNT" — the year the return covers, i.e. the balance the year
+        # opened with. Easy to misread as the year the balance is *from*, so the
+        # prior year is called out specifically rather than lumped in as junk.
+        if _re.fullmatch(r"\d{4}", tag):
+            tagged = int(tag)
+            if tagged == year:
+                return amount, f"YTD_START_EQUITY ({year})"
+            if tagged == year - 1:
+                return None, (
+                    f"YTD_START_EQUITY is tagged {tagged}, but the tag names the "
+                    f"year the return covers, not the year the balance came from. "
+                    f'If this is the {tagged}-12-31 closing value, write it as '
+                    f'"{tagged}-12-31:{amount:.2f}" (or "{year}:{amount:.2f}").')
+            return None, (f"YTD_START_EQUITY is tagged {tagged}, not {year} — "
+                          "update it from the Dec-31 statement")
+        return None, f"YTD_START_EQUITY tag not understood: {tag!r}"
+
+    amount = _parse_anchor_amount(raw)
+    if amount is None or amount <= 0:
         return None, f"YTD_START_EQUITY is not parseable: {raw!r}"
-    print("[account-ytd] YTD_START_EQUITY has no year tag — cannot verify it "
-          f'belongs to {year}. Prefer "{year}:{val:g}".')
-    return val, "YTD_START_EQUITY (untagged)"
+    print("[account-ytd] YTD_START_EQUITY carries no date or year tag — cannot "
+          f"verify it belongs to {year}, and it will be silently reused next "
+          f'January. Prefer "{year - 1}-12-31:{amount:.2f}".')
+    return amount, "YTD_START_EQUITY (untagged)"
 
 
 def compute_account_ytd_return(equity_now: Optional[float],
