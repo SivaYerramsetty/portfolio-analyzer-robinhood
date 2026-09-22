@@ -13,7 +13,10 @@ Run it whenever the workflow fails with "No valid Robinhood session":
     python update_rh_session_secret.py
 
 Requirements: pip install pynacl requests
-Auth: uses GH_TOKEN env var, or the token embedded in `git remote origin`.
+Auth: uses the GH_TOKEN env var, else the `gh` CLI's own credential
+(`gh auth token`). It deliberately does NOT read a token from the git
+remote URL: git echoes that URL on any remote error, so a token parked
+there leaks into terminal output and CI logs.
 """
 
 from __future__ import annotations
@@ -28,22 +31,42 @@ SECRET_NAME = "RH_SESSION_B64"
 PICKLE_PATH = Path.home() / ".tokens" / "robinhood.pickle"
 
 
+def _gh(*args: str) -> str:
+    """Run a `gh` subcommand, returning stripped stdout ('' if gh is missing
+    or the call fails)."""
+    try:
+        r = subprocess.run(("gh",) + args, capture_output=True, text=True,
+                           cwd=Path(__file__).parent)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except FileNotFoundError:
+        return ""
+
+
 def _repo_and_token() -> tuple[str, str]:
-    token = os.environ.get("GH_TOKEN", "").strip()
-    url = subprocess.run(
-        ["git", "config", "--get", "remote.origin.url"],
-        capture_output=True, text=True, cwd=Path(__file__).parent,
-    ).stdout.strip()
-    m = re.search(r"github\.com[:/](?:([^@/]+)@)?", url)
-    if not token:
-        m_tok = re.match(r"https://([^@]+)@github\.com/", url)
-        if m_tok:
-            token = m_tok.group(1)
-    m_repo = re.search(r"github\.com[:/](?:[^@/]+@)?([^/]+/[^/\s]+?)(?:\.git)?/?$", url)
-    repo = m_repo.group(1) if m_repo else ""
+    """Resolve (repo, token), preferring the `gh` CLI's own credential.
+
+    The remote URL used to be the fallback token source, but embedding a token
+    there is a liability — git prints the full URL on any remote error, so it
+    leaks into terminal output and CI logs. The remote is now tokenless, so the
+    order is: GH_TOKEN, then `gh auth token`. The repo name comes from `gh` too,
+    falling back to parsing the remote (which needs no token).
+    """
+    token = os.environ.get("GH_TOKEN", "").strip() or _gh("auth", "token")
+
+    repo = _gh("repo", "view", "--json", "nameWithOwner",
+               "--jq", ".nameWithOwner")
+    if not repo:
+        url = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, cwd=Path(__file__).parent,
+        ).stdout.strip()
+        m_repo = re.search(
+            r"github\.com[:/](?:[^@/]+@)?([^/]+/[^/\s]+?)(?:\.git)?/?$", url)
+        repo = m_repo.group(1) if m_repo else ""
+
     if not repo or not token:
-        sys.exit("ERROR: could not resolve repo/token. Set GH_TOKEN and run "
-                 "from the repo directory.")
+        sys.exit("ERROR: could not resolve repo/token. Either run `gh auth "
+                 "login`, or set GH_TOKEN, and run from the repo directory.")
     return repo, token
 
 
