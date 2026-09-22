@@ -20,3 +20,12 @@ recs_history.json
 # so like recs_history.json it stays out of this public repo and rides the CI
 # cache (see .github/workflows/portfolio.yml).
 equity_history.json
+
+# Generated portfolio reports. These render real holdings and, since the
+# deposit-adjusted YTD tile, real account equity and deposits — and this repo
+# is public. CI builds report.html fresh each run and deploys it to Pages
+# behind add_password_protection.py, so nothing needs a copy committed here.
+# (report_protected.html's protection is client-side only: the holdings sit in
+# the page as plaintext, so committing it published them.)
+report.html
+report_protected.html
