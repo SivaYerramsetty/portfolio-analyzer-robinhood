@@ -1510,18 +1510,11 @@ def test_account_ytd_return() -> None:
     check(stored, {"2025-12-31": 1000.0, "2026-01-02": 2500.0},
           "one equity per day, last write wins, junk values ignored")
 
-    # --- the tile ------------------------------------------------------------
-    acct = {"pct": 32.89, "start_equity": 22973.16, "end_equity": 62467.86,
-            "net_flows": 27562.70, "weighted_flows": 13300.03,
-            "avg_capital": 36273.19, "gain": 11932.0, "flow_count": 47,
-            "source": "YTD_START_EQUITY (2026)", "year": 2026}
-    html = ap._render_account_ytd_stat(acct, {"ytd_pct": 13.41})
-    check("+32.89%" in html, True, "the tile shows the adjusted figure")
-    check("account (after deposits)" in html, True,
-          "the tile says the figure is deposit-adjusted")
-    check(_tag_errors(html), [], "the tile is well-formed markup")
-    check(ap._render_account_ytd_stat(None, {"ytd_pct": 13.41}), "",
-          "no account data renders no tile")
+    # The figure is no longer rendered as a tile — the summary row carries only
+    # Today and YTD. It is still computed, logged, and ledgered, so the report
+    # can show it again without rebuilding any of this.
+    check(hasattr(ap, "_render_account_ytd_stat"), False,
+          "the account tile renderer is gone from the report")
 
 
 def test_external_flow_scoping() -> None:
