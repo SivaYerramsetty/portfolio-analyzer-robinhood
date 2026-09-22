@@ -911,10 +911,11 @@ def fetch_tax_lots(verbose: bool = True) -> dict[str, list[dict]]:
 
 
 def fetch_external_flows(year: Optional[int] = None,
+                         account_number: Optional[str] = None,
                          verbose: bool = True) -> Optional[list[dict]]:
-    """Completed external cash movements for `year` as
-    [{"date": "YYYY-MM-DD", "amount": float}, ...] — deposits POSITIVE,
-    withdrawals NEGATIVE, sorted by date.
+    """Completed external cash movements for `year` **on one account**, as
+    [{"date": "YYYY-MM-DD", "amount": float}, ...] — money in POSITIVE, money
+    out NEGATIVE, sorted by date.
 
     These are the flows a real account return has to neutralize: money you add
     is not performance. Robinhood used to serve portfolio historicals, but
@@ -924,8 +925,18 @@ def fetch_external_flows(year: Optional[int] = None,
     no YTD figure to read off the API. The report computes its own instead and
     needs the flows explicitly — see compute_account_ytd_return().
 
-    Reads the unified transfer feed, which covers ACH pulls/pushes and instant
-    deposits in one place. `pull` is money into Robinhood, `push` money out.
+    The unified transfer feed spans EVERY Robinhood account the login can see —
+    a joint tenancy, a second brokerage account, firm credits — so it must be
+    scoped to the account being analysed or the return is badly wrong. On one
+    real login the unscoped total was $27,562.70 against $20,336.60 actually
+    belonging to the analysed account: a 36% overstatement of deposits, which
+    lands entirely on the reported return. Rows are matched on
+    originating/receiving_account_id, which carries the plain account number.
+
+    Direction is read from which side this account is on, not from the
+    `direction` field alone: a `push` from a firm account *into* this one is
+    money in, and signing it by direction alone gets it backwards.
+
     Only `completed` rows count: pending, cancelled, failed and reversed
     transfers never settled, so counting them would invent cash that was not
     there. Returns None if the feed can't be read at all, so the caller skips
@@ -933,6 +944,17 @@ def fetch_external_flows(year: Optional[int] = None,
     """
     _require_rh()
     year = year or _dt.datetime.now().year
+    try:
+        acct = account_number or rh.account.load_account_profile(
+            info='account_number')
+    except Exception as e:
+        print(f"[flows] Could not resolve the account number: {e}")
+        return None
+    if not acct:
+        print("[flows] No account number — cannot scope transfers.")
+        return None
+    acct = str(acct)
+
     try:
         from robin_stocks.robinhood.urls import unifiedtransfers_url
         rows = rh.helper.request_get(unifiedtransfers_url(), 'pagination')
@@ -944,15 +966,16 @@ def fetch_external_flows(year: Optional[int] = None,
         return None
 
     flows: list[dict] = []
-    skipped = 0
+    skipped_state = 0
+    other_accounts: dict[str, float] = {}
     for t in rows:
         if not isinstance(t, dict):
             continue
-        if (t.get("state") or "").lower() != "completed":
-            skipped += 1
-            continue
         date_str = (t.get("record_date") or t.get("created_at") or "")[:10]
         if not date_str.startswith(f"{year}-"):
+            continue
+        if (t.get("state") or "").lower() != "completed":
+            skipped_state += 1
             continue
         # net_amount is after any service fee; fall back to the gross amount.
         raw = t.get("net_amount")
@@ -962,22 +985,39 @@ def fetch_external_flows(year: Optional[int] = None,
             amt = float(raw)
         except (TypeError, ValueError):
             continue
+
+        orig = str(t.get("originating_account_id") or "")
+        recv = str(t.get("receiving_account_id") or "")
         direction = (t.get("direction") or "").lower()
-        if direction == "pull":            # money into the account
-            flows.append({"date": date_str, "amount": amt})
-        elif direction == "push":          # money out of the account
-            flows.append({"date": date_str, "amount": -amt})
+
+        if recv == acct:
+            signed = amt                    # landed in this account
+        elif orig == acct:
+            # This account initiated: an ACH `pull` draws money in from the
+            # bank, a `push` sends it out.
+            signed = amt if direction == "pull" else -amt
         else:
-            print(f"[flows] Unknown transfer direction {direction!r} on "
-                  f"{date_str} — ignoring ${amt:,.2f}")
+            key = f"{t.get('originating_account_type') or '?'}:{orig or '?'}"
+            other_accounts[key] = other_accounts.get(key, 0.0) + amt
+            continue
+
+        flows.append({"date": date_str, "amount": signed})
 
     flows.sort(key=lambda f: f["date"])
     if verbose:
         net = sum(f["amount"] for f in flows)
         inflow = sum(f["amount"] for f in flows if f["amount"] > 0)
-        print(f"[flows] {year}: {len(flows)} completed transfer(s), "
-              f"${inflow:,.2f} in, ${net - inflow:,.2f} out, net ${net:,.2f} "
-              f"({skipped} non-completed skipped)")
+        print(f"[flows] {year}, account {acct}: {len(flows)} completed "
+              f"transfer(s), ${inflow:,.2f} in, ${net - inflow:,.2f} out, "
+              f"net ${net:,.2f} ({skipped_state} non-completed skipped)")
+        if other_accounts:
+            total_other = sum(other_accounts.values())
+            print(f"[flows] Ignored ${total_other:,.2f} across "
+                  f"{len(other_accounts)} other Robinhood account(s) in the "
+                  f"same feed — they are not part of this account's return:")
+            for key, amount in sorted(other_accounts.items(),
+                                      key=lambda kv: -abs(kv[1])):
+                print(f"[flows]   {key}: ${amount:,.2f}")
     return flows
 
 
