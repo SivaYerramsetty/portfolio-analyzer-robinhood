@@ -367,6 +367,70 @@ def test_lexicon_read_is_not_carried() -> None:
         ap._news_cache = None
 
 
+def test_empty_feed_keeps_last_claude_read() -> None:
+    # 2026-09-29/30: a day whose headline feed came back empty cached `None`
+    # over every Claude read, so the next morning — batch queued, tickers in
+    # flight — had nothing to carry and served the lexicon.
+    section("an empty headline feed doesn't erase the last Claude read")
+    real_path, real_client, real_headlines = (
+        ap._NEWS_CACHE_PATH, ap._anthropic_client, ap.fetch_recent_headlines)
+    today = _REAL_ET_NOW().date()
+    try:
+        prior = _news(0.8, _as_of_aged(2, today))
+        _isolated_cache({"AAA": {"ts": time.time() - 86400, "sentiment": prior}})
+        ap._anthropic_client = lambda: None
+        ap.fetch_recent_headlines = lambda t, max_items=8: []
+
+        got = ap.score_news_sentiment("AAA")
+        check(got, prior, "no headlines: the last Claude read is still served")
+        entry = ap._news_cache["AAA"]
+        check((entry["sentiment"], entry.get("last_claude")), (None, prior),
+              "and the cache records 'no news today' beside the kept read")
+        check(ap.score_news_sentiment("AAA"), prior,
+              "a later run the same day (a cache hit) serves it too")
+
+        # Next day: headlines are back but the ticker's batch is in flight.
+        ap.fetch_recent_headlines = lambda t, max_items=8: [
+            "shares surge on record profit beat"]
+        ap._news_cache["AAA"]["ts"] = time.time() - 86400
+        ap._news_batch_inflight.add("AAA")
+        check(ap.score_news_sentiment("AAA"), prior,
+              "then carried while the refresh is queued, not replaced by lexicon")
+    finally:
+        ap._news_batch_inflight.discard("AAA")
+        ap._NEWS_CACHE_PATH, ap._anthropic_client, ap.fetch_recent_headlines = (
+            real_path, real_client, real_headlines)
+        ap._news_cache = None
+
+
+def test_freshness_display() -> None:
+    section("the report says how fresh each news read is")
+    today = _REAL_ET_NOW().date()
+    real_pending = ap._pending_batches
+    try:
+        ap._pending_batches = lambda: [{"id": "b"}]
+        fresh = _news(0.8, today.isoformat())
+        aged = _news(0.8, _as_of_aged(1, today))
+        kw = _news(0.8, today.isoformat(), method="lexicon")
+        row = lambda ns: SimpleNamespace(news_sentiment=ns)
+        label = ap._news_as_of_label(aged)
+
+        check(f"· {label}" in ap._news_chip(row(aged)), True,
+              "a carried read's chip shows its date")
+        check("opacity" in ap._news_chip(row(fresh)), False,
+              "today's read is not faded")
+        check("keyword read" in ap._news_chip(row(kw)), True,
+              "a lexicon read says so on hover")
+        check(ap._news_freshness_meta([row(fresh), row(aged), row(kw), row(None)]),
+              f"News: 2 today · 1 from {label} · 1 keyword-only"
+              " (Claude refresh queued)",
+              "the header sums reads by date")
+        check(ap._news_freshness_meta([row(None)]), "",
+              "no header note without news")
+    finally:
+        ap._pending_batches = real_pending
+
+
 # ------------------------- 5. batch harvest dates by submission, not pickup ---
 
 class _FakeBatchResult:
@@ -491,7 +555,9 @@ def main() -> int:
     for t in (test_weekdays_between, test_age_from_as_of, test_decay_table,
               test_decay_leaves_odd_input_alone, test_reason_text,
               test_verdict_integration, test_carry_preserves_as_of,
-              test_lexicon_read_is_not_carried, test_batch_harvest_as_of,
+              test_lexicon_read_is_not_carried,
+              test_empty_feed_keeps_last_claude_read, test_freshness_display,
+              test_batch_harvest_as_of,
               test_stuck_pipeline_fades_out):
         before = len(_results)
         t()
