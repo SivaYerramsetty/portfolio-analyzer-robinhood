@@ -1416,6 +1416,33 @@ def _is_claude_sentiment(sentiment: Optional[dict]) -> bool:
     return bool(sentiment and sentiment.get("method") != "lexicon")
 
 
+def _news_entry(old: Optional[dict], sentiment: Optional[dict]) -> dict:
+    """A news-cache entry for `sentiment` that keeps the ticker's last Claude
+    read under `last_claude`. Without it a lexicon or no-headlines write (a
+    headline feed that returned nothing, a batch still queued) overwrote the
+    only Claude read, and the next run had nothing to carry forward."""
+    last = (sentiment if _is_claude_sentiment(sentiment)
+            else (old or {}).get("last_claude")
+            or ((old or {}).get("sentiment")
+                if _is_claude_sentiment((old or {}).get("sentiment")) else None))
+    entry = {"ts": time.time(), "sentiment": sentiment}
+    if last:
+        entry["last_claude"] = last
+    return entry
+
+
+def _carryable_claude_read(entry: Optional[dict]) -> Optional[dict]:
+    """The Claude read worth serving in place of a missing or lexicon one: the
+    entry's own read if it is Claude's, else its `last_claude`. No age cap —
+    _news_signal_modifier already fades an old read to no nudge, and the news
+    chip shows its date."""
+    entry = entry or {}
+    read = entry.get("sentiment")
+    if not _is_claude_sentiment(read):
+        read = entry.get("last_claude")
+    return read if _is_claude_sentiment(read) else None
+
+
 def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[dict]:
     """Score a ticker's recent news, cached on disk. Uses Claude when
     ANTHROPIC_API_KEY is set, otherwise a FREE headline lexicon — both return
@@ -1429,10 +1456,13 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
     with _news_cache_lock:
         entry = _load_news_cache().get(ticker)
     prior = (entry or {}).get("sentiment")
+    carry = _carryable_claude_read(entry)
     if entry is not None and _news_entry_fresh(entry):
         with _news_cache_lock:
             _news_hits += 1
-        return prior
+        # Today's entry can be "no headlines" (the feed came back empty);
+        # the last Claude read still says more than nothing.
+        return prior if prior is not None else carry
 
     headlines = fetch_recent_headlines(ticker)
     result = None
@@ -1456,18 +1486,21 @@ def score_news_sentiment(ticker: str, name: Optional[str] = None) -> Optional[di
             # bounds this carry: _news_signal_modifier fades the nudge by the
             # read's age, so a refresh that keeps failing decays to no signal
             # instead of pinning old headlines to the verdict forever.
-            if _is_claude_sentiment(prior):
+            if carry is not None:
                 with _news_cache_lock:
                     _news_hits += 1
-                return prior
+                return carry
             result = _lexicon_sentiment(headlines)
 
     if _news_caching_enabled():
         with _news_cache_lock:
-            _load_news_cache()[ticker] = {"ts": time.time(), "sentiment": result}
+            cache = _load_news_cache()
+            cache[ticker] = _news_entry(cache.get(ticker), result)
             _news_cache_dirty = True
             _news_misses += 1
-    return result
+    # No headlines today: cache that (so every run doesn't re-fetch) but keep
+    # serving the last Claude read, which fades by its as_of.
+    return result if result is not None else carry
 
 
 # ============================================================
@@ -1531,7 +1564,8 @@ def _store_batch_results(client, batch_id: str, id_map: dict,
             print(f"[news-batch] {ticker}: unparseable ({type(e).__name__}: {e})")
             continue
         with _news_cache_lock:
-            _load_news_cache()[ticker] = {"ts": time.time(), "sentiment": sentiment}
+            cache = _load_news_cache()
+            cache[ticker] = _news_entry(cache.get(ticker), sentiment)
             _news_cache_dirty = True
             _news_batched += 1
         scored += 1
@@ -5433,12 +5467,53 @@ def _news_chip(r) -> str:
         return ""
     rationale = ((ns.get("rationale") or "")
                  .replace("&", "&amp;").replace("'", "&#39;").replace('"', "&quot;"))
-    asof = ns.get("as_of", "")
-    title = (f"{rationale} (news as of {asof})" if rationale
-             else f"News sentiment as of {asof}")
+    # Freshness: a carried-over read (today's refresh still queued, or the feed
+    # came back empty) shows its date on the chip and fades, so it can't pass
+    # for today's news.
+    age = _news_signal_age_days(ns)
+    when = _news_as_of_label(ns) or "unknown date"
+    how = ("keyword read (Claude unavailable)" if ns.get("method") == "lexicon"
+           else "Claude read")
+    if age:
+        weight = ("no longer weighted" if age >= _NEWS_MAX_AGE_DAYS
+                  else "half weight" if age > _NEWS_FULL_WEIGHT_DAYS
+                  else "full weight")
+        fresh = (f"{how} from {when}, {age} trading day{'s' * (age != 1)} old "
+                 f"({weight}); today's refresh is pending")
+    else:
+        fresh = f"{how} from today ({when})"
+    title = f"{rationale} — {fresh}" if rationale else fresh
+    stamp = f" · {when}" if age else ""
+    fade = "opacity:.65;" if age else ""
     return (f"<span title=\"{title}\" style='font-size:9px;font-weight:600;"
             f"background:{bg};color:{fg};padding:1px 5px;border-radius:6px;"
-            f"margin-left:5px;cursor:help;'>📰 {label}</span>")
+            f"margin-left:5px;cursor:help;{fade}'>📰 {label}{stamp}</span>")
+
+
+def _news_freshness_meta(analyses) -> str:
+    """Header note on how current the report's news reads are, e.g.
+    "News: 24 today · 6 from Sep 29 (refresh queued)". Empty when news
+    scoring produced nothing to show."""
+    reads = [ns for r in analyses
+             if (ns := getattr(r, "news_sentiment", None))]
+    if not reads:
+        return ""
+    today = sum(1 for ns in reads if not _news_signal_age_days(ns))
+    older: dict[str, int] = {}          # ISO as_of -> count, so dates sort right
+    for ns in reads:
+        if _news_signal_age_days(ns):
+            k = str(ns.get("as_of") or "")
+            older[k] = older.get(k, 0) + 1
+    keyword = sum(1 for ns in reads if ns.get("method") == "lexicon")
+    parts = [f"{today} today"] if today else []
+    parts += [f"{n} from {_news_as_of_label({'as_of': d}) or 'unknown date'}"
+              for d, n in sorted(older.items())]
+    if keyword:
+        parts.append(f"{keyword} keyword-only")
+    text = "News: " + " · ".join(parts)
+    if _pending_batches():
+        text += " (Claude refresh queued)"
+    return text
 
 
 def _name_sector_cell(r) -> str:
@@ -8380,6 +8455,8 @@ def generate_html_report(
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
     live_total = finalize_holding_verdicts(results)
+    news_meta = _news_freshness_meta(
+        list(results) + [r for items in (watchlists or {}).values() for r in items])
 
     statement_total = sum(r.statement_market_value for r in results)
     delta = live_total - statement_total
@@ -9472,6 +9549,7 @@ def generate_html_report(
   <div class="report-title">
     <h1>{report_title}</h1>
     <div class="hdr-meta">Last updated <span id="lastUpdatedAgo" data-generated-ms="{now_epoch_ms}">{relative_now}</span> · {now}{' · Finnhub enabled' if FINNHUB_API_KEY else ''}</div>
+    {f'<div class="hdr-meta">{news_meta}</div>' if news_meta else ''}
   </div>
   <div class="report-controls">
     {qr_chip_html}
