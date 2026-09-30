@@ -1588,6 +1588,12 @@ def _harvest_pending_news_batches(client) -> None:
             _news_batch_inflight.update(id_map.values())  # unknown -> don't re-buy
             continue
         if status != "ended":
+            # Say so: a silent skip here is indistinguishable in the log from
+            # "Claude was never called" while the run serves lexicon scores.
+            age_min = (time.time() - rec.get("ts", time.time())) / 60
+            print(f"[news-batch] {batch_id} still {status} after "
+                  f"{age_min:.0f} min — {len(id_map)} ticker(s) stay on "
+                  f"lexicon until it lands")
             still_pending.append(rec)
             _news_batch_inflight.update(id_map.values())
             continue
