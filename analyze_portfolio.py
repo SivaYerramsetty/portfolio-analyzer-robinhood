@@ -666,6 +666,198 @@ def _render_benchmark_stat(port_today_pct: Optional[float],
     return "".join(blocks)
 
 
+# --- Upcoming market-moving events (header "Next event" stat) -----------------
+# Three sources, merged and sorted:
+#   1. This week's HIGH-impact US releases (jobs, CPI, PCE, GDP, retail sales…)
+#      from the free Forex Factory calendar feed, with consensus forecasts. The
+#      feed only covers the current week, so it is the near-term detail.
+#   2. FOMC rate decisions from the Fed's published schedule — the lookahead
+#      beyond this week. Append the next year once the Fed publishes it
+#      (federalreserve.gov/monetarypolicy/fomccalendars.htm); True = the
+#      meeting carries a Summary of Economic Projections (dot plot).
+#   3. Monthly options expiration (third Friday), computed; Mar/Jun/Sep/Dec is
+#      quarterly "quad witching".
+_MARKET_EVENTS_CACHE_PATH = (Path(__file__).resolve().parent / ".cache"
+                             / "market_events.json")
+_MARKET_EVENTS_TTL_SEC = 6 * 60 * 60
+_MARKET_EVENTS_FEED = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+_FOMC_DECISIONS = {
+    "2026-01-28": False, "2026-03-18": True, "2026-04-29": False,
+    "2026-06-17": True, "2026-07-29": False, "2026-09-16": True,
+    "2026-10-28": False, "2026-12-09": True,
+    "2027-01-27": False, "2027-03-17": True, "2027-04-28": False,
+    "2027-06-09": True, "2027-07-28": False, "2027-09-15": True,
+    "2027-10-27": False, "2027-12-08": True,
+}
+
+# Feed titles -> the plain name shown in the header. Matched by prefix; the
+# first match wins, so list the specific titles before broader ones. Unlisted
+# high-impact titles show as the feed names them.
+_EVENT_NAMES = (
+    ("Non-Farm Employment Change", "Jobs report"),
+    ("Unemployment Rate", "Jobs report"),
+    ("Average Hourly Earnings", "Jobs report"),
+    ("Core CPI", "CPI inflation"),
+    ("CPI", "CPI inflation"),
+    ("Core PCE", "PCE inflation"),
+    ("Core PPI", "PPI inflation"),
+    ("PPI", "PPI inflation"),
+    ("Advance GDP", "GDP"),
+    ("Prelim GDP", "GDP"),
+    ("Final GDP", "GDP"),
+    ("Core Retail Sales", "Retail sales"),
+    ("Retail Sales", "Retail sales"),
+    ("ISM Manufacturing PMI", "ISM manufacturing"),
+    ("ISM Services PMI", "ISM services"),
+    ("Fed Chair", "Fed Chair speaks"),
+)
+# Feed rows that duplicate the built-in FOMC entry.
+_FOMC_FEED_TITLES = ("Federal Funds Rate", "FOMC Statement",
+                     "FOMC Press Conference", "FOMC Economic Projections")
+
+
+def _fetch_week_calendar() -> Optional[list]:
+    """This week's high-impact USD rows from the calendar feed, cached in
+    .cache/ (6-hour TTL, carried across CI runs like the other market caches).
+    A failed fetch serves the stale cache; None only when there is nothing."""
+    cached: Optional[dict] = None
+    try:
+        if _MARKET_EVENTS_CACHE_PATH.exists():
+            cached = json.loads(_MARKET_EVENTS_CACHE_PATH.read_text())
+            if time.time() - cached.get("fetched_at", 0) < _MARKET_EVENTS_TTL_SEC:
+                return cached.get("events")
+    except Exception:
+        cached = None
+    if not requests:
+        return cached.get("events") if cached else None
+    try:
+        r = requests.get(_MARKET_EVENTS_FEED,
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return cached.get("events") if cached else None
+        rows = [e for e in (r.json() or [])
+                if e.get("country") == "USD" and e.get("impact") == "High"]
+        events = [{k: e.get(k) for k in ("title", "date", "forecast", "previous")}
+                  for e in rows]
+        try:
+            _MARKET_EVENTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _MARKET_EVENTS_CACHE_PATH.write_text(
+                json.dumps({"events": events, "fetched_at": time.time()}))
+        except Exception:
+            pass
+        return events
+    except Exception:
+        return cached.get("events") if cached else None
+
+
+def _third_friday(year: int, month: int) -> date:
+    d = date(year, month, 15)          # the third Friday falls on the 15th-21st
+    return d + timedelta(days=(4 - d.weekday()) % 7)
+
+
+def fetch_market_events(horizon_days: int = 45) -> list[dict]:
+    """Upcoming market-moving events within `horizon_days`, soonest first:
+    [{"name", "when" (aware datetime, ET), "timed", "detail"}]. Releases at the
+    same moment collapse into one entry (the jobs report is three feed rows)."""
+    if os.environ.get("MARKET_METER", "").strip() == "0":
+        return []
+    et = ZoneInfo("America/New_York")
+    now = datetime.now(et)
+    end = now + timedelta(days=horizon_days)
+    out: list[dict] = []
+
+    fomc_days = set(_FOMC_DECISIONS)
+    grouped: dict[str, dict] = {}
+    for e in _fetch_week_calendar() or []:
+        title = (e.get("title") or "").strip()
+        try:
+            when = datetime.fromisoformat(e["date"]).astimezone(et)
+        except Exception:
+            continue
+        if when.date().isoformat() in fomc_days and title.startswith(_FOMC_FEED_TITLES):
+            continue
+        name = next((n for p, n in _EVENT_NAMES if title.startswith(p)), title)
+        part = title
+        if e.get("forecast"):
+            part += f" (est {e['forecast']}"
+            part += f", prior {e['previous']})" if e.get("previous") else ")"
+        key = f"{when.isoformat()}|{name}"
+        g = grouped.setdefault(key, {"name": name, "when": when, "timed": True,
+                                     "parts": []})
+        g["parts"].append(part)
+    for g in grouped.values():
+        out.append({"name": g["name"], "when": g["when"], "timed": True,
+                    "detail": "; ".join(g["parts"])})
+
+    for iso, sep in _FOMC_DECISIONS.items():
+        d = date.fromisoformat(iso)
+        out.append({
+            "name": "FOMC rate decision",
+            "when": datetime(d.year, d.month, d.day, 14, 0, tzinfo=et),
+            "timed": True,
+            "detail": ("Fed rate decision 2:00 PM ET, press conference 2:30 PM"
+                       + (", with new projections (dot plot)" if sep else "")),
+        })
+
+    for i in range(3):
+        y, m = now.year + (now.month - 1 + i) // 12, (now.month - 1 + i) % 12 + 1
+        d = _third_friday(y, m)
+        quad = m in (3, 6, 9, 12)
+        out.append({
+            "name": "Quad witching" if quad else "Options expiration",
+            "when": datetime(d.year, d.month, d.day, 16, 0, tzinfo=et),
+            "timed": False,
+            "detail": ("Quarterly expiry of stock/index options and futures — "
+                       "heavy volume, choppy close" if quad else
+                       "Monthly options expiration — elevated volume into the close"),
+        })
+
+    out = [e for e in out if now <= e["when"] <= end]
+    out.sort(key=lambda e: e["when"])
+    return out
+
+
+def _render_events_stat(events: list[dict]) -> str:
+    """'Next market event' tile, beside the Today/YTD tiles: the soonest event
+    as the big figure, its date and countdown on the muted sub-line, and the
+    rest of the lookahead in the tooltip. Amber when it lands today/tomorrow."""
+    if not events:
+        return ""
+    import html as _html
+    et = ZoneInfo("America/New_York")
+    today = datetime.now(et).date()
+
+    def _when(e) -> tuple[str, int]:
+        w = e["when"]
+        days = (w.date() - today).days
+        s = f"{w:%a} {w:%b} {w.day}"
+        if e["timed"]:
+            s += f" · {w:%I:%M %p}".replace(" 0", " ") + " ET"
+        return s, days
+
+    def _rel(days: int) -> str:
+        return "today" if days == 0 else "tomorrow" if days == 1 else f"in {days}d"
+
+    first = events[0]
+    when_s, days = _when(first)
+    lines = ["Upcoming scheduled events that can move the whole market:"]
+    for e in events[:8]:
+        s, d = _when(e)
+        lines.append(f"• {s} ({_rel(d)}) — {e['name']}: {e['detail']}")
+    tip = _html.escape("\n".join(lines), quote=True).replace("\n", "&#10;")
+    color = "var(--fg-chip-amber)" if days <= 1 else "var(--fg-strong)"
+    cap_style = ("font-size:10px;color:var(--fg-muted);font-weight:400;"
+                 "text-transform:none;letter-spacing:0;margin-top:2px;")
+    return (
+        f'<div class="stat" title="{tip}" style="cursor:help;">'
+        f'<strong style="color:{color};">{_html.escape(first["name"])}</strong>'
+        f'Next market event'
+        f'<div style="{cap_style}">{when_s} · {_rel(days)}</div>'
+        f'</div>'
+    )
+
+
 # --- True account YTD return (cash-flow adjusted) -----------------------------
 # The benchmark tile above is a price return on the CURRENT basket. It is not
 # what a broker shows you, and on an account that takes regular deposits the two
@@ -8700,6 +8892,10 @@ def generate_html_report(
             account_ytd,
         )
 
+    # Next market-moving event (jobs, CPI, FOMC, opex…) — sits right after the
+    # Today/YTD tiles. Independent of holdings; hides itself with no data.
+    events_stat_html = _render_events_stat(fetch_market_events())
+
     holdings_summary = ""
     if has_holdings:
         # Today's-change stat (colored), only when we have the data.
@@ -9572,6 +9768,7 @@ def generate_html_report(
     {missed_stat_html}
     {earnings_stat_html}
     {benchmark_stat_html}
+    {events_stat_html}
   </div>
 </div>
 
