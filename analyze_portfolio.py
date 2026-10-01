@@ -8140,7 +8140,7 @@ def _miss_base_line(by_mode: dict, mode: str) -> str:
         lbl, sc = by_mode[other]
         name = BASE_SCORE_LABELS.get(other, other)
         score = f" {sc:.0f}" if sc is not None else ""
-        bits.append(f"{name} base: {_miss_esc(lbl or '—')}{score}")
+        bits.append(f"<span>{name} base: {_miss_esc(lbl or '—')}{score}</span>")
     return (f"<span class='miss-alt'>{' · '.join(bits)}</span>") if bits else ""
 
 
@@ -9288,10 +9288,13 @@ def generate_html_report(
   .vcard.show {{ display: block; }}
   .miss-trigger {{ font-size: 11px; color: var(--fg-muted); cursor: help;
                   border-bottom: 1px dotted var(--fg-muted); white-space: nowrap; }}
-  /* What the other base scores called a missed/avoided name. */
+  /* What the other base scores called a missed/avoided name. Five entries
+     on one unbroken line stretched the verdict columns, so it wraps between
+     entries (each stays whole) within a capped width. */
   .miss-alt {{ display: block; margin-top: 3px; font-size: 10px;
-               color: var(--fg-muted); white-space: nowrap;
-               font-variant-numeric: tabular-nums; }}
+               color: var(--fg-muted); white-space: normal; max-width: 210px;
+               line-height: 1.4; font-variant-numeric: tabular-nums; }}
+  .miss-alt > span {{ white-space: nowrap; }}
   .miss-vcard {{ width: 360px; }}
   .vcard-head {{ display: flex; align-items: baseline;
                  justify-content: space-between; gap: 10px; margin-bottom: 8px; }}

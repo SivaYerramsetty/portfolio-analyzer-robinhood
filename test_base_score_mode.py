@@ -1040,7 +1040,8 @@ def test_missed_opps_markup() -> None:
           "the cell sorts by the run's label, with every mode's alongside")
     check(td.count("class='verdict'"), len(ap.BASE_SCORE_MODES),
           "and holds one chip per base x calibration")
-    check(re.findall(r"<span class='miss-alt'>(.*?)</span>", td)[0],
+    check(re.sub(r"</?span>", "", re.findall(
+              r"<span class='miss-alt'>((?:<span>.*?</span>|[^<])*)</span>", td)[0]),
           "Quality base: ADD 94 · Blend base: ADD 88 · "
           "Composite (Recalibrated) base: ADD 82 · "
           "Quality (Recalibrated) base: ADD 99 · "
