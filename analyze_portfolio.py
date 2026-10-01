@@ -10147,6 +10147,41 @@ Verdicts are framework outputs, not investment advice.
     (window.reloadFreshReport || location.reload.bind(location))();
   });
 })();
+// Auto-reload. Once a minute, while the tab is visible, fetch the published
+// report (cache-busted, like reloadFreshReport) and compare its generation
+// stamp with this page's. Reload only when a newer report is up, so an open
+// tab follows the scheduled runs without losing its place every minute for
+// nothing. Read-only: never dispatches the workflow.
+(function() {
+  var el = document.getElementById('lastUpdatedAgo');
+  var mine = el ? parseInt(el.getAttribute('data-generated-ms'), 10) : 0;
+  if (!mine || !window.fetch) return;
+  var CHECK_MS = 60000, lastCheck = Date.now(), busy = false;
+  function typing() {
+    var a = document.activeElement;
+    return a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+  }
+  function check() {
+    if (busy || document.hidden || typing()) return;
+    busy = true;
+    lastCheck = Date.now();
+    fetch(location.pathname + '?v=' + Date.now(), {cache: 'no-store'})
+      .then(function(r) { return r.ok ? r.text() : ''; })
+      .then(function(html) {
+        var m = /id="lastUpdatedAgo" data-generated-ms="(\\d+)"/.exec(html);
+        if (m && parseInt(m[1], 10) > mine) {
+          (window.reloadFreshReport || location.reload.bind(location))();
+        }
+      })
+      .catch(function() {})   // offline / transient — try again next tick
+      .then(function() { busy = false; });
+  }
+  setInterval(check, CHECK_MS);
+  // Returning to a tab that sat hidden past a tick checks right away.
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && Date.now() - lastCheck >= CHECK_MS) check();
+  });
+})();
 (function() {
   function sortableValue(td) {
     var s = td.getAttribute('data-sort');
