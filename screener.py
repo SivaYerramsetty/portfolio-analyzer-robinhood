@@ -31,7 +31,7 @@ screen_universe() is the entry point the report uses. It scans at most once
 per market day (cached in .cache/screen.json) and in two passes: fundamentals
 for all ~900 names, then the expensive SEC insider read for the few dozen that
 survive. That is what makes the scan cheap enough to run inside a report that
-regenerates every 15 minutes.
+regenerates every 10 minutes.
 """
 
 from __future__ import annotations
@@ -562,7 +562,7 @@ def split_passers_and_near_misses(
 # Once-a-day universe scan
 # ============================================================
 # The scan is the slowest thing the analyzer can do — a fundamentals pull for
-# every S&P 500/400 name. Scheduled report runs fire every 15 minutes, so the
+# every S&P 500/400 name. Scheduled report runs fire every 10 minutes, so the
 # result is cached per market day in .cache/ (gitignored; carried across CI
 # runs by the Actions cache). The first run of the day pays for the scan and
 # the rest of the day reads it back.
