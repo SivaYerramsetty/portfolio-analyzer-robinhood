@@ -549,6 +549,21 @@ def test_stuck_pipeline_fades_out() -> None:
         ap._news_cache = None
 
 
+def test_empty_entry_rechecked_hourly() -> None:
+    # 2026-10-05: yfinance .news went empty for every symbol; the 7am run cached
+    # "no headlines" for all tickers, and every later run that day was a cache
+    # hit serving the Oct 1 carry. An empty entry must expire within the hour.
+    section("a 'no headlines' entry is re-checked hourly, a real score isn't")
+    now = time.time()
+    check(ap._news_entry_fresh({"ts": now - 60, "sentiment": None}), True,
+          "a fresh empty entry is a hit (no refetch storm within the hour)")
+    check(ap._news_entry_fresh({"ts": now - 3700, "sentiment": None}), False,
+          "an hour-old empty entry is stale, so the feed is tried again")
+    check(ap._news_entry_fresh({"ts": now - 3700, "sentiment": _news(0.5, None)}),
+          ap._et_now(now - 3700).date() == ap._et_now().date(),
+          "a real score still follows the calendar-day rule")
+
+
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
@@ -556,7 +571,8 @@ def main() -> int:
               test_decay_leaves_odd_input_alone, test_reason_text,
               test_verdict_integration, test_carry_preserves_as_of,
               test_lexicon_read_is_not_carried,
-              test_empty_feed_keeps_last_claude_read, test_freshness_display,
+              test_empty_feed_keeps_last_claude_read,
+              test_empty_entry_rechecked_hourly, test_freshness_display,
               test_batch_harvest_as_of,
               test_stuck_pipeline_fades_out):
         before = len(_results)

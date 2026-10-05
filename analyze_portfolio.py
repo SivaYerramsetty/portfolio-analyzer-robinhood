@@ -175,6 +175,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 
@@ -1331,6 +1332,9 @@ _anthropic_client_singleton = None
 # collide with a real cache entry.
 _NEWS_PENDING_KEY = "__pending_batches__"
 
+# How long a "no headlines" cache entry counts as fresh (see _news_entry_fresh).
+_NEWS_EMPTY_RETRY_SECONDS = 3600
+
 _NEWS_SENTIMENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1396,6 +1400,11 @@ def _news_entry_fresh(entry: Optional[dict]) -> bool:
     ts = entry.get("ts", 0)
     if not ts:
         return False
+    # "No headlines" is usually a feed outage, not a quiet day; caching it for
+    # the whole day pinned every later run to the stale carried read. Re-check
+    # hourly instead — a headline fetch is free, only a real score costs.
+    if entry.get("sentiment") is None and time.time() - ts >= _NEWS_EMPTY_RETRY_SECONDS:
+        return False
     if mode == "hours":
         return (time.time() - ts) < hours * 3600
     return _et_now(ts).date() == _et_now().date()
@@ -1443,7 +1452,8 @@ def _anthropic_client():
 
 def fetch_recent_headlines(ticker: str, max_items: int = 8) -> list[str]:
     """Recent company headlines (last ~7 days), newest first. Finnhub
-    company-news (free endpoint) preferred; yfinance .news as fallback."""
+    company-news (free endpoint) preferred; yfinance .news, then Yahoo's
+    keyless RSS feed, as fallbacks."""
     out: list[str] = []
     if FINNHUB_API_KEY and requests:
         try:
@@ -1476,7 +1486,46 @@ def fetch_recent_headlines(ticker: str, max_items: int = 8) -> list[str]:
                     out.append(title)
         except Exception:
             pass
+    if not out:
+        out = _yahoo_rss_headlines(ticker, max_items)
     return out[:max_items]
+
+
+def _yahoo_rss_headlines(ticker: str, max_items: int = 8) -> list[str]:
+    """Headlines from Yahoo Finance's public RSS feed. Since ~2026-10-02
+    yfinance's .news comes back empty for every symbol, and CI has no Finnhub
+    key, so without this the scorer saw no headlines at all and every report
+    kept serving the last pre-outage Claude read."""
+    if not requests:
+        return []
+    import xml.etree.ElementTree as ET
+    try:
+        r = requests.get(
+            "https://feeds.finance.yahoo.com/rss/2.0/headline",
+            params={"s": ticker.replace(".", "-"), "region": "US", "lang": "en-US"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return []
+        cutoff = time.time() - 7 * 86400
+        out = []
+        for item in ET.fromstring(r.content).iter("item"):
+            title = (item.findtext("title") or "").strip()
+            pub = item.findtext("pubDate")
+            if pub:
+                try:
+                    if parsedate_to_datetime(pub).timestamp() < cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            if title:
+                out.append(title)
+            if len(out) >= max_items:
+                break
+        return out
+    except Exception:
+        return []
 
 
 # The prompt and the response parsing are shared by the real-time path
