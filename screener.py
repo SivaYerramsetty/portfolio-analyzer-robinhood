@@ -1,37 +1,39 @@
 """
 screener.py
 -----------
-Screens the S&P 500 + S&P 400 universe against the 9-filter quality framework
-and computes a composite score for ranking the passers.
+Screens the S&P 500 + S&P 400 universe against the 9-filter quality framework.
 
-Filter set (matches analyze_portfolio.py):
-    1. Revenue growth >= 10% YoY
-    2. EPS growth >= 10% YoY
-    3. P/E < 30
+Filter set (analyze_portfolio.apply_quality_filters is the definition):
+    1. Revenue growth >= 10%/yr     (3-year CAGR, else 1-year YoY)
+    2. EPS growth >= 10%/yr         (3-year CAGR, else 1-year YoY)
+    3. P/E < 30                     (lower of trailing / forward)
     4. PEG < 2
-    5. ROE >= 15%
-    6. Operating margin >= 15%
+    5. ROE >= 15%                   (3-year average, else TTM)
+    6. Operating margin >= 15%      (3-year average, else TTM)
     7. Debt/Equity < 1
-    8. FCF positive & growing YoY
+    8. FCF positive & growing       (every recent year, else 1-year YoY)
     9. Quick ratio > 1.0
 
-Composite score weighting (0-100):
-    Quality 35% · Growth 25% · Value 20% · Analyst 20%
+The scan runs in two stages:
 
-Per-stock metrics surfaced to the HTML report:
+  1. Prefilter — one Yahoo request per name (quoteSummary) and a rough reading
+     of the nine filters from trailing numbers. It exists to drop the names
+     that plainly fail, cheaply: Yahoo refuses an IP for a few minutes after
+     about 2,500 requests (see yahoo_limits), and full scoring costs about
+     seven requests a name.
+  2. Scoring — the caller scores the shortlist. The report passes
+     analyze_portfolio.score_screen_shortlist, which runs the same filters,
+     sub-scores and Composite as every holding and watchlist row, so the
+     Screening table's numbers are the report's numbers.
+
+Per-stock fields the Screening table shows besides the scores:
     RecAvg     — Yahoo's analyst recommendation mean (1 strong buy ... 5 strong sell)
     52w Pos    — where price sits in 52-week range (0% = low, 100% = high)
-    #F         — number of filters FAILED (we list 0, 1, 2 in the "near misses" view)
-
-Allows shows in the screen output:
-    - "passed" (0 failed): primary list
-    - "near_miss" (1-2 failed): runners-up for visibility
+    #F         — number of filters failed (near misses fail 1 or 2)
 
 screen_universe() is the entry point the report uses. It scans at most once
-per market day (cached in .cache/screen.json) and in two passes: fundamentals
-for all ~900 names, then the expensive SEC insider read for the few dozen that
-survive. That is what makes the scan cheap enough to run inside a report that
-regenerates every 10 minutes.
+per market day (cached in .cache/screen.json), which is what makes the scan
+cheap enough to run inside a report that regenerates every 10 minutes.
 """
 
 from __future__ import annotations
@@ -39,17 +41,19 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import threading
 import time
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
 import yfinance as yf
+
+import yahoo_limits as yl
 
 
 # ============================================================
@@ -232,8 +236,17 @@ def fetch_sp500_sp400(verbose: bool = True,
 
 
 # ============================================================
-# Per-stock fundamentals fetch + 9-filter scoring
+# Stage 1 — the prefilter
 # ============================================================
+# One quoteSummary request per name. Ticker.info costs three (quoteSummary, the
+# v7 quote and a fundamentals-timeseries call for the trailing PEG), and the
+# scan used to add a fourth for the cash-flow statement: ~3,600 requests for
+# the universe against Yahoo's limit of about 2,500. Every scan was cut off
+# partway — on 2026-10-05 the last ~250 names alphabetically (roughly Q onward)
+# failed within seconds and were left out without a word.
+_PREFILTER_MODULES = ["financialData", "defaultKeyStatistics", "summaryDetail",
+                      "assetProfile", "quoteType"]
+
 
 def _safe(d: dict, k: str) -> Optional[float]:
     v = d.get(k)
@@ -245,24 +258,31 @@ def _safe(d: dict, k: str) -> Optional[float]:
         return None
 
 
-def _fcf_growing(tkr: yf.Ticker) -> Optional[bool]:
-    """Same FCF-growing logic used in analyze_portfolio.py."""
+def _quote_summary(ticker: str) -> dict:
+    """The prefilter's one request, flattened the way Ticker.info flattens it.
+
+    Uses yfinance's internal quoteSummary fetch (yfinance is pinned in
+    requirements.txt). If that ever moves, falls back to Ticker.info, which
+    works but costs three requests a name."""
+    t = yf.Ticker(ticker)
+    fetch = getattr(getattr(t, "_quote", None), "_fetch", None)
+    if fetch is None:
+        return t.info or {}
+    raw = fetch(modules=_PREFILTER_MODULES)
     try:
-        cf = tkr.cashflow
-        if cf is None or cf.empty:
-            return None
-        s = None
-        if "Free Cash Flow" in cf.index:
-            s = cf.loc["Free Cash Flow"].dropna()
-        elif ("Operating Cash Flow" in cf.index) and ("Capital Expenditure" in cf.index):
-            s = (cf.loc["Operating Cash Flow"] + cf.loc["Capital Expenditure"]).dropna()
-        if s is None or len(s) < 2:
-            return None
-        cur = float(s.iloc[0])
-        prv = float(s.iloc[1])
-        return cur > prv and cur > 0
-    except Exception:
-        return None
+        modules = raw["quoteSummary"]["result"][0]
+    except (TypeError, KeyError, IndexError):
+        return {}
+    info: dict = {}
+    for module in modules.values():
+        if not isinstance(module, dict):
+            continue
+        for k, v in module.items():
+            if isinstance(v, dict) and "raw" in v:
+                v = v["raw"]
+            if v is not None:
+                info[k] = v
+    return info
 
 
 @dataclass
@@ -276,27 +296,27 @@ class ScreenResult:
     week52_high: Optional[float] = None
     week52_low: Optional[float] = None
     week52_pos: Optional[float] = None
-    # Raw metrics
-    rev_growth: Optional[float] = None      # decimal
+    # Trailing metrics the prefilter read (decimals; D/E as a ratio)
+    rev_growth: Optional[float] = None
     eps_growth: Optional[float] = None
-    pe: Optional[float] = None
+    pe: Optional[float] = None              # lower of trailing / forward
     peg: Optional[float] = None
     roe: Optional[float] = None
     op_margin: Optional[float] = None
     de_ratio: Optional[float] = None
     fcf: Optional[float] = None
-    fcf_growing: Optional[bool] = None
     quick: Optional[float] = None
-    # Analyst
+    # Analyst (Yahoo)
     rec_avg: Optional[float] = None         # 1 = strong buy, 5 = strong sell
     num_analysts: Optional[int] = None
     target_mean: Optional[float] = None
     upside_pct: Optional[float] = None
-    # Filter pass/fail
+    # Filters the prefilter's rough reading failed (stage 1)
+    prefilter_failed: Optional[int] = None
+    # The nine filters, sub-scores (0-100) and Composite (stage 2)
     passes: dict[str, bool] = field(default_factory=dict)
     num_passed: int = 0
     num_failed: int = 9
-    # Sub-scores (0-100) and composite (0-100)
     score_quality: Optional[float] = None
     score_growth: Optional[float] = None
     score_value: Optional[float] = None
@@ -308,112 +328,72 @@ class ScreenResult:
     error: Optional[str] = None
 
 
-def screen_one(ticker: str, include_insider: bool = True) -> ScreenResult:
-    """Pull fundamentals for one ticker and apply the 9 filters.
+def _prefilter_passes(r: ScreenResult) -> dict[str, bool]:
+    """The nine filters as far as trailing numbers can judge them.
 
-    The insider read costs ~10x the rest of the pull (it walks every recent
-    Form 4 at the SEC), so a universe-wide pass leaves it out and enriches only
-    the shortlist afterwards — see add_insider_scores().
-    """
+    Stage 2 judges growth on 3-year CAGRs, ROE and margin on 3-year averages,
+    FCF on its history and PEG on the trailing ratio — none of which this
+    reading has — so a value missing for one of those isn't held against the
+    name. P/E, D/E and the quick ratio read the fields stage 2 reads."""
+    return {
+        "rev_growth": r.rev_growth is None or r.rev_growth >= 0.10,
+        "eps_growth": r.eps_growth is None or r.eps_growth >= 0.10,
+        "pe": r.pe is not None and r.pe < 30,
+        "peg": r.peg is None or 0 < r.peg < 2,
+        "roe": r.roe is None or r.roe >= 0.15,
+        "op_margin": r.op_margin is None or r.op_margin >= 0.15,
+        "de": r.de_ratio is not None and r.de_ratio < 1,
+        "fcf": r.fcf is None or r.fcf > 0,
+        "quick": r.quick is not None and r.quick > 1.0,
+    }
+
+
+def prefilter_one(ticker: str) -> ScreenResult:
+    """Fetch one name's quoteSummary and count the filters it plainly fails."""
     r = ScreenResult(ticker=ticker)
     try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-        if not info:
-            r.error = "no info"
-            return r
-
-        r.name = info.get("shortName") or info.get("longName") or ticker
-        r.sector = info.get("sector")
-        r.industry = info.get("industry")
-        r.price = _safe(info, "regularMarketPrice") or _safe(info, "currentPrice")
-        r.market_cap = _safe(info, "marketCap")
-        r.week52_high = _safe(info, "fiftyTwoWeekHigh")
-        r.week52_low = _safe(info, "fiftyTwoWeekLow")
-        if r.price and r.week52_high and r.week52_low and r.week52_high > r.week52_low:
-            r.week52_pos = round(
-                (r.price - r.week52_low) / (r.week52_high - r.week52_low) * 100, 1
-            )
-
-        r.rev_growth = _safe(info, "revenueGrowth")
-        r.eps_growth = _safe(info, "earningsGrowth")
-        r.pe = _safe(info, "trailingPE") or _safe(info, "forwardPE")
-        r.peg = _safe(info, "trailingPegRatio") or _safe(info, "pegRatio")
-        r.roe = _safe(info, "returnOnEquity")
-        r.op_margin = _safe(info, "operatingMargins")
-        de_raw = _safe(info, "debtToEquity")
-        r.de_ratio = (de_raw / 100) if de_raw is not None else None
-        r.fcf = _safe(info, "freeCashflow")
-        r.fcf_growing = _fcf_growing(t)
-        r.quick = _safe(info, "quickRatio")
-
-        r.rec_avg = _safe(info, "recommendationMean")
-        na = info.get("numberOfAnalystOpinions")
-        r.num_analysts = int(na) if na else None
-        r.target_mean = _safe(info, "targetMeanPrice")
-        if r.price and r.target_mean and r.target_mean > 0:
-            r.upside_pct = round((r.target_mean - r.price) / r.price * 100, 1)
-
-        # Apply filters
-        p = {
-            "rev_growth": (r.rev_growth is not None and r.rev_growth >= 0.10),
-            "eps_growth": (r.eps_growth is not None and r.eps_growth >= 0.10),
-            "pe": (r.pe is not None and 0 < r.pe < 30),
-            "peg": (r.peg is not None and 0 < r.peg < 2),
-            "roe": (r.roe is not None and r.roe >= 0.15),
-            "op_margin": (r.op_margin is not None and r.op_margin >= 0.15),
-            "de": (r.de_ratio is not None and r.de_ratio < 1),
-            "fcf": (r.fcf is not None and r.fcf > 0 and r.fcf_growing is not False),
-            "quick": (r.quick is not None and r.quick > 1.0),
-        }
-        r.passes = p
-        r.num_passed = sum(1 for v in p.values() if v)
-        r.num_failed = 9 - r.num_passed
-
-        # Sub-scores
-        r.score_quality = _quality_subscore(r)
-        r.score_growth = _growth_subscore(r)
-        r.score_value = _value_subscore(r)
-        r.score_analyst = _analyst_subscore(r)
-
-        if include_insider:
-            add_insider_score(r)
-        _set_composite(r)
-
+        info = _quote_summary(ticker)
     except Exception as e:
         r.error = f"{type(e).__name__}: {e}"
+        return r
+    if not info:
+        r.error = "no info"
+        return r
+
+    r.name = info.get("shortName") or info.get("longName") or ticker
+    r.sector = info.get("sector")
+    r.industry = info.get("industry")
+    r.price = _safe(info, "regularMarketPrice") or _safe(info, "currentPrice")
+    r.market_cap = _safe(info, "marketCap")
+    r.week52_high = _safe(info, "fiftyTwoWeekHigh")
+    r.week52_low = _safe(info, "fiftyTwoWeekLow")
+    if r.price and r.week52_high and r.week52_low and r.week52_high > r.week52_low:
+        r.week52_pos = round(
+            (r.price - r.week52_low) / (r.week52_high - r.week52_low) * 100, 1
+        )
+
+    r.rev_growth = _safe(info, "revenueGrowth")
+    r.eps_growth = _safe(info, "earningsGrowth")
+    pes = [p for p in (_safe(info, "trailingPE"), _safe(info, "forwardPE"))
+           if p is not None and p > 0]
+    r.pe = min(pes) if pes else None
+    r.peg = _safe(info, "trailingPegRatio") or _safe(info, "pegRatio")
+    r.roe = _safe(info, "returnOnEquity")
+    r.op_margin = _safe(info, "operatingMargins")
+    de_raw = _safe(info, "debtToEquity")
+    r.de_ratio = (de_raw / 100) if de_raw is not None else None
+    r.fcf = _safe(info, "freeCashflow")
+    r.quick = _safe(info, "quickRatio")
+
+    r.rec_avg = _safe(info, "recommendationMean")
+    na = info.get("numberOfAnalystOpinions")
+    r.num_analysts = int(na) if na else None
+    r.target_mean = _safe(info, "targetMeanPrice")
+    if r.price and r.target_mean and r.target_mean > 0:
+        r.upside_pct = round((r.target_mean - r.price) / r.price * 100, 1)
+
+    r.prefilter_failed = sum(1 for ok in _prefilter_passes(r).values() if not ok)
     return r
-
-
-def _set_composite(r: ScreenResult) -> None:
-    """Composite over whichever sub-scores exist (weights match
-    analyze_portfolio.py). A missing sub-score drops out of the denominator
-    rather than scoring zero, so a name with no insider read is not penalised
-    for it."""
-    weights = {
-        "quality": 0.30, "growth": 0.20,
-        "value": 0.20, "analyst": 0.15, "insider": 0.15,
-    }
-    parts, total_w = 0.0, 0.0
-    for k, w in weights.items():
-        sub = getattr(r, f"score_{k}")
-        if sub is not None:
-            parts += sub * w
-            total_w += w
-    r.score_composite = round(parts / total_w, 1) if total_w > 0 else None
-
-
-def add_insider_score(r: ScreenResult) -> None:
-    """Fill in the insider sub-score for one result (no-op if unavailable)."""
-    try:
-        from insider_trading import get_insider_activity, insider_score
-        r.insider_activity = get_insider_activity(r.ticker, lookback_days=90)
-        r.score_insider = insider_score(r.insider_activity,
-                                        market_cap=r.market_cap)
-        if r.insider_activity is not None:
-            r.insider_activity["_score"] = r.score_insider
-    except Exception:
-        pass
 
 
 def _workers(max_workers: Optional[int] = None) -> int:
@@ -427,132 +407,67 @@ def _workers(max_workers: Optional[int] = None) -> int:
         return 6
 
 
-def add_insider_scores(results: list[ScreenResult],
-                       max_workers: Optional[int] = None,
-                       verbose: bool = True) -> None:
-    """Enrich a shortlist with insider reads, in place, and rescore."""
-    if not results:
-        return
-    start = time.time()
-    with ThreadPoolExecutor(max_workers=min(_workers(max_workers),
-                                            len(results))) as ex:
-        list(ex.map(add_insider_score, results))
-    for r in results:
-        _set_composite(r)
-    if verbose:
-        print(f"[screen] Insider reads for {len(results)} shortlisted name(s) "
-              f"in {time.time() - start:.0f}s")
-
-
-def _clip01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-
-def _quality_subscore(r: ScreenResult) -> Optional[float]:
-    """0-100 based on ROE, op margin, D/E, FCF positivity, quick ratio."""
-    parts = []
-    if r.roe is not None:
-        parts.append(_clip01(r.roe / 0.30) * 100)            # cap at 30% ROE
-    if r.op_margin is not None:
-        parts.append(_clip01(r.op_margin / 0.30) * 100)
-    if r.de_ratio is not None:
-        parts.append(_clip01(1 - r.de_ratio / 2) * 100)      # 0 -> 100, 2.0 -> 0
-    if r.fcf is not None:
-        parts.append(100 if (r.fcf > 0 and r.fcf_growing is not False) else 0)
-    if r.quick is not None:
-        parts.append(_clip01((r.quick - 0.5) / 1.5) * 100)
-    return round(sum(parts) / len(parts), 1) if parts else None
-
-
-def _growth_subscore(r: ScreenResult) -> Optional[float]:
-    parts = []
-    if r.rev_growth is not None:
-        parts.append(_clip01(r.rev_growth / 0.30) * 100)     # cap at 30% rev growth
-    if r.eps_growth is not None:
-        parts.append(_clip01(r.eps_growth / 0.30) * 100)
-    return round(sum(parts) / len(parts), 1) if parts else None
-
-
-def _value_subscore(r: ScreenResult) -> Optional[float]:
-    """Lower P/E and PEG = higher score."""
-    parts = []
-    if r.pe is not None and r.pe > 0:
-        parts.append(_clip01(1 - (r.pe / 40)) * 100)         # 0 -> 100, 40 -> 0
-    if r.peg is not None and r.peg > 0:
-        parts.append(_clip01(1 - (r.peg / 3)) * 100)
-    return round(sum(parts) / len(parts), 1) if parts else None
-
-
-def _analyst_subscore(r: ScreenResult) -> Optional[float]:
-    """Lower recAvg (1 = strong buy) + higher upside = higher score."""
-    parts = []
-    if r.rec_avg is not None and r.rec_avg > 0:
-        # 1.0 (strong buy) -> 100; 3.0 (hold) -> 50; 5.0 (strong sell) -> 0
-        parts.append(_clip01((5 - r.rec_avg) / 4) * 100)
-    if r.upside_pct is not None:
-        # 0% -> 50; +30% -> 100; -30% -> 0
-        parts.append(_clip01(0.5 + r.upside_pct / 60) * 100)
-    return round(sum(parts) / len(parts), 1) if parts else None
-
-
-# ============================================================
-# Batch screening with progress + throttling
-# ============================================================
-
-def run_screen(
-    tickers: list[str],
-    max_workers: Optional[int] = None,
-    log_every: int = 25,
-    max_tickers: Optional[int] = None,
-    verbose: bool = True,
-    include_insider: bool = True,
-) -> list[ScreenResult]:
-    """Screen all tickers concurrently, preserving input order.
-
-    screen_one() is almost entirely network wait, so a small thread pool turns
-    a ~20-minute serial pass over the full universe into a few minutes. Workers
-    stay moderate: Yahoo rate-limits aggressive bursts (same reason
-    analyze_positions_parallel defaults to 6).
-    """
-    if max_tickers:
-        tickers = tickers[:max_tickers]
-    max_workers = _workers(max_workers)
+def prefilter_universe(tickers: list[str], *, gate: yl.YahooGate,
+                       max_workers: Optional[int] = None, log_every: int = 50,
+                       verbose: bool = True) -> list[ScreenResult]:
+    """Stage 1 over every ticker, in input order. A name Yahoo kept refusing
+    comes back carrying a rate-limit `error` instead of quietly going missing."""
     total = len(tickers)
-    if not total:
-        return []
-    max_workers = max(1, min(max_workers, total))
-
-    out: list[Optional[ScreenResult]] = [None] * total
+    results: dict[str, ScreenResult] = {}
+    lock = threading.Lock()
+    done = [0]
     start = time.time()
-    done = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(screen_one, tk, include_insider): i
-                   for i, tk in enumerate(tickers)}
-        for fut in as_completed(futures):
-            i = futures[fut]
-            try:
-                out[i] = fut.result()
-            except Exception as e:
-                out[i] = ScreenResult(ticker=tickers[i],
-                                      error=f"{type(e).__name__}: {e}")
-            done += 1
-            if verbose and (done % log_every == 0 or done == total):
-                elapsed = time.time() - start
-                rate = done / elapsed if elapsed > 0 else 0
-                eta = (total - done) / rate if rate > 0 else 0
-                passers = sum(1 for s in out if s and s.num_passed == 9)
-                print(f"  [{done:>4}/{total}]  {rate:.1f}/s  ETA {eta/60:.1f}m  "
-                      f"passers so far: {passers}")
-    return [r for r in out if r is not None]
+
+    def fetch(t: str) -> bool:
+        r = prefilter_one(t)
+        with lock:
+            results[t] = r
+        return yl.is_rate_limited(r.error)
+
+    def progress(_t: str) -> None:
+        with lock:
+            done[0] += 1
+            n = done[0]
+            short = sum(1 for r in results.values() if not r.error
+                        and r.prefilter_failed <= PREFILTER_MAX_FAILED)
+        if verbose and (n % log_every == 0 or n == total):
+            elapsed = time.time() - start
+            rate = n / elapsed if elapsed > 0 else 0
+            print(f"  [{n:>4}/{total}]  {rate:.1f}/s  shortlisted so far: {short}")
+
+    refused = yl.run_gated(tickers, fetch, gate=gate,
+                           workers=_workers(max_workers), on_done=progress)
+    for t in refused:
+        r = results.get(t) or ScreenResult(ticker=t)
+        if not yl.is_rate_limited(r.error):
+            r.error = "YFRateLimitError: Yahoo kept refusing"
+        results[t] = r
+    return [results[t] for t in tickers]
+
+
+# ============================================================
+# Shortlist and split
+# ============================================================
+# Names within this many prefilter misses go on to full scoring. The rough
+# reading disagrees with stage 2 mostly on growth (a weak last year inside a
+# strong three) and on trailing versus averaged ROE and margins, so the
+# allowance has to cover a few flips at once. Measured over the whole universe
+# on 2026-10-05: all 13 names that passed the nine filters had at most 2
+# prefilter misses; of the ~163 the table showed, 3 misses caught 148 (91%)
+# and 2 caught 121 (74%). At 3, about 500 of the ~900 names are fully scored.
+PREFILTER_MAX_FAILED = 3
+# The table's near misses: names stage 2 found failing one or two filters.
+NEAR_MISS_MAX_FAILED = 2
 
 
 def split_passers_and_near_misses(
     results: list[ScreenResult],
 ) -> tuple[list[ScreenResult], list[ScreenResult]]:
-    """Return (passed, near_miss). Passed = all 9 filters. Near-miss = 1-2 failed."""
+    """Return (passed, near_miss), each best Composite first. Passed = all
+    nine filters; near miss = one or two failed."""
     passed = [r for r in results if r.num_passed == 9 and not r.error]
-    near_miss = [r for r in results if r.num_failed in (1, 2) and not r.error]
-    # Sort each by composite descending (best first)
+    near_miss = [r for r in results
+                 if 1 <= r.num_failed <= NEAR_MISS_MAX_FAILED and not r.error]
     passed.sort(key=lambda r: (r.score_composite or -1), reverse=True)
     near_miss.sort(key=lambda r: (r.score_composite or -1), reverse=True)
     return passed, near_miss
@@ -569,6 +484,9 @@ def split_passers_and_near_misses(
 
 _SCREEN_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "screen.json"
 _ET = ZoneInfo("America/New_York")
+# Recorded in the cache so a scan scored some other way — the screener's own
+# composite, before 2026-10-06 — is never read back as today's.
+_CACHE_SCORING = "report"
 
 
 def _market_today() -> str:
@@ -581,13 +499,15 @@ def _load_screen_cache(verbose: bool = True) -> Optional[dict]:
         cached = json.loads(_SCREEN_CACHE_PATH.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
-    if not isinstance(cached, dict) or cached.get("date") != _market_today():
+    if (not isinstance(cached, dict) or cached.get("date") != _market_today()
+            or cached.get("scoring") != _CACHE_SCORING):
         return None
     try:
         out = {
             "passed": [ScreenResult(**d) for d in cached.get("passed") or []],
             "near_miss": [ScreenResult(**d) for d in cached.get("near_miss") or []],
             "universe_size": cached.get("universe_size", 0),
+            "unscreened": list(cached.get("unscreened") or []),
             "scanned_at": cached.get("scanned_at"),
             "from_cache": True,
         }
@@ -605,8 +525,10 @@ def _save_screen_cache(out: dict, verbose: bool = True) -> None:
         _SCREEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _SCREEN_CACHE_PATH.write_text(json.dumps({
             "date": _market_today(),
+            "scoring": _CACHE_SCORING,
             "scanned_at": out.get("scanned_at"),
             "universe_size": out.get("universe_size", 0),
+            "unscreened": out.get("unscreened") or [],
             "passed": [asdict(r) for r in out.get("passed") or []],
             "near_miss": [asdict(r) for r in out.get("near_miss") or []],
         }))
@@ -615,7 +537,12 @@ def _save_screen_cache(out: dict, verbose: bool = True) -> None:
             print(f"[screen] Could not write scan cache ({e})")
 
 
+# score(shortlist, gate=, max_workers=, verbose=) scores the shortlist in place.
+Scorer = Callable[..., None]
+
+
 def screen_universe(
+    score: Scorer,
     limit: Optional[int] = None,
     max_workers: Optional[int] = None,
     force: bool = False,
@@ -623,33 +550,57 @@ def screen_universe(
 ) -> dict:
     """Scan the S&P 500 + 400 universe, at most once per market day.
 
-    Returns {"passed", "near_miss", "universe_size", "scanned_at", "from_cache"}.
-    `limit` caps the universe for a fast test and neither reads nor writes the
-    day's cache, so a test run can't stand in for the real scan.
+    `score` gets the prefilter's shortlist and fills in, on each result, the
+    nine filters (passes / num_passed / num_failed), the sub-scores, the
+    Composite and the insider read — or an `error`. Yahoo work inside it
+    should go through the gate it is handed.
+
+    Returns {"passed", "near_miss", "universe_size", "unscreened",
+    "scanned_at", "from_cache"}. `unscreened` lists the tickers that could not
+    be fetched (most often: Yahoo kept refusing). `limit` caps the universe
+    for a fast test and neither reads nor writes the day's cache, so a test
+    run can't stand in for the real scan.
     """
     if not force and not limit:
         cached = _load_screen_cache(verbose=verbose)
         if cached:
             return cached
 
+    yl.install()
     universe = fetch_sp500_sp400(verbose=verbose)
     if limit:
         universe = universe[:limit]
         if verbose:
             print(f"[screen] Limiting to first {limit} tickers (test run; "
                   f"not cached).")
-    # Two passes: fundamentals for the whole universe, then insider reads for
-    # the handful that survive. One insider read costs about as much as twenty
-    # fundamentals pulls, and it only ever affects names the report shows.
-    raw = run_screen(universe, max_workers=max_workers, verbose=verbose,
-                     include_insider=False)
-    passed, near = split_passers_and_near_misses(raw)
-    add_insider_scores(passed + near, max_workers=max_workers, verbose=verbose)
-    passed, near = split_passers_and_near_misses(passed + near)
+    gate = yl.YahooGate()
+    start = time.time()
+    raw = prefilter_universe(universe, gate=gate, max_workers=max_workers,
+                             verbose=verbose)
+    # Fewest misses first: if Yahoo cuts the scan short, the names likeliest
+    # to pass have already been scored.
+    shortlist = sorted((r for r in raw if not r.error
+                        and r.prefilter_failed <= PREFILTER_MAX_FAILED),
+                       key=lambda r: r.prefilter_failed)
+    if verbose:
+        fetched = sum(1 for r in raw if not r.error)
+        print(f"[screen] Prefilter: {fetched}/{len(universe)} fetched in "
+              f"{time.time() - start:.0f}s; {len(shortlist)} within "
+              f"{PREFILTER_MAX_FAILED} misses go on to full scoring.")
+    score(shortlist, gate=gate, max_workers=_workers(max_workers),
+          verbose=verbose)
+    passed, near = split_passers_and_near_misses(shortlist)
+    unscreened = sorted(r.ticker for r in raw if r.error)
+    refused = sorted(r.ticker for r in raw if yl.is_rate_limited(r.error))
+    if verbose and refused:
+        shown = ", ".join(refused[:40]) + (" …" if len(refused) > 40 else "")
+        print(f"[screen] ⚠ {len(refused)} name(s) not screened — Yahoo kept "
+              f"refusing (rate limit): {shown}")
     out = {
         "passed": passed,
         "near_miss": near,
         "universe_size": len(universe),
+        "unscreened": unscreened,
         "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
         "from_cache": False,
     }
@@ -659,13 +610,22 @@ def screen_universe(
 
 
 if __name__ == "__main__":
-    # Quick manual test: screen a handful of known tickers
+    # Manual check: a handful of names through both stages, scored the way the
+    # report scores them.
+    from analyze_portfolio import score_screen_shortlist
+
     test = ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "MU", "TSLA", "JNJ"]
     print(f"Screening {len(test)} test tickers...")
-    res = run_screen(test, log_every=1)
+    yl.install()
+    gate = yl.YahooGate()
+    res = prefilter_universe(test, gate=gate, log_every=1)
+    score_screen_shortlist([r for r in res if not r.error], gate=gate,
+                           max_workers=4)
     passed, near = split_passers_and_near_misses(res)
     print(f"\nPassed (9/9): {[r.ticker for r in passed]}")
     print(f"Near-miss (7-8/9): {[(r.ticker, r.num_passed) for r in near]}")
     for r in passed + near[:3]:
-        print(f"  {r.ticker:6s} passed={r.num_passed}/9 composite={r.score_composite} "
-              f"Q={r.score_quality} G={r.score_growth} V={r.score_value} A={r.score_analyst}")
+        print(f"  {r.ticker:6s} passed={r.num_passed}/9 "
+              f"composite={r.score_composite} Q={r.score_quality} "
+              f"G={r.score_growth} V={r.score_value} A={r.score_analyst} "
+              f"I={r.score_insider}")
