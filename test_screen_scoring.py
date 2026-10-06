@@ -8,10 +8,10 @@ both stages run through (yahoo_limits.py).
 
 The policy under test: a screened name's filters, sub-scores and Composite
 come from the same functions as a holding's, so the Screening table and the
-Quality Compounders table never disagree about one stock; a name Yahoo
-refused is retried after a cool-down and, failing that, reported as not
-screened instead of silently dropped; and nothing fetched while Yahoo was
-refusing is cached.
+Quality Compounders table never disagree about one stock; each run spends a
+capped number of Yahoo requests on the scan and stops at the first refusal,
+leaving the rest for the next run instead of retrying into a longer block;
+and nothing fetched while Yahoo was refusing is cached.
 
 Hermetic: no network, no real cache file. Run it directly —
 
@@ -24,7 +24,6 @@ from __future__ import annotations
 import contextlib
 import json
 import tempfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,25 +61,8 @@ def patched(obj, **attrs):
             setattr(obj, k, v)
 
 
-class FakeClock:
-    """A clock the gate can sleep on without real waiting."""
-
-    def __init__(self):
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, s: float) -> None:
-        self.now += s
-
-
-_RealGate = yl.YahooGate      # tests below swap yl.YahooGate for a quiet one
-
-
-def quiet_gate(**kw) -> yl.YahooGate:
-    clock = FakeClock()
-    return _RealGate(sleep=clock.sleep, clock=clock, log=lambda _m: None, **kw)
+def quiet_budget(limit=None) -> yl.YahooBudget:
+    return yl.YahooBudget(limit, log=lambda _m: None)
 
 
 RATE_LIMITED = "YFRateLimitError: Too Many Requests. Rate limited. Try after a while."
@@ -112,86 +94,71 @@ def test_rate_limit_detection() -> None:
                 raise YFRateLimitError()
             return "ok"
 
-    yl._count_refusals(Fake, YFRateLimitError)
-    before = yl.refusals()
+    yl._count_requests(Fake, YFRateLimitError)
+    sent, refused = yl.requests(), yl.refusals()
     check(Fake().get(False), "ok", "a wrapped request passes its answer through")
     try:
         Fake().get(True)
         raised = False
     except YFRateLimitError:
         raised = True
-    check((raised, yl.refusals() - before), (True, 1),
-          "a refused one is counted and still raised")
+    check((raised, yl.requests() - sent, yl.refusals() - refused), (True, 2, 1),
+          "every request is counted; a refused one also as a refusal, and raised")
     check(yl.install(), True, "install() wraps yfinance's request method")
     from yfinance.data import YfData
     check(hasattr(YfData.get, "__wrapped__"), True, "and leaves it wrapped")
 
 
-def test_gate() -> None:
-    section("YahooGate: one cool-down per block, and a limit on how many")
-    clock = FakeClock()
+def test_budget() -> None:
+    section("YahooBudget: a run's allowance, and the first refusal stops it")
     log = []
-    gate = yl.YahooGate(cooldown_s=240, max_trips=2, sleep=clock.sleep,
-                        clock=clock, log=log.append)
-    gate.wait()
-    check(clock.now, 0.0, "an open gate doesn't wait")
-    check(gate.trip(), True, "the first refusal closes it")
-    check(gate.trip(), True, "a second worker's refusal in the same block...")
-    check(gate.trips, 1, "...doesn't start a second cool-down")
-    gate.wait()
-    check(clock.now >= 240, True, "wait() sits out the cool-down")
-    check(gate.trip(), True, "a refusal after reopening starts another")
-    clock.sleep(240)
-    check((gate.trip(), gate.exhausted), (False, True),
-          "past max_trips the gate gives up")
-    check(len(log), 3, "each cool-down and the giving up are logged once")
+    budget = yl.YahooBudget(limit=3, log=log.append)
+    check(budget.spent(), False, "a fresh budget has room")
+    for _ in range(3):
+        yl.note_request()
+    check((budget.used(), budget.spent()), (3, True), "three requests spend three")
+
+    open_ended = yl.YahooBudget(log=log.append)
+    for _ in range(50):
+        yl.note_request()
+    check(open_ended.spent(), False, "no limit: only a refusal stops it")
+    open_ended.refused()
+    open_ended.refused()
+    check((open_ended.spent(), open_ended.stopped, len(log)), (True, True, 1),
+          "a refusal stops it, and is logged once")
 
 
 def test_run_gated() -> None:
-    section("run_gated: refused names are retried after the cool-down")
-    gate = quiet_gate(cooldown_s=60, max_trips=3)
-    calls: dict[str, int] = {}
-    lock = threading.Lock()
+    section("run_gated: stops at the budget or the first refusal")
+    started = []
 
-    def fn(item):
-        with lock:
-            calls[item] = calls.get(item, 0) + 1
-            n = calls[item]
-        return item == "B" and n == 1          # B is refused once
-
-    refused = yl.run_gated(["A", "B", "C"], fn, gate=gate, workers=2)
-    check(refused, [], "everything lands in the end")
-    check((calls["A"], calls["B"], calls["C"]), (1, 2, 1),
-          "only the refused name is fetched again")
-    check(gate.trips, 1, "after one cool-down")
-
-    gate = quiet_gate(cooldown_s=60, max_trips=5)
-    calls.clear()
-    refused = yl.run_gated(["X"], lambda i: True, gate=gate, attempts=3)
-    check(refused, ["X"], "a name refused every time is handed back")
-
-    gate = quiet_gate(cooldown_s=60, max_trips=1)
-    refused = yl.run_gated(["P", "Q"], lambda i: True, gate=gate, workers=1)
-    check((sorted(refused), gate.exhausted), (["P", "Q"], True),
-          "once the gate is exhausted the rest are handed back unfetched")
-
-    # A swallowed refusal: fn reports nothing, but a 429 landed meanwhile.
-    gate = quiet_gate(cooldown_s=60, max_trips=3)
-    seen = {"n": 0}
-
-    def swallowing(item):
-        seen["n"] += 1
-        if seen["n"] == 1:
-            yl.note_refusal()                  # yfinance ate the error
+    def costs_two(item) -> bool:
+        started.append(item)
+        yl.note_request()
+        yl.note_request()
         return False
 
-    refused = yl.run_gated(["S"], swallowing, gate=gate, watch_counter=True)
-    check((refused, seen["n"]), ([], 2),
-          "watch_counter retries an attempt that saw any 429")
-    refused = yl.run_gated(["T"], lambda i: (yl.note_refusal(), False)[1],
-                           gate=quiet_gate(cooldown_s=1, max_trips=9),
-                           attempts=2)
-    check(refused, [], "without watch_counter only fn's own answer counts")
+    left = yl.run_gated(list("ABCDE"), costs_two, budget=quiet_budget(4),
+                        workers=1)
+    check((started, left), (["A", "B"], ["C", "D", "E"]),
+          "once the budget is spent the rest are handed back unstarted")
+
+    started.clear()
+    budget = quiet_budget()
+    left = yl.run_gated(list("ABC"), lambda i: (started.append(i), i == "B")[1],
+                        budget=budget, workers=1)
+    check((started, left, budget.stopped), (["A", "B"], ["B", "C"], True),
+          "a refusal stops the run: the refused name and the rest wait")
+
+    # A swallowed refusal: fn reports nothing, but a 429 landed meanwhile.
+    budget = quiet_budget()
+    left = yl.run_gated(["S"], lambda i: (yl.note_refusal(), False)[1],
+                        budget=budget, watch_counter=True)
+    check((left, budget.stopped), (["S"], True),
+          "watch_counter treats an attempt that saw any 429 as refused")
+    left = yl.run_gated(["T"], lambda i: (yl.note_refusal(), False)[1],
+                        budget=quiet_budget())
+    check(left, [], "without watch_counter only fn's own answer counts")
 
 
 # -------------------------------------------------------- 2. the prefilter ----
@@ -273,26 +240,24 @@ def test_prefilter_one() -> None:
 
 
 def test_prefilter_universe() -> None:
-    section("prefilter_universe: refusals retried, the rest reported")
-    tries: dict[str, int] = {}
+    section("prefilter_universe: a refusal leaves the rest for the next run")
 
     def fake(t):
-        tries[t] = tries.get(t, 0) + 1
-        if t == "LATE" and tries[t] == 1:
+        if t == "RL":
             return sc.ScreenResult(ticker=t, error=RATE_LIMITED)
-        if t == "GONE":
-            return sc.ScreenResult(ticker=t, error=RATE_LIMITED)
+        if t == "NONE":
+            return sc.ScreenResult(ticker=t, error="no info")
         return sc.ScreenResult(ticker=t, prefilter_failed=0)
 
     with patched(sc, prefilter_one=fake):
-        out = sc.prefilter_universe(["AAA", "LATE", "GONE"],
-                                    gate=quiet_gate(max_trips=5),
-                                    verbose=False)
-    check([r.ticker for r in out], ["AAA", "LATE", "GONE"], "input order kept")
-    check((out[1].error, tries["LATE"]), (None, 2),
-          "a name refused once is fetched again and lands")
-    check(yl.is_rate_limited(out[2].error), True,
-          "one refused every time comes back marked, not missing")
+        done, left = sc.prefilter_universe(["AAA", "NONE", "RL", "LATER"],
+                                           budget=quiet_budget(),
+                                           max_workers=1, verbose=False)
+    check([r.ticker for r in done], ["AAA", "NONE"],
+          "fetched names come back, and so does one with no data")
+    check(done[1].error, "no info", "that one carries its error")
+    check(left, ["RL", "LATER"],
+          "the refused name and everything after it wait for the next run")
 
 
 # ------------------------------------------------------- 3. the stage-2 scorer ----
@@ -331,8 +296,10 @@ def test_scorer_matches_the_holding() -> None:
     with patched(ap, _screen_scoring_inputs=_inputs(infos),
                  _set_insider_scores=fake_insider,
                  _flush_fund_cache=lambda: None):
-        ap.score_screen_shortlist(rows, gate=quiet_gate(), verbose=False)
+        left = ap.score_screen_shortlist(rows, budget=quiet_budget(),
+                                         verbose=False)
     passing, near, far = rows
+    check(left, [], "with room in the budget every name is scored")
     check((passing.num_passed, near.num_failed, far.num_failed), (9, 2, 3),
           "the nine filters are analyze_portfolio's")
     check(sorted(k for k, v in near.passes.items() if not v),
@@ -357,26 +324,27 @@ def test_scorer_matches_the_holding() -> None:
 
 
 def test_scorer_refusals() -> None:
-    section("score_screen_shortlist: a refused name is marked, not scored")
+    section("score_screen_shortlist: a refusal hands the rest back")
     from yfinance.exceptions import YFRateLimitError
 
-    def always_refused(ticker, name):
+    def refuses_rl(ticker, name):
         if ticker == "RL":
             raise YFRateLimitError()
-        return _inputs({"OK": PASSING})(ticker, name)
+        return _inputs({"OK": PASSING, "AFTER": PASSING})(ticker, name)
 
-    rows = [sc.ScreenResult(ticker="OK"), sc.ScreenResult(ticker="RL"),
-            sc.ScreenResult(ticker="NONE")]
-    with patched(ap, _screen_scoring_inputs=always_refused,
+    rows = [sc.ScreenResult(ticker=t) for t in ("OK", "NONE", "RL", "AFTER")]
+    with patched(ap, _screen_scoring_inputs=refuses_rl,
                  _set_insider_scores=lambda pa, t, i: None,
                  _flush_fund_cache=lambda: None):
-        ap.score_screen_shortlist(rows, gate=quiet_gate(max_trips=5),
-                                  verbose=False)
-    ok, rl, none = rows
-    check((ok.error, ok.num_passed), (None, 9), "the good name is scored")
-    check((yl.is_rate_limited(rl.error), rl.score_composite), (True, None),
-          "the refused one carries the refusal and no score")
+        left = ap.score_screen_shortlist(rows, budget=quiet_budget(),
+                                         max_workers=1, verbose=False)
+    ok, none, rl, after = rows
+    check((ok.error, ok.num_passed), (None, 9), "the name before it is scored")
     check(none.error, "ValueError: no info", "a name with no data says so")
+    check([r.ticker for r in left], ["RL", "AFTER"],
+          "the refused name and the rest come back for the next run")
+    check((rl.error, rl.score_composite, after.num_failed), (None, None, 9),
+          "untouched: no error recorded against them, nothing scored")
     check(sc.split_passers_and_near_misses(rows)[0], [ok],
           "only the scored name reaches the table")
 
@@ -404,51 +372,107 @@ def test_growth_cache_guard() -> None:
 
 # ----------------------------------------------- 4. the scan and its cache ----
 
+def _fake_scorer(verdicts: dict, scored: list):
+    """A scorer that spends two requests a name, as far as the budget goes."""
+    def score(batch, budget, max_workers, verbose):
+        def one(r) -> bool:
+            yl.note_request()
+            yl.note_request()
+            scored.append(r.ticker)
+            r.num_failed, r.score_composite = verdicts[r.ticker]
+            r.num_passed = 9 - r.num_failed
+            return False
+        return yl.run_gated(batch, one, budget=budget, workers=1)
+    return score
+
+
 def test_screen_universe() -> None:
-    section("screen_universe: prefilter, shortlist, score, cache")
+    section("screen_universe: one budget per run, the rest next run")
     pre = {"AAA": 0, "BBB": 1, "CCC": sc.PREFILTER_MAX_FAILED,
-           "DDD": sc.PREFILTER_MAX_FAILED + 1}
+           "DDD": sc.PREFILTER_MAX_FAILED + 1, "FFF": 2}
+    verdicts = {"AAA": (0, 70.0), "BBB": (1, 80.0), "CCC": (4, 50.0),
+                "FFF": (0, 75.0)}
 
     def fake_prefilter(t):
+        yl.note_request()
         if t == "EEE":
-            return sc.ScreenResult(ticker=t, error=RATE_LIMITED)
+            return sc.ScreenResult(ticker=t, error="no info")
         return sc.ScreenResult(ticker=t, name=t, prefilter_failed=pre[t])
 
-    scored = []
-
-    def fake_score(shortlist, gate, max_workers, verbose):
-        for r in shortlist:
-            scored.append(r.ticker)
-            r.num_failed = {"AAA": 0, "BBB": 1, "CCC": 4}[r.ticker]
-            r.num_passed = 9 - r.num_failed
-            r.score_composite = {"AAA": 70.0, "BBB": 80.0, "CCC": 50.0}[r.ticker]
-
+    scored: list = []
+    score = _fake_scorer(verdicts, scored)
+    universe = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
     with tempfile.TemporaryDirectory() as d, \
             patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
-                    fetch_sp500_sp400=lambda verbose: list(pre) + ["EEE"],
-                    prefilter_one=fake_prefilter), \
-            patched(yl, YahooGate=lambda: quiet_gate(max_trips=5)):
-        out = sc.screen_universe(fake_score, verbose=False)
-        check(sorted(scored), ["AAA", "BBB", "CCC"],
-              f"names within {sc.PREFILTER_MAX_FAILED} prefilter misses are scored")
-        check(([r.ticker for r in out["passed"]],
-               [r.ticker for r in out["near_miss"]]), (["AAA"], ["BBB"]),
-              "the scorer's verdict decides passed and near miss")
-        check((out["universe_size"], out["unscreened"]), (5, ["EEE"]),
-              "a name Yahoo refused is reported as not screened")
+                    fetch_sp500_sp400=lambda verbose: list(universe),
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 8):
+        first = sc.screen_universe(score, max_workers=1, verbose=False)
+        check(scored, ["AAA"],
+              "run 1: six prefilter requests leave room to score one name, "
+              "the one with the fewest misses")
+        check(([r.ticker for r in first["passed"]], first["pending"],
+               first["unscreened"]), (["AAA"], 3, ["EEE"]),
+              "it shows what it has and counts what is left")
+        cached = json.loads((Path(d) / "screen.json").read_text())
+        check([r["ticker"] for r in cached["to_score"]], ["BBB", "FFF", "CCC"],
+              "the rest wait in the cache, fewest misses first")
+
+        second = sc.screen_universe(score, max_workers=1, verbose=False)
+        check(scored, ["AAA", "BBB", "FFF", "CCC"],
+              "run 2 skips the prefilter and scores the rest")
+        check(([r.ticker for r in second["passed"]],
+               [r.ticker for r in second["near_miss"]], second["pending"]),
+              (["FFF", "AAA"], ["BBB"], 0),
+              "the table now covers the whole shortlist, best Composite first")
+
+        third = sc.screen_universe(lambda *a, **k: scored.append("again"),
+                                   verbose=False)
+        check((third["from_cache"], "again" in scored,
+               [r.ticker for r in third["passed"]]),
+              (True, False, ["FFF", "AAA"]), "a finished scan is read back")
 
         cached = json.loads((Path(d) / "screen.json").read_text())
-        check(cached["scoring"], sc._CACHE_SCORING, "the cache records how it was scored")
-        again = sc.screen_universe(lambda *a, **k: scored.append("again"),
-                                   verbose=False)
-        check((again["from_cache"], [r.ticker for r in again["passed"]],
-               again["unscreened"], "again" in scored),
-              (True, ["AAA"], ["EEE"], False), "the day's scan is read back")
+        old_format = {k: cached[k] for k in ("date", "scoring", "scanned_at",
+                                             "universe_size", "unscreened")}
+        old_format["passed"] = cached["shown"][:1]
+        old_format["near_miss"] = []
+        (Path(d) / "screen.json").write_text(json.dumps(old_format))
+        state = sc._load_screen_state(verbose=False)
+        check((len(state["shown"]), state["to_score"], state["to_prefilter"]),
+              (1, [], []), "a cache from before scans were spread out loads "
+                           "as a finished scan")
 
         cached["scoring"] = None              # a scan from the old screener
         (Path(d) / "screen.json").write_text(json.dumps(cached))
-        check(sc._load_screen_cache(verbose=False), None,
+        check(sc._load_screen_state(verbose=False), None,
               "a cache scored any other way is not today's scan")
+
+
+def test_screen_universe_refusal() -> None:
+    section("screen_universe: a refusal mid-prefilter resumes next run")
+    refuse = {"RL"}
+
+    def fake_prefilter(t):
+        if t in refuse:
+            refuse.discard(t)                 # refused once, fine next run
+            return sc.ScreenResult(ticker=t, error=RATE_LIMITED)
+        return sc.ScreenResult(ticker=t, name=t, prefilter_failed=0)
+
+    scored: list = []
+    score = _fake_scorer({t: (0, 60.0) for t in ("AAA", "RL", "ZZZ")}, scored)
+    with tempfile.TemporaryDirectory() as d, \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_sp500_sp400=lambda verbose: ["AAA", "RL", "ZZZ"],
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 1000):
+        first = sc.screen_universe(score, max_workers=1, verbose=False)
+        check((scored, first["pending"]), ([], 3),
+              "run 1 stops at the refusal: nothing scored, nothing lost")
+        second = sc.screen_universe(score, max_workers=1, verbose=False)
+        check((sorted(scored), second["pending"],
+               len(second["passed"])), (["AAA", "RL", "ZZZ"], 0, 3),
+              "run 2 prefilters the rest and scores all three")
 
 
 def test_split() -> None:
@@ -478,7 +502,8 @@ def test_render_live_scores() -> None:
                                statement_pct_portfolio=0)
     held.composite_score, held.score_quality = 72.4, 81.0
     html = ap._render_screening_section(sr, {"HELD": held})
-    check("Screened 898 of 900 tickers (2 could not be fetched from Yahoo)" in html,
+    check("Screened 898 of 900 tickers against the 9-filter quality framework "
+          "(2 could not be fetched from Yahoo)." in html,
           True, "the header counts what was actually screened")
     check("from the day's scan at 7:01 AM ET" in html, True,
           "and says when the scan ran")
@@ -494,14 +519,20 @@ def test_render_live_scores() -> None:
     check("Composite Score: 65" in html, True,
           "an analysis that errored doesn't replace the scan's score")
 
+    html = ap._render_screening_section(dict(sr, pending=415), {})
+    check("Screening 900 tickers against the 9-filter quality framework; 415 "
+          "are still to go, and the next runs fill them in. So far" in html,
+          True, "a scan still in progress says so")
+
 
 # -------------------------------------------------------------------- main ----
 
 def main() -> int:
-    for t in (test_rate_limit_detection, test_gate, test_run_gated,
+    for t in (test_rate_limit_detection, test_budget, test_run_gated,
               test_quote_summary, test_prefilter_one, test_prefilter_universe,
               test_scorer_matches_the_holding, test_scorer_refusals,
-              test_growth_cache_guard, test_screen_universe, test_split,
+              test_growth_cache_guard, test_screen_universe,
+              test_screen_universe_refusal, test_split,
               test_render_live_scores):
         before = len(_results)
         t()

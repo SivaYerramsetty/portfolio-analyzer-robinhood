@@ -4857,8 +4857,8 @@ def _screen_scoring_inputs(ticker: str, name: str) -> tuple:
     return pa, info
 
 
-def score_screen_shortlist(results: list, gate, max_workers: int = 6,
-                           verbose: bool = True) -> None:
+def score_screen_shortlist(results: list, budget, max_workers: int = 6,
+                           verbose: bool = True) -> list:
     """Score the screen's shortlist the way analyze_position scores a holding.
 
     This is the scorer screener.screen_universe calls. The nine filters, the
@@ -4868,9 +4868,11 @@ def score_screen_shortlist(results: list, gate, max_workers: int = 6,
     screener used to score names with formulas of its own: the same weights
     on different inputs and scales, 5-8 points off on a typical name.)
 
-    Yahoo work goes through `gate`; a name Yahoo kept refusing gets an
-    `error` and is left out. The insider read (SEC) is made only for the names
-    the table shows: all nine filters passed, or one or two missed.
+    Yahoo work spends `budget` (a yahoo_limits.YahooBudget). The results it
+    didn't get to — the budget ran out, or Yahoo refused — come back untouched
+    for the next run; a name Yahoo has no data for gets an `error`. The
+    insider read (SEC) is made only for the names the table shows: all nine
+    filters passed, or one or two missed.
     """
     from screener import NEAR_MISS_MAX_FAILED
 
@@ -4881,22 +4883,23 @@ def score_screen_shortlist(results: list, gate, max_workers: int = 6,
         try:
             got = _screen_scoring_inputs(r.ticker, r.name)
         except Exception as e:
-            r.error = f"{type(e).__name__}: {e}"
             with lock:
                 gathered.pop(r.ticker, None)
-            return yahoo_limits.is_rate_limited(e)
+            if yahoo_limits.is_rate_limited(e):
+                return True
+            r.error = f"{type(e).__name__}: {e}"
+            return False
         r.error = None
         with lock:
             gathered[r.ticker] = got
         return False
 
     start = time.time()
-    refused = yahoo_limits.run_gated(results, fetch, gate=gate,
-                                     workers=max_workers, watch_counter=True)
-    for r in refused:
+    left = yahoo_limits.run_gated(results, fetch, budget=budget,
+                                  workers=max_workers, watch_counter=True)
+    for r in left:
         gathered.pop(r.ticker, None)
-        if not yahoo_limits.is_rate_limited(r.error):
-            r.error = "YFRateLimitError: Yahoo kept refusing"
+        r.error = None         # not a verdict on the name: the next run retries
     _flush_fund_cache()
 
     shown = []
@@ -4912,9 +4915,10 @@ def score_screen_shortlist(results: list, gate, max_workers: int = 6,
         if r.num_failed <= NEAR_MISS_MAX_FAILED:
             shown.append((r, pa, info))
     if verbose:
-        print(f"[screen] Scored {len(gathered)}/{len(results)} shortlisted "
+        print(f"[screen] Scored {len(gathered)} of {len(results)} queued "
               f"name(s) in {time.time() - start:.0f}s; {len(shown)} pass all "
-              f"nine filters or miss one or two.")
+              f"nine filters or miss one or two"
+              + (f"; {len(left)} wait for the next run" if left else "") + ".")
 
     start = time.time()
     if shown:
@@ -4932,6 +4936,7 @@ def score_screen_shortlist(results: list, gate, max_workers: int = 6,
     if verbose and shown:
         print(f"[screen] Insider reads for {len(shown)} name(s) in "
               f"{time.time() - start:.0f}s")
+    return left
 
 
 def _gh_repo_slug() -> str:
@@ -6383,6 +6388,7 @@ def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
     near_miss = _screen_rows_with_live_scores(sr.get("near_miss") or [], analyzed)
     uni = sr.get("universe_size", 0)
     unscreened = len(sr.get("unscreened") or [])
+    pending = sr.get("pending") or 0
     scanned = ""
     try:
         at = datetime.fromisoformat(sr.get("scanned_at") or "")
@@ -6391,12 +6397,18 @@ def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
         pass
 
     html = "<h2 style='margin-top:48px;'>📊 Screening — S&amp;P 500 + 400</h2>\n"
-    screened = (f"Screened {uni - unscreened} of {uni} tickers"
-                f" ({unscreened} could not be fetched from Yahoo)"
-                if unscreened else f"Screened {uni} tickers")
+    framework = "against the 9-filter quality framework"
+    if pending:
+        screened = (f"Screening {uni} tickers {framework}; {pending} are still "
+                    f"to go, and the next runs fill them in. So far")
+    elif unscreened:
+        screened = (f"Screened {uni - unscreened} of {uni} tickers {framework} "
+                    f"({unscreened} could not be fetched from Yahoo).")
+    else:
+        screened = f"Screened {uni} tickers {framework}."
     html += (
         f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:8px;">'
-        f"{screened} against the 9-filter quality framework. "
+        f"{screened} "
         f"<strong>{len(passed)}</strong> passed all 9; "
         f"<strong>{len(near_miss)}</strong> failed only 1-2 (near misses, sorted by score). "
         f"Scores are the report's Composite, from the day's scan{scanned}; a name "
@@ -11474,9 +11486,10 @@ def main():
     ap.add_argument("--screen", action="store_true",
                     help="Run S&P 500/400 screening and add the screening "
                          "section. The scan runs at most once per market day "
-                         "and is cached in .cache/, so the first run of the "
-                         "day pays for it (~10 min, more if Yahoo rate-limits "
-                         "and it has to wait) and the rest reuse it.")
+                         "and is cached in .cache/. Each run spends at most "
+                         "SCREEN_REQUEST_BUDGET Yahoo requests on it (default "
+                         "1500), so a day's scan completes over the first few "
+                         "runs and the rest reuse it.")
     ap.add_argument("--screen-limit", type=int, default=None,
                     help="Cap the screening universe size (e.g. 50 for a fast "
                          "test). A limited run never reads or writes the "
@@ -11831,8 +11844,10 @@ def main():
                 score_screen_shortlist, limit=args.screen_limit,
                 force=args.rescan, verbose=True)
             passed = screening_results["passed"]
+            pending = screening_results.get("pending") or 0
             print(f"[screen] Passed: {len(passed)}  "
-                  f"Near-miss: {len(screening_results['near_miss'])}")
+                  f"Near-miss: {len(screening_results['near_miss'])}"
+                  + (f"  Still to screen: {pending}" if pending else ""))
 
             # Append the best passers to the Screening watchlist, then put them
             # straight into this run's universe. Pruning removes them again

@@ -18,9 +18,9 @@ The scan runs in two stages:
 
   1. Prefilter — one Yahoo request per name (quoteSummary) and a rough reading
      of the nine filters from trailing numbers. It exists to drop the names
-     that plainly fail, cheaply: Yahoo refuses an IP for a few minutes after
-     about 2,500 requests (see yahoo_limits), and full scoring costs about
-     seven requests a name.
+     that plainly fail, cheaply: Yahoo blocks an IP once it has made a few
+     thousand requests (see yahoo_limits), and full scoring costs about seven
+     requests a name.
   2. Scoring — the caller scores the shortlist. The report passes
      analyze_portfolio.score_screen_shortlist, which runs the same filters,
      sub-scores and Composite as every holding and watchlist row, so the
@@ -31,9 +31,10 @@ Per-stock fields the Screening table shows besides the scores:
     52w Pos    — where price sits in 52-week range (0% = low, 100% = high)
     #F         — number of filters failed (near misses fail 1 or 2)
 
-screen_universe() is the entry point the report uses. It scans at most once
-per market day (cached in .cache/screen.json), which is what makes the scan
-cheap enough to run inside a report that regenerates every 10 minutes.
+screen_universe() is the entry point the report uses. It scans once per
+market day (cached in .cache/screen.json), spending a capped number of Yahoo
+requests per run and leaving the rest to the next run, which is what makes the
+scan cheap enough to run inside a report that regenerates every 10 minutes.
 """
 
 from __future__ import annotations
@@ -407,11 +408,14 @@ def _workers(max_workers: Optional[int] = None) -> int:
         return 6
 
 
-def prefilter_universe(tickers: list[str], *, gate: yl.YahooGate,
+def prefilter_universe(tickers: list[str], *, budget: yl.YahooBudget,
                        max_workers: Optional[int] = None, log_every: int = 50,
-                       verbose: bool = True) -> list[ScreenResult]:
-    """Stage 1 over every ticker, in input order. A name Yahoo kept refusing
-    comes back carrying a rate-limit `error` instead of quietly going missing."""
+                       verbose: bool = True) -> tuple[list[ScreenResult], list[str]]:
+    """Stage 1 over `tickers` until `budget` runs out.
+
+    Returns (results, left): a result for every name fetched — or failed for
+    good, carrying its `error` — in input order, and the names to try again on
+    a later run because Yahoo refused or the budget ran out first."""
     total = len(tickers)
     results: dict[str, ScreenResult] = {}
     lock = threading.Lock()
@@ -420,9 +424,11 @@ def prefilter_universe(tickers: list[str], *, gate: yl.YahooGate,
 
     def fetch(t: str) -> bool:
         r = prefilter_one(t)
-        with lock:
-            results[t] = r
-        return yl.is_rate_limited(r.error)
+        refused = yl.is_rate_limited(r.error)
+        if not refused:
+            with lock:
+                results[t] = r
+        return refused
 
     def progress(_t: str) -> None:
         with lock:
@@ -435,14 +441,9 @@ def prefilter_universe(tickers: list[str], *, gate: yl.YahooGate,
             rate = n / elapsed if elapsed > 0 else 0
             print(f"  [{n:>4}/{total}]  {rate:.1f}/s  shortlisted so far: {short}")
 
-    refused = yl.run_gated(tickers, fetch, gate=gate,
-                           workers=_workers(max_workers), on_done=progress)
-    for t in refused:
-        r = results.get(t) or ScreenResult(ticker=t)
-        if not yl.is_rate_limited(r.error):
-            r.error = "YFRateLimitError: Yahoo kept refusing"
-        results[t] = r
-    return [results[t] for t in tickers]
+    left = yl.run_gated(tickers, fetch, budget=budget,
+                        workers=_workers(max_workers), on_done=progress)
+    return [results[t] for t in tickers if t in results], left
 
 
 # ============================================================
@@ -474,13 +475,15 @@ def split_passers_and_near_misses(
 
 
 # ============================================================
-# Once-a-day universe scan
+# Once-a-day universe scan, spread over runs
 # ============================================================
-# The scan is the slowest thing the analyzer can do — a fundamentals pull for
-# every S&P 500/400 name. Scheduled report runs fire every 10 minutes, so the
-# result is cached per market day in .cache/ (gitignored; carried across CI
-# runs by the Actions cache). The first run of the day pays for the scan and
-# the rest of the day reads it back.
+# The scan is the slowest thing the analyzer can do: ~900 prefilter requests
+# plus ~7 per shortlisted name, ~4,400 Yahoo requests in all. It is cached per
+# market day in .cache/ (gitignored; carried across CI runs by the Actions
+# cache) together with what is still to do. Each run spends at most the
+# request budget on it and leaves the rest to the next run, so a day's scan
+# completes over the first few runs: the 7:00 ET run and the first ones after
+# the open.
 
 _SCREEN_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "screen.json"
 _ET = ZoneInfo("America/New_York")
@@ -489,12 +492,23 @@ _ET = ZoneInfo("America/New_York")
 _CACHE_SCORING = "report"
 
 
+def _request_budget() -> int:
+    """The Yahoo requests one run's scan may make (SCREEN_REQUEST_BUDGET).
+    Well under the few thousand after which Yahoo blocks a runner, so the
+    holdings analysis later in the same run still has room."""
+    try:
+        return max(0, int(os.environ.get("SCREEN_REQUEST_BUDGET", "1500")))
+    except ValueError:
+        return 1500
+
+
 def _market_today() -> str:
     """Today's date in market time — the cache key for a day's scan."""
     return _dt.datetime.now(_ET).date().isoformat()
 
 
-def _load_screen_cache(verbose: bool = True) -> Optional[dict]:
+def _load_screen_state(verbose: bool = True) -> Optional[dict]:
+    """Today's scan as far as it got, or None to start one."""
     try:
         cached = json.loads(_SCREEN_CACHE_PATH.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -502,43 +516,65 @@ def _load_screen_cache(verbose: bool = True) -> Optional[dict]:
     if (not isinstance(cached, dict) or cached.get("date") != _market_today()
             or cached.get("scoring") != _CACHE_SCORING):
         return None
+    shown = cached.get("shown")
+    if shown is None:      # written before scans were spread over runs
+        shown = (cached.get("passed") or []) + (cached.get("near_miss") or [])
     try:
-        out = {
-            "passed": [ScreenResult(**d) for d in cached.get("passed") or []],
-            "near_miss": [ScreenResult(**d) for d in cached.get("near_miss") or []],
+        state = {
+            "scanned_at": cached.get("scanned_at"),
             "universe_size": cached.get("universe_size", 0),
             "unscreened": list(cached.get("unscreened") or []),
-            "scanned_at": cached.get("scanned_at"),
-            "from_cache": True,
+            "to_prefilter": list(cached.get("to_prefilter") or []),
+            "to_score": [ScreenResult(**d) for d in cached.get("to_score") or []],
+            "shown": [ScreenResult(**d) for d in shown],
         }
     except TypeError:
         return None      # cache written by an older ScreenResult shape
     if verbose:
-        print(f"[screen] Reusing today's scan from {_SCREEN_CACHE_PATH} "
-              f"({len(out['passed'])} passed, {len(out['near_miss'])} near-miss, "
-              f"scanned {out['scanned_at']}).")
-    return out
+        pending = len(state["to_prefilter"]) + len(state["to_score"])
+        print(f"[screen] {'Continuing' if pending else 'Reusing'} today's scan "
+              f"from {_SCREEN_CACHE_PATH} (started {state['scanned_at']}; "
+              f"{len(state['shown'])} shown so far"
+              + (f", {len(state['to_prefilter'])} to prefilter, "
+                 f"{len(state['to_score'])} to score" if pending else "")
+              + ").")
+    return state
 
 
-def _save_screen_cache(out: dict, verbose: bool = True) -> None:
+def _save_screen_state(state: dict, verbose: bool = True) -> None:
     try:
         _SCREEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _SCREEN_CACHE_PATH.write_text(json.dumps({
             "date": _market_today(),
             "scoring": _CACHE_SCORING,
-            "scanned_at": out.get("scanned_at"),
-            "universe_size": out.get("universe_size", 0),
-            "unscreened": out.get("unscreened") or [],
-            "passed": [asdict(r) for r in out.get("passed") or []],
-            "near_miss": [asdict(r) for r in out.get("near_miss") or []],
+            "scanned_at": state["scanned_at"],
+            "universe_size": state["universe_size"],
+            "unscreened": state["unscreened"],
+            "to_prefilter": state["to_prefilter"],
+            "to_score": [asdict(r) for r in state["to_score"]],
+            "shown": [asdict(r) for r in state["shown"]],
         }))
     except OSError as e:
         if verbose:
             print(f"[screen] Could not write scan cache ({e})")
 
 
-# score(shortlist, gate=, max_workers=, verbose=) scores the shortlist in place.
-Scorer = Callable[..., None]
+def _scan_output(state: dict, from_cache: bool) -> dict:
+    passed, near = split_passers_and_near_misses(state["shown"])
+    return {
+        "passed": passed,
+        "near_miss": near,
+        "universe_size": state["universe_size"],
+        "unscreened": sorted(state["unscreened"]),
+        "pending": len(state["to_prefilter"]) + len(state["to_score"]),
+        "scanned_at": state["scanned_at"],
+        "from_cache": from_cache,
+    }
+
+
+# score(shortlist, budget=, max_workers=, verbose=) scores what it can of the
+# shortlist in place and returns the results it didn't get to.
+Scorer = Callable[..., list]
 
 
 def screen_universe(
@@ -548,64 +584,78 @@ def screen_universe(
     force: bool = False,
     verbose: bool = True,
 ) -> dict:
-    """Scan the S&P 500 + 400 universe, at most once per market day.
+    """Scan the S&P 500 + 400 universe once per market day, over as many runs
+    as the request budget needs.
 
-    `score` gets the prefilter's shortlist and fills in, on each result, the
+    `score` gets the shortlist and fills in, on each result it finishes, the
     nine filters (passes / num_passed / num_failed), the sub-scores, the
-    Composite and the insider read — or an `error`. Yahoo work inside it
-    should go through the gate it is handed.
+    Composite and the insider read — or an `error`. It returns the results it
+    didn't get to (budget spent, or Yahoo refused), which wait for the next
+    run. Its Yahoo work should go through the budget it is handed.
 
-    Returns {"passed", "near_miss", "universe_size", "unscreened",
-    "scanned_at", "from_cache"}. `unscreened` lists the tickers that could not
-    be fetched (most often: Yahoo kept refusing). `limit` caps the universe
-    for a fast test and neither reads nor writes the day's cache, so a test
-    run can't stand in for the real scan.
+    Returns {"passed", "near_miss", "universe_size", "unscreened", "pending",
+    "scanned_at", "from_cache"}. `pending` counts the names still to prefilter
+    or score; `unscreened` lists the names Yahoo had no data for. `limit` caps
+    the universe for a fast test, lifts the request budget, and neither reads
+    nor writes the day's cache, so a test run can't stand in for the real scan.
     """
-    if not force and not limit:
-        cached = _load_screen_cache(verbose=verbose)
-        if cached:
-            return cached
+    state = None if (force or limit) else _load_screen_state(verbose=verbose)
+    if state and not state["to_prefilter"] and not state["to_score"]:
+        return _scan_output(state, from_cache=True)
 
     yl.install()
-    universe = fetch_sp500_sp400(verbose=verbose)
-    if limit:
-        universe = universe[:limit]
+    if state is None:
+        universe = fetch_sp500_sp400(verbose=verbose)
+        if limit:
+            universe = universe[:limit]
+            if verbose:
+                print(f"[screen] Limiting to first {limit} tickers (test run; "
+                      f"not cached).")
+        state = {
+            "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
+            "universe_size": len(universe),
+            "unscreened": [], "to_prefilter": list(universe),
+            "to_score": [], "shown": [],
+        }
+    budget = yl.YahooBudget(None if limit else _request_budget())
+    workers = _workers(max_workers)
+
+    if state["to_prefilter"]:
+        start = time.time()
+        fetched, left = prefilter_universe(state["to_prefilter"], budget=budget,
+                                           max_workers=workers, verbose=verbose)
+        state["unscreened"] += [r.ticker for r in fetched if r.error]
+        # Fewest misses first: the names likeliest to pass are scored first.
+        state["to_score"] = sorted(
+            state["to_score"] + [r for r in fetched if not r.error
+                                 and r.prefilter_failed <= PREFILTER_MAX_FAILED],
+            key=lambda r: r.prefilter_failed)
+        state["to_prefilter"] = left
         if verbose:
-            print(f"[screen] Limiting to first {limit} tickers (test run; "
-                  f"not cached).")
-    gate = yl.YahooGate()
-    start = time.time()
-    raw = prefilter_universe(universe, gate=gate, max_workers=max_workers,
-                             verbose=verbose)
-    # Fewest misses first: if Yahoo cuts the scan short, the names likeliest
-    # to pass have already been scored.
-    shortlist = sorted((r for r in raw if not r.error
-                        and r.prefilter_failed <= PREFILTER_MAX_FAILED),
-                       key=lambda r: r.prefilter_failed)
-    if verbose:
-        fetched = sum(1 for r in raw if not r.error)
-        print(f"[screen] Prefilter: {fetched}/{len(universe)} fetched in "
-              f"{time.time() - start:.0f}s; {len(shortlist)} within "
-              f"{PREFILTER_MAX_FAILED} misses go on to full scoring.")
-    score(shortlist, gate=gate, max_workers=_workers(max_workers),
-          verbose=verbose)
-    passed, near = split_passers_and_near_misses(shortlist)
-    unscreened = sorted(r.ticker for r in raw if r.error)
-    refused = sorted(r.ticker for r in raw if yl.is_rate_limited(r.error))
-    if verbose and refused:
-        shown = ", ".join(refused[:40]) + (" …" if len(refused) > 40 else "")
-        print(f"[screen] ⚠ {len(refused)} name(s) not screened — Yahoo kept "
-              f"refusing (rate limit): {shown}")
-    out = {
-        "passed": passed,
-        "near_miss": near,
-        "universe_size": len(universe),
-        "unscreened": unscreened,
-        "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
-        "from_cache": False,
-    }
+            print(f"[screen] Prefilter: {len(fetched)} fetched in "
+                  f"{time.time() - start:.0f}s; {len(state['to_score'])} within "
+                  f"{PREFILTER_MAX_FAILED} misses queued for full scoring"
+                  + (f"; {len(left)} left for the next run" if left else "")
+                  + ".")
+
+    if state["to_score"] and not budget.spent():
+        batch = state["to_score"]
+        left = score(batch, budget=budget, max_workers=workers,
+                     verbose=verbose) or []
+        unfinished = {id(r) for r in left}
+        done = [r for r in batch if id(r) not in unfinished]
+        state["unscreened"] += [r.ticker for r in done if r.error]
+        passed, near = split_passers_and_near_misses(done)
+        state["shown"] += passed + near
+        state["to_score"] = left
+
+    out = _scan_output(state, from_cache=False)
+    if verbose and out["pending"]:
+        why = "Yahoo refused" if budget.stopped else "request budget spent"
+        print(f"[screen] {out['pending']} name(s) left for the next run "
+              f"({why} after {budget.used()} requests).")
     if not limit:
-        _save_screen_cache(out, verbose=verbose)
+        _save_screen_state(state, verbose=verbose)
     return out
 
 
@@ -617,9 +667,9 @@ if __name__ == "__main__":
     test = ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "MU", "TSLA", "JNJ"]
     print(f"Screening {len(test)} test tickers...")
     yl.install()
-    gate = yl.YahooGate()
-    res = prefilter_universe(test, gate=gate, log_every=1)
-    score_screen_shortlist([r for r in res if not r.error], gate=gate,
+    budget = yl.YahooBudget()
+    res, _ = prefilter_universe(test, budget=budget, log_every=1)
+    score_screen_shortlist([r for r in res if not r.error], budget=budget,
                            max_workers=4)
     passed, near = split_passers_and_near_misses(res)
     print(f"\nPassed (9/9): {[r.ticker for r in passed]}")

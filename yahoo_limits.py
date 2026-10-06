@@ -3,41 +3,47 @@ yahoo_limits.py
 ---------------
 Keeps bulk Yahoo Finance work inside the limit Yahoo actually enforces.
 
-Measured 2026-10-05, from a GitHub runner and from a home connection alike:
-after roughly 2,500 requests within a couple of minutes, Yahoo answers 429
-("Too Many Requests") to everything from that IP for about three minutes.
-Pacing alone does not avoid it — a run held to ~19 requests/s was cut off at
-~2,400 — so bulk work has to make fewer requests, stop the moment Yahoo starts
-refusing, and retry what failed once the block has passed.
+Yahoo answers 429 ("Too Many Requests") to everything from an IP once it has
+made a few thousand requests in a short span: ~2,500 in tests from a home
+connection on 2026-10-05, ~2,600 and ~3,800 on two GitHub runners. From home
+the block lifted after about three minutes. On a runner it did not: it
+outlasted three 4-minute pauses and was still refusing some requests 20
+minutes later, by which time the holdings analysis was running into it
+(2026-10-06, the first scan with this module: GOOG and BX errored). Pacing
+doesn't help either; a run held to ~19 requests/s was cut off at ~2,400.
+
+So bulk work here never waits out a block. It spends a fixed allowance of
+requests per run, stops at the first refusal, and leaves the rest for the
+next run — which, in CI, starts on a fresh IP.
 
 Two pieces:
 
-  * A refusal counter. install() wraps yfinance's request method so every 429
-    is counted. The counter is what makes a refusal visible at all: yfinance
-    swallows the error in several places — a refused financial-statement
-    fetch comes back as an empty table, indistinguishable from a company that
-    has none.
-  * YahooGate and run_gated(). The gate closes on the first refusal; workers
-    wait out the cool-down, then retry the names that failed.
+  * Counters. install() wraps yfinance's request method to count every
+    request and every 429. The refusal count is what makes a refusal visible
+    at all: yfinance swallows the error in several places — a refused
+    financial-statement fetch comes back as an empty table, indistinguishable
+    from a company that has none.
+  * YahooBudget and run_gated(): one run's allowance, and a thread pool that
+    stops starting work once the allowance is spent or Yahoo refuses.
 """
 
 from __future__ import annotations
 
 import functools
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, Optional
 
 _lock = threading.Lock()
+_requests = 0
 _refusals = 0
 _installed = False
 
 
 def install() -> bool:
-    """Count every 429 yfinance receives. Idempotent. Returns False when
-    yfinance's internals have moved, in which case only the refusals that
-    surface as exceptions are seen."""
+    """Count every request and 429 that goes through yfinance. Idempotent.
+    Returns False when yfinance's internals have moved, in which case only
+    the refusals that surface as exceptions are seen."""
     global _installed
     with _lock:
         if _installed:
@@ -49,17 +55,19 @@ def install() -> bool:
             return False
         if getattr(YfData, "get", None) is None:
             return False
-        _count_refusals(YfData, YFRateLimitError)
+        _count_requests(YfData, YFRateLimitError)
         _installed = True
         return True
 
 
-def _count_refusals(cls, error: type) -> None:
-    """Wrap cls.get so each `error` it raises is counted, then re-raised."""
+def _count_requests(cls, error: type) -> None:
+    """Wrap cls.get so each call is counted, and each `error` it raises is
+    counted as a refusal and re-raised."""
     original = cls.get
 
     @functools.wraps(original)
     def get(self, *args, **kwargs):
+        note_request()
         try:
             return original(self, *args, **kwargs)
         except error:
@@ -69,10 +77,22 @@ def _count_refusals(cls, error: type) -> None:
     cls.get = get
 
 
+def note_request() -> None:
+    global _requests
+    with _lock:
+        _requests += 1
+
+
 def note_refusal() -> None:
     global _refusals
     with _lock:
         _refusals += 1
+
+
+def requests() -> int:
+    """How many requests this process has sent through yfinance."""
+    with _lock:
+        return _requests
 
 
 def refusals() -> int:
@@ -90,90 +110,67 @@ def is_rate_limited(err) -> bool:
             or "Rate limited" in text)
 
 
-class YahooGate:
-    """Closes on Yahoo's first refusal and reopens after a cool-down.
+class YahooBudget:
+    """One run's allowance of Yahoo requests, and its stop switch.
 
-    Workers call wait() before each name. trip() closes the gate — once per
-    block, however many workers saw the refusal — and returns False once the
-    scan has used up its cool-downs, so the caller gives up on what is left
-    instead of waiting indefinitely.
-    """
+    `limit` is how many yfinance requests the run may make (None: no cap).
+    The first refusal stops the run outright — waiting a block out costs
+    more than it saves (see the module docstring)."""
 
-    def __init__(self, cooldown_s: float = 240.0, max_trips: int = 3,
-                 sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic,
+    def __init__(self, limit: Optional[int] = None,
                  log: Callable[[str], None] = print):
-        self.cooldown_s = cooldown_s
-        self.max_trips = max_trips
-        self.trips = 0
-        self.exhausted = False       # out of cool-downs: stop sending requests
-        self._sleep, self._clock, self._log = sleep, clock, log
+        self.limit = limit
+        self.stopped = False         # Yahoo refused: send nothing more
+        self._start = requests()
+        self._log = log
         self._lock = threading.Lock()
-        self._reopen_at = 0.0
 
-    def wait(self) -> None:
-        while True:
-            with self._lock:
-                left = self._reopen_at - self._clock()
-            if left <= 0:
-                return
-            self._sleep(min(left, 5.0))
+    def used(self) -> int:
+        return requests() - self._start
 
-    def trip(self) -> bool:
-        """Report a refusal. True: wait() and retry. False: out of cool-downs."""
+    def spent(self) -> bool:
+        return self.stopped or (self.limit is not None
+                                and self.used() >= self.limit)
+
+    def refused(self) -> None:
         with self._lock:
-            now = self._clock()
-            if now < self._reopen_at:      # this block is already being waited out
-                return True
-            if self.trips >= self.max_trips:
-                if not self.exhausted:
-                    self.exhausted = True
-                    self._log(f"[yahoo] Still rate limited after "
-                              f"{self.max_trips} cool-downs — giving up on "
-                              f"the names left.")
-                return False
-            self.trips += 1
-            self._reopen_at = now + self.cooldown_s
-            n = self.trips
-        self._log(f"[yahoo] Rate limited (429) — pausing {self.cooldown_s:.0f}s, "
-                  f"then retrying (cool-down {n} of {self.max_trips}).")
-        return True
+            if self.stopped:
+                return
+            self.stopped = True
+        self._log("[yahoo] Rate limited (429) — stopping here; the next run "
+                  "picks up the rest.")
 
 
 def run_gated(items: Iterable, fn: Callable[[object], bool], *,
-              gate: YahooGate, workers: int = 6, attempts: int = 3,
+              budget: YahooBudget, workers: int = 6,
               watch_counter: bool = False,
               on_done: Optional[Callable[[object], None]] = None) -> list:
-    """Run fn over items on a thread pool, retrying through `gate`.
+    """Run fn over items on a thread pool until `budget` is spent.
 
     fn(item) does the work and returns True when its own result shows a
     refusal. With watch_counter, an attempt during which the process received
     any 429 also counts as refused — that is how a swallowed refusal (an
-    empty financial statement) gets retried instead of scored. on_done(item)
-    runs after each item's last attempt, for progress output.
+    empty financial statement) is caught instead of scored. A refusal stops
+    the budget; items not yet started then stay unstarted. on_done(item) runs
+    after each item that was started, for progress output.
 
-    Returns the items still refused after `attempts` tries or once the gate
-    ran out of cool-downs; the caller decides what to record for them.
+    Returns the items not done — refused, or never started — in input order.
     """
     items = list(items)
     if not items:
         return []
 
     def one(item) -> bool:
-        try:
-            for _ in range(attempts):
-                gate.wait()
-                if gate.exhausted:
-                    return False
-                before = refusals()
-                refused = fn(item)
-                if watch_counter and refusals() != before:
-                    refused = True
-                if not refused:
-                    return True
-                if not gate.trip():
-                    return False
+        if budget.spent():
             return False
+        try:
+            before = refusals()
+            refused = fn(item)
+            if watch_counter and refusals() != before:
+                refused = True
+            if refused:
+                budget.refused()
+            return not refused
         finally:
             if on_done is not None:
                 on_done(item)
