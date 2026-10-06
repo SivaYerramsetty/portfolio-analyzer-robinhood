@@ -162,6 +162,7 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo   # Python 3.9+; add near top of file if not already there
 import math as _math
 import argparse
+import copy
 import csv
 import io
 import json
@@ -180,6 +181,12 @@ from pathlib import Path
 from typing import Optional
 
 import yfinance as yf
+
+import yahoo_limits
+
+# Count every 429 Yahoo sends, so data fetched while Yahoo was refusing is
+# never cached or scored as if it were complete (see yahoo_limits).
+yahoo_limits.install()
 
 try:
     import requests  # for Finnhub
@@ -2436,7 +2443,11 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
     """Cache-aware wrapper around _compute_multi_year_growth(). On a fresh cache
     hit, inject the stored metrics and skip the income_stmt + balance_sheet
     fetches; otherwise compute live and stage the result in memory (the disk
-    write is batched once per run by _flush_fund_cache())."""
+    write is batched once per run by _flush_fund_cache()).
+
+    Nothing is cached if Yahoo refused any request meanwhile: yfinance turns a
+    refused statement fetch into an empty table, and caching what came of it
+    would score the name on 1-year fallbacks for the next 24 hours."""
     global _fund_cache_dirty, _fund_hits, _fund_misses
     ttl = _fundamentals_ttl_hours()
     if ttl > 0:
@@ -2449,14 +2460,18 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
                 _fund_hits += 1
             return  # cache hit — no statement fetches
 
+    refusals_before = yahoo_limits.refusals()
     _compute_multi_year_growth(tkr, info)
 
     if ttl > 0:
+        refused = yahoo_limits.refusals() != refusals_before
         metrics = {k: info[k] for k in _GROWTH_METRIC_KEYS if k in info}
         with _fund_cache_lock:
-            _load_fund_cache()[ticker] = {"ts": time.time(), "metrics": metrics}
-            _fund_cache_dirty = True
             _fund_misses += 1
+            if not refused:
+                _load_fund_cache()[ticker] = {"ts": time.time(),
+                                              "metrics": metrics}
+                _fund_cache_dirty = True
 
 
 def _flush_fund_cache() -> None:
@@ -2964,8 +2979,10 @@ def _value_sub_score(pe: Optional[float], peg: Optional[float],
 
 def compute_composite_score(pa, info: dict) -> None:
     """
-    Populate pa.score_{quality,growth,value,analyst} and pa.composite_score
-    using the same weights as the screener: 35/25/20/20.
+    Populate pa.score_{quality,growth,value,analyst} and pa.composite_score:
+    quality 30%, growth 20%, value 20%, analyst 15%, insider 15%. This is the
+    report's one Composite — the Screening table scores its names through it
+    too (score_screen_shortlist).
 
     Each sub-score is 0-100. Missing data sub-scores are dropped from the
     weighted average rather than treated as 0 — fairer to limited-coverage
@@ -2989,7 +3006,7 @@ def compute_composite_score(pa, info: dict) -> None:
     fcf = _safe_get(info, "freeCashflow")
     fcf_growing = info.get("_fcfGrowing")
 
-    # Quality (35%): ROE, op margin, D/E, quick, FCF positive & growing
+    # Quality (30%): ROE, op margin, D/E, quick, FCF positive & growing
     q_components = []
     if roe is not None:
         q_components.append(_clip01(roe / 0.30))      # 30% ROE -> 100
@@ -3009,7 +3026,7 @@ def compute_composite_score(pa, info: dict) -> None:
     if q_components:
         pa.score_quality = round(sum(q_components) / len(q_components) * 100, 1)
 
-    # Growth (25%): revenue and earnings YoY
+    # Growth (20%): revenue and earnings growth (3-year CAGR, else YoY)
     g_components = []
     if rev_g is not None:
         g_components.append(_clip01(rev_g / 0.30))   # 30% growth -> 100
@@ -3028,7 +3045,7 @@ def compute_composite_score(pa, info: dict) -> None:
     pa.score_value = _value_sub_score(pe, peg, calibrated=False)
     pa.score_value_cal = _value_sub_score(pe, peg, calibrated=True)
 
-    # Analyst (20%): rec_avg (lower = better) + number of analysts (more = more conviction)
+    # Analyst (15%): rec_avg (lower = better) + number of analysts (more = more conviction)
     if pa.rating_breakdown and pa.rating_breakdown.get("total"):
         rec_avg = pa.rating_breakdown.get("rec_avg")
         if rec_avg is not None:
@@ -4175,6 +4192,154 @@ def _extract_next_earnings(info: dict) -> tuple[Optional[str], Optional[int]]:
     return best.isoformat(), (best - today).days
 
 
+def _set_fcf_growing(tkr, info: dict) -> None:
+    """info["_fcfGrowing"]: whether the latest annual free cash flow is
+    positive and above the year before (None when the statement is
+    missing). The composite's quality sub-score reads it, and the FCF
+    filter falls back to it when there is no multi-year history."""
+    info["_fcfGrowing"] = None  # default: unknown
+    try:
+        cf = tkr.cashflow
+        if cf is not None and not cf.empty:
+            fcf_series = None
+            if "Free Cash Flow" in cf.index:
+                fcf_series = cf.loc["Free Cash Flow"].dropna()
+            elif (("Operating Cash Flow" in cf.index)
+                  and ("Capital Expenditure" in cf.index)):
+                op = cf.loc["Operating Cash Flow"]
+                capex = cf.loc["Capital Expenditure"]
+                fcf_series = (op + capex).dropna()
+            if fcf_series is not None and len(fcf_series) >= 2:
+                current_fcf = float(fcf_series.iloc[0])
+                prior_fcf = float(fcf_series.iloc[1])
+                info["_fcfGrowing"] = bool(
+                    current_fcf > prior_fcf and current_fcf > 0
+                )
+    except Exception:
+        pass
+
+
+def _gather_analyst_ratings(pa, tkr, info: dict, ticker: str,
+                            use_robinhood_ratings: bool) -> None:
+    """Fill pa.rating_breakdown / pa.num_analysts from Robinhood (when
+    asked), Finnhub (when keyed) and Yahoo, letting Robinhood or Finnhub
+    override the Yahoo price targets already on pa."""
+    # Build aggregated ratings: combine Robinhood + Finnhub + Yahoo
+    from analyst_aggregator import normalize_breakdown, aggregate
+    rh_norm = fh_norm = yh_norm = None
+
+    # 1. Robinhood
+    if use_robinhood_ratings:
+        try:
+            from robinhood_source import (
+                fetch_robinhood_ratings, fetch_robinhood_price_target,
+            )
+            rh_rating = fetch_robinhood_ratings(ticker)
+            if rh_rating:
+                rh_norm = normalize_breakdown(
+                    buy=rh_rating.get("buy", 0),
+                    hold=rh_rating.get("hold", 0),
+                    sell=rh_rating.get("sell", 0),
+                    source="robinhood",
+                )
+            rh_target = fetch_robinhood_price_target(ticker)
+            if rh_target and rh_target.get("targetMean"):
+                pa.target_mean = rh_target["targetMean"]
+                pa.target_high = rh_target.get("targetHigh") or pa.target_high
+                pa.target_low = rh_target.get("targetLow") or pa.target_low
+        except Exception as e:
+            print(f"[robinhood-ratings] {ticker}: {e}")
+
+    # 2. Finnhub
+    if FINNHUB_API_KEY:
+        fh_target = fetch_finnhub_price_target(ticker)
+        if fh_target:
+            # Only override target if Robinhood didn't provide one
+            if not (use_robinhood_ratings and pa.target_mean):
+                if fh_target.get("targetMean"):
+                    pa.target_mean = fh_target["targetMean"]
+                if fh_target.get("targetHigh"):
+                    pa.target_high = fh_target["targetHigh"]
+                if fh_target.get("targetLow"):
+                    pa.target_low = fh_target["targetLow"]
+        fh_rec = fetch_finnhub_recommendation(ticker)
+        if fh_rec:
+            fh_norm = normalize_breakdown(
+                buy=fh_rec.get("strongBuy", 0) + fh_rec.get("buy", 0),
+                hold=fh_rec.get("hold", 0),
+                sell=fh_rec.get("strongSell", 0) + fh_rec.get("sell", 0),
+                source="finnhub",
+            )
+        time.sleep(0.05)
+
+    # 3. Yahoo Finance (always — comes from info we already have)
+    # yfinance .info exposes: numberOfAnalystOpinions, recommendationMean,
+    # recommendationKey. For lot-count breakdown we use the latest row of
+    # tkr.recommendations if available; else estimate from rec_mean.
+    try:
+        rec_df = tkr.recommendations
+        if rec_df is not None and not rec_df.empty:
+            # Most recent row sums per category
+            latest = rec_df.iloc[0]
+            yb = int(latest.get("strongBuy", 0) or 0) + int(latest.get("buy", 0) or 0)
+            yh = int(latest.get("hold", 0) or 0)
+            ys = int(latest.get("sell", 0) or 0) + int(latest.get("strongSell", 0) or 0)
+            if yb + yh + ys > 0:
+                yh_norm = normalize_breakdown(yb, yh, ys, "yahoo")
+    except Exception:
+        pass
+    # Fallback: use recommendationMean if no breakdown rows
+    if yh_norm is None:
+        rec_mean = _safe_get(info, "recommendationMean")
+        n_an = info.get("numberOfAnalystOpinions") or 0
+        if rec_mean and n_an:
+            # Reverse-engineer a buy/hold/sell split from rec_mean & count.
+            # rec_mean ~1.5 = mostly buys, ~3 = mostly holds, ~4.5 = mostly sells.
+            # Simple heuristic split (good enough for aggregation weighting).
+            if rec_mean < 2.0:
+                yb, yh, ys = int(n_an * 0.85), int(n_an * 0.15), 0
+            elif rec_mean < 2.5:
+                yb, yh, ys = int(n_an * 0.65), int(n_an * 0.30), int(n_an * 0.05)
+            elif rec_mean < 3.0:
+                yb, yh, ys = int(n_an * 0.40), int(n_an * 0.50), int(n_an * 0.10)
+            elif rec_mean < 3.5:
+                yb, yh, ys = int(n_an * 0.20), int(n_an * 0.60), int(n_an * 0.20)
+            else:
+                yb, yh, ys = int(n_an * 0.10), int(n_an * 0.40), int(n_an * 0.50)
+            if yb + yh + ys > 0:
+                yh_norm = normalize_breakdown(yb, yh, ys, "yahoo")
+
+    # Aggregate all three (drops Nones internally)
+    agg = aggregate(rh_norm, fh_norm, yh_norm)
+    if agg:
+        pa.rating_breakdown = agg
+        pa.num_analysts = agg["total"]
+
+
+def _set_insider_scores(pa, ticker: str, info: dict) -> None:
+    """pa.insider_activity and its two scores (standard and recalibrated),
+    from the last 90 days of SEC Form 4s."""
+    try:
+        from insider_trading import get_insider_activity, insider_score
+        pa.insider_activity = get_insider_activity(ticker, lookback_days=90)
+        # Pass market cap so the score scales sells by company size —
+        # $163M selling at $4T NVDA is very different from $163M at $5B
+        market_cap = info.get("marketCap")
+        pa.score_insider = insider_score(pa.insider_activity, market_cap=market_cap)
+        # The recalibrated read: identical except that a no-information
+        # outcome (below-noise selling, RSU withholding, compensation only)
+        # comes back as None so the weight renormalizes away — finding 1.
+        pa.score_insider_cal = insider_score(
+            pa.insider_activity, market_cap=market_cap,
+            neutral_as_missing=True)
+        # Stash the score on the activity dict so the renderer can use it
+        # to decide between "Caution" and "No signal" for selling cases.
+        if pa.insider_activity is not None:
+            pa.insider_activity["_score"] = pa.score_insider
+    except Exception as e:
+        print(f"[insider] {ticker}: {e}")
+
+
 def analyze_position(
     row: dict,
     use_robinhood_ratings: bool = False,
@@ -4284,26 +4449,7 @@ def analyze_position(
             pa.day_change_pct = _chg / pa.prev_close * 100
 
         # Determine FCF YoY growth from historical cashflow statements.
-        info["_fcfGrowing"] = None  # default: unknown
-        try:
-            cf = tkr.cashflow
-            if cf is not None and not cf.empty:
-                fcf_series = None
-                if "Free Cash Flow" in cf.index:
-                    fcf_series = cf.loc["Free Cash Flow"].dropna()
-                elif (("Operating Cash Flow" in cf.index)
-                      and ("Capital Expenditure" in cf.index)):
-                    op = cf.loc["Operating Cash Flow"]
-                    capex = cf.loc["Capital Expenditure"]
-                    fcf_series = (op + capex).dropna()
-                if fcf_series is not None and len(fcf_series) >= 2:
-                    current_fcf = float(fcf_series.iloc[0])
-                    prior_fcf = float(fcf_series.iloc[1])
-                    info["_fcfGrowing"] = bool(
-                        current_fcf > prior_fcf and current_fcf > 0
-                    )
-        except Exception:
-            pass
+        _set_fcf_growing(tkr, info)
 
         # Analyst data — yfinance baseline
         pa.target_mean = _safe_get(info, "targetMeanPrice")
@@ -4364,96 +4510,8 @@ def analyze_position(
             else:
                 pa.trend = "sideways"
 
-        # Build aggregated ratings: combine Robinhood + Finnhub + Yahoo
-        from analyst_aggregator import normalize_breakdown, aggregate
-        rh_norm = fh_norm = yh_norm = None
-
-        # 1. Robinhood
-        if use_robinhood_ratings:
-            try:
-                from robinhood_source import (
-                    fetch_robinhood_ratings, fetch_robinhood_price_target,
-                )
-                rh_rating = fetch_robinhood_ratings(ticker)
-                if rh_rating:
-                    rh_norm = normalize_breakdown(
-                        buy=rh_rating.get("buy", 0),
-                        hold=rh_rating.get("hold", 0),
-                        sell=rh_rating.get("sell", 0),
-                        source="robinhood",
-                    )
-                rh_target = fetch_robinhood_price_target(ticker)
-                if rh_target and rh_target.get("targetMean"):
-                    pa.target_mean = rh_target["targetMean"]
-                    pa.target_high = rh_target.get("targetHigh") or pa.target_high
-                    pa.target_low = rh_target.get("targetLow") or pa.target_low
-            except Exception as e:
-                print(f"[robinhood-ratings] {ticker}: {e}")
-
-        # 2. Finnhub
-        if FINNHUB_API_KEY:
-            fh_target = fetch_finnhub_price_target(ticker)
-            if fh_target:
-                # Only override target if Robinhood didn't provide one
-                if not (use_robinhood_ratings and pa.target_mean):
-                    if fh_target.get("targetMean"):
-                        pa.target_mean = fh_target["targetMean"]
-                    if fh_target.get("targetHigh"):
-                        pa.target_high = fh_target["targetHigh"]
-                    if fh_target.get("targetLow"):
-                        pa.target_low = fh_target["targetLow"]
-            fh_rec = fetch_finnhub_recommendation(ticker)
-            if fh_rec:
-                fh_norm = normalize_breakdown(
-                    buy=fh_rec.get("strongBuy", 0) + fh_rec.get("buy", 0),
-                    hold=fh_rec.get("hold", 0),
-                    sell=fh_rec.get("strongSell", 0) + fh_rec.get("sell", 0),
-                    source="finnhub",
-                )
-            time.sleep(0.05)
-
-        # 3. Yahoo Finance (always — comes from info we already have)
-        # yfinance .info exposes: numberOfAnalystOpinions, recommendationMean,
-        # recommendationKey. For lot-count breakdown we use the latest row of
-        # tkr.recommendations if available; else estimate from rec_mean.
-        try:
-            rec_df = tkr.recommendations
-            if rec_df is not None and not rec_df.empty:
-                # Most recent row sums per category
-                latest = rec_df.iloc[0]
-                yb = int(latest.get("strongBuy", 0) or 0) + int(latest.get("buy", 0) or 0)
-                yh = int(latest.get("hold", 0) or 0)
-                ys = int(latest.get("sell", 0) or 0) + int(latest.get("strongSell", 0) or 0)
-                if yb + yh + ys > 0:
-                    yh_norm = normalize_breakdown(yb, yh, ys, "yahoo")
-        except Exception:
-            pass
-        # Fallback: use recommendationMean if no breakdown rows
-        if yh_norm is None:
-            rec_mean = _safe_get(info, "recommendationMean")
-            n_an = info.get("numberOfAnalystOpinions") or 0
-            if rec_mean and n_an:
-                # Reverse-engineer a buy/hold/sell split from rec_mean & count.
-                # rec_mean ~1.5 = mostly buys, ~3 = mostly holds, ~4.5 = mostly sells.
-                # Simple heuristic split (good enough for aggregation weighting).
-                if rec_mean < 2.0:
-                    yb, yh, ys = int(n_an * 0.85), int(n_an * 0.15), 0
-                elif rec_mean < 2.5:
-                    yb, yh, ys = int(n_an * 0.65), int(n_an * 0.30), int(n_an * 0.05)
-                elif rec_mean < 3.0:
-                    yb, yh, ys = int(n_an * 0.40), int(n_an * 0.50), int(n_an * 0.10)
-                elif rec_mean < 3.5:
-                    yb, yh, ys = int(n_an * 0.20), int(n_an * 0.60), int(n_an * 0.20)
-                else:
-                    yb, yh, ys = int(n_an * 0.10), int(n_an * 0.40), int(n_an * 0.50)
-                if yb + yh + ys > 0:
-                    yh_norm = normalize_breakdown(yb, yh, ys, "yahoo")
-
-        # Aggregate all three (drops Nones internally)
-        agg = aggregate(rh_norm, fh_norm, yh_norm)
-        if agg:
-            pa.rating_breakdown = agg
-            pa.num_analysts = agg["total"]
+        # Aggregated ratings: Robinhood + Finnhub + Yahoo
+        _gather_analyst_ratings(pa, tkr, info, ticker, use_robinhood_ratings)
 
         if pa.current_price and pa.target_mean and pa.target_mean > 0:
             pa.upside_pct = (pa.target_mean - pa.current_price) / pa.current_price * 100
@@ -4494,25 +4552,7 @@ def analyze_position(
         apply_context_adjustments(pa)
 
         # Insider activity (free for the first call per ticker; cached after)
-        try:
-            from insider_trading import get_insider_activity, insider_score
-            pa.insider_activity = get_insider_activity(ticker, lookback_days=90)
-            # Pass market cap so the score scales sells by company size —
-            # $163M selling at $4T NVDA is very different from $163M at $5B
-            market_cap = info.get("marketCap")
-            pa.score_insider = insider_score(pa.insider_activity, market_cap=market_cap)
-            # The recalibrated read: identical except that a no-information
-            # outcome (below-noise selling, RSU withholding, compensation only)
-            # comes back as None so the weight renormalizes away — finding 1.
-            pa.score_insider_cal = insider_score(
-                pa.insider_activity, market_cap=market_cap,
-                neutral_as_missing=True)
-            # Stash the score on the activity dict so the renderer can use it
-            # to decide between "Caution" and "No signal" for selling cases.
-            if pa.insider_activity is not None:
-                pa.insider_activity["_score"] = pa.score_insider
-        except Exception as e:
-            print(f"[insider] {ticker}: {e}")
+        _set_insider_scores(pa, ticker, info)
 
         # Composite scoring (now includes insider as 5th sub-score)
         compute_composite_score(pa, info)
@@ -4785,6 +4825,113 @@ def select_screen_additions(
             continue
         picks.append(t)
     return picks, skipped
+
+
+# The nine filters' short names, as the Screening table lists a near miss's
+# failures ("eps_growth, fcf"). A filter missing here is listed by its name.
+_SCREEN_FILTER_KEYS = {
+    "Revenue growth >=10%": "rev_growth", "EPS growth >=10%": "eps_growth",
+    "P/E < 30": "pe", "PEG < 2": "peg", "ROE >= 15%": "roe",
+    "Op margin >= 15%": "op_margin", "Debt/Equity < 1": "de",
+    "FCF positive & growing": "fcf", "Quick ratio > 1.0": "quick",
+}
+
+
+def _screen_scoring_inputs(ticker: str, name: str) -> tuple:
+    """(pa, info) for one screened name: everything apply_quality_filters and
+    compute_composite_score read, fetched the way analyze_position fetches it.
+    A refused quote raises (the caller retries it); a refused statement fetch,
+    which yfinance swallows, shows up in yahoo_limits' refusal counter."""
+    tkr = yf.Ticker(ticker)
+    info = tkr.info or {}
+    if not info:
+        raise ValueError("no info")
+    _compute_growth_cached(tkr, info, ticker)
+    _set_fcf_growing(tkr, info)
+    pa = PositionAnalysis(ticker=ticker, name=name or ticker, shares=0.0,
+                          statement_market_value=0.0,
+                          statement_pct_portfolio=0.0)
+    # Robinhood ratings are fetched for the run's own holdings and watchlists
+    # only; a screened name that is one of those shows that row's scores.
+    _gather_analyst_ratings(pa, tkr, info, ticker, use_robinhood_ratings=False)
+    return pa, info
+
+
+def score_screen_shortlist(results: list, gate, max_workers: int = 6,
+                           verbose: bool = True) -> None:
+    """Score the screen's shortlist the way analyze_position scores a holding.
+
+    This is the scorer screener.screen_universe calls. The nine filters, the
+    five sub-scores and the Composite come from apply_quality_filters and
+    compute_composite_score, fed by the fetch helpers analyze_position uses,
+    so a name's Screening row agrees with its holding or watchlist row. (The
+    screener used to score names with formulas of its own: the same weights
+    on different inputs and scales, 5-8 points off on a typical name.)
+
+    Yahoo work goes through `gate`; a name Yahoo kept refusing gets an
+    `error` and is left out. The insider read (SEC) is made only for the names
+    the table shows: all nine filters passed, or one or two missed.
+    """
+    from screener import NEAR_MISS_MAX_FAILED
+
+    gathered: dict[str, tuple] = {}
+    lock = threading.Lock()
+
+    def fetch(r) -> bool:
+        try:
+            got = _screen_scoring_inputs(r.ticker, r.name)
+        except Exception as e:
+            r.error = f"{type(e).__name__}: {e}"
+            with lock:
+                gathered.pop(r.ticker, None)
+            return yahoo_limits.is_rate_limited(e)
+        r.error = None
+        with lock:
+            gathered[r.ticker] = got
+        return False
+
+    start = time.time()
+    refused = yahoo_limits.run_gated(results, fetch, gate=gate,
+                                     workers=max_workers, watch_counter=True)
+    for r in refused:
+        gathered.pop(r.ticker, None)
+        if not yahoo_limits.is_rate_limited(r.error):
+            r.error = "YFRateLimitError: Yahoo kept refusing"
+    _flush_fund_cache()
+
+    shown = []
+    for r in results:
+        if r.error or r.ticker not in gathered:
+            continue
+        pa, info = gathered[r.ticker]
+        filters = apply_quality_filters(info)
+        r.passes = {_SCREEN_FILTER_KEYS.get(f.name, f.name): bool(f.passed)
+                    for f in filters}
+        r.num_passed = sum(1 for f in filters if f.passed)
+        r.num_failed = len(filters) - r.num_passed
+        if r.num_failed <= NEAR_MISS_MAX_FAILED:
+            shown.append((r, pa, info))
+    if verbose:
+        print(f"[screen] Scored {len(gathered)}/{len(results)} shortlisted "
+              f"name(s) in {time.time() - start:.0f}s; {len(shown)} pass all "
+              f"nine filters or miss one or two.")
+
+    start = time.time()
+    if shown:
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers,
+                                                       len(shown)))) as ex:
+            list(ex.map(lambda s: _set_insider_scores(s[1], s[0].ticker, s[2]),
+                        shown))
+    for r, pa, info in shown:
+        compute_composite_score(pa, info)
+        r.score_quality, r.score_growth = pa.score_quality, pa.score_growth
+        r.score_value, r.score_analyst = pa.score_value, pa.score_analyst
+        r.score_insider = pa.score_insider
+        r.insider_activity = pa.insider_activity
+        r.score_composite = pa.composite_score
+    if verbose and shown:
+        print(f"[screen] Insider reads for {len(shown)} name(s) in "
+              f"{time.time() - start:.0f}s")
 
 
 def _gh_repo_slug() -> str:
@@ -6200,21 +6347,60 @@ def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
     return "—"
 
 
-def _render_screening_section(sr: dict) -> str:
+def _screen_rows_with_live_scores(rows: list, analyzed: dict) -> list:
+    """The scan's rows, with this run's scores on every name the run analyzed.
+
+    The scan is from the first run of the day; a held or watchlisted name was
+    scored again minutes ago, by the same formulas but on current prices and
+    with its Robinhood ratings. Showing those numbers keeps the Screening table
+    from disagreeing with that name's own row. Best Composite first."""
+    out = []
+    for r in rows:
+        pa = analyzed.get(r.ticker)
+        if pa is not None and not pa.error and pa.composite_score is not None:
+            r = copy.copy(r)
+            r.score_quality, r.score_growth = pa.score_quality, pa.score_growth
+            r.score_value, r.score_analyst = pa.score_value, pa.score_analyst
+            r.score_insider = pa.score_insider
+            r.insider_activity = pa.insider_activity
+            r.score_composite = pa.composite_score
+        out.append(r)
+    out.sort(key=lambda r: (r.score_composite if r.score_composite is not None
+                            else -1), reverse=True)
+    return out
+
+
+def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
     """
     Render the S&P 500/400 screening output.
-    sr: {"passed": [ScreenResult], "near_miss": [ScreenResult], "universe_size": int}
+    sr: {"passed": [ScreenResult], "near_miss": [ScreenResult],
+         "universe_size": int, "unscreened": [ticker], "scanned_at": iso}
+    analyzed: {ticker: PositionAnalysis} for every name this run analyzed —
+    those rows show this run's scores (see _screen_rows_with_live_scores).
     """
-    passed = sr.get("passed") or []
-    near_miss = sr.get("near_miss") or []
+    analyzed = analyzed or {}
+    passed = _screen_rows_with_live_scores(sr.get("passed") or [], analyzed)
+    near_miss = _screen_rows_with_live_scores(sr.get("near_miss") or [], analyzed)
     uni = sr.get("universe_size", 0)
+    unscreened = len(sr.get("unscreened") or [])
+    scanned = ""
+    try:
+        at = datetime.fromisoformat(sr.get("scanned_at") or "")
+        scanned = f" at {at.strftime('%I:%M %p').lstrip('0')} ET"
+    except ValueError:
+        pass
 
     html = "<h2 style='margin-top:48px;'>📊 Screening — S&amp;P 500 + 400</h2>\n"
+    screened = (f"Screened {uni - unscreened} of {uni} tickers"
+                f" ({unscreened} could not be fetched from Yahoo)"
+                if unscreened else f"Screened {uni} tickers")
     html += (
         f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:8px;">'
-        f"Screened {uni} tickers against the 9-filter quality framework. "
+        f"{screened} against the 9-filter quality framework. "
         f"<strong>{len(passed)}</strong> passed all 9; "
-        f"<strong>{len(near_miss)}</strong> failed only 1-2 (near misses, sorted by score).</p>\n"
+        f"<strong>{len(near_miss)}</strong> failed only 1-2 (near misses, sorted by score). "
+        f"Scores are the report's Composite, from the day's scan{scanned}; a name "
+        f"this run analyzed (held or on a watchlist) shows this run's numbers.</p>\n"
     )
     html += (
         '<p style="background:#f1f8e9;border-left:3px solid #689f38;padding:8px 12px;'
@@ -9993,7 +10179,11 @@ def generate_html_report(
 
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
-        html += _render_screening_section(screening_results)
+        analyzed = {r.ticker: r for r in results}
+        for items in (watchlists or {}).values():
+            for r in items:
+                analyzed.setdefault(r.ticker, r)
+        html += _render_screening_section(screening_results, analyzed)
 
     # ---------- ETFs & Thematic positions (moved before Tax section) ----------
     if thematics:
@@ -11285,7 +11475,8 @@ def main():
                     help="Run S&P 500/400 screening and add the screening "
                          "section. The scan runs at most once per market day "
                          "and is cached in .cache/, so the first run of the "
-                         "day pays for it (~3-5 min) and the rest reuse it.")
+                         "day pays for it (~10 min, more if Yahoo rate-limits "
+                         "and it has to wait) and the rest reuse it.")
     ap.add_argument("--screen-limit", type=int, default=None,
                     help="Cap the screening universe size (e.g. 50 for a fast "
                          "test). A limited run never reads or writes the "
@@ -11637,7 +11828,8 @@ def main():
             print("S&P 500/400 screen (scans once per market day)")
             print("=" * 60)
             screening_results = scr.screen_universe(
-                limit=args.screen_limit, force=args.rescan, verbose=True)
+                score_screen_shortlist, limit=args.screen_limit,
+                force=args.rescan, verbose=True)
             passed = screening_results["passed"]
             print(f"[screen] Passed: {len(passed)}  "
                   f"Near-miss: {len(screening_results['near_miss'])}")
