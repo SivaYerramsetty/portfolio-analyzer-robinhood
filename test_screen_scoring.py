@@ -467,12 +467,53 @@ def test_screen_universe_refusal() -> None:
                     prefilter_one=fake_prefilter,
                     _request_budget=lambda: 1000):
         first = sc.screen_universe(score, max_workers=1, verbose=False)
-        check((scored, first["pending"]), ([], 3),
-              "run 1 stops at the refusal: nothing scored, nothing lost")
+        check((scored, first["pending"], first["refused"]), ([], 3, True),
+              "run 1 stops at the refusal and says so: nothing scored, "
+              "nothing lost")
         second = sc.screen_universe(score, max_workers=1, verbose=False)
-        check((sorted(scored), second["pending"],
-               len(second["passed"])), (["AAA", "RL", "ZZZ"], 0, 3),
+        check((sorted(scored), second["pending"], len(second["passed"]),
+               second["refused"]), (["AAA", "RL", "ZZZ"], 0, 3, False),
               "run 2 prefilters the rest and scores all three")
+
+
+def test_add_screened_names() -> None:
+    section("add_screened_names: the scan's additions join this run's report")
+
+    def pa(ticker: str) -> ap.PositionAnalysis:
+        return ap.PositionAnalysis(ticker=ticker, name=ticker, shares=0,
+                                   statement_market_value=0,
+                                   statement_pct_portfolio=0)
+
+    on_list, pinned, kept, dup = pa("ONLIST"), pa("PINNED"), pa("KEPT"), pa("DUP")
+    groups = {"Screening": [dup], "Tech": [on_list],
+              ap.RECENTLY_HELD_GROUP: [pinned, kept]}
+    ran: list = []
+
+    def analyze(rows):
+        ran.extend(r["ticker"] for r in rows)
+        return [pa(r["ticker"]) for r in rows]
+
+    landed = [{"ticker": t, "name": t}
+              for t in ("ONLIST", "PINNED", "NEW", "DUP")]
+    added = ap.add_screened_names(
+        groups, landed, analyze=analyze,
+        analyzed={"ONLIST": on_list, "PINNED": pinned, "KEPT": kept})
+    check(ran, ["NEW"], "only a name this run hasn't analyzed is analyzed")
+    check([p.ticker for p in groups["Screening"]],
+          ["DUP", "ONLIST", "PINNED", "NEW"],
+          "the rest reuse their analysis; one already listed isn't doubled")
+    check((groups["Screening"][1] is on_list, [p.ticker for p in added]),
+          (True, ["ONLIST", "PINNED", "NEW"]), "the very same analysis object")
+    check([p.ticker for p in groups[ap.RECENTLY_HELD_GROUP]], ["KEPT"],
+          "a pinned name moves off the recently-held group")
+
+    groups = {ap.RECENTLY_HELD_GROUP: [pinned]}
+    ap.add_screened_names(groups, [{"ticker": "PINNED", "name": "P"}],
+                          analyze=analyze, analyzed={"PINNED": pinned})
+    check(sorted(groups), ["Screening"],
+          "an emptied recently-held group goes; a missing Screening group is made")
+    check(ap.add_screened_names({}, [], analyze=analyze, analyzed={}), [],
+          "nothing landed, nothing to do")
 
 
 def test_split() -> None:
@@ -532,7 +573,7 @@ def main() -> int:
               test_quote_summary, test_prefilter_one, test_prefilter_universe,
               test_scorer_matches_the_holding, test_scorer_refusals,
               test_growth_cache_guard, test_screen_universe,
-              test_screen_universe_refusal, test_split,
+              test_screen_universe_refusal, test_add_screened_names, test_split,
               test_render_live_scores):
         before = len(_results)
         t()

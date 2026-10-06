@@ -4827,6 +4827,38 @@ def select_screen_additions(
     return picks, skipped
 
 
+def add_screened_names(watchlists_analyzed: dict, landed: list[dict], *,
+                       analyzed: dict, analyze) -> list:
+    """File the names the scan just added to the Screening watchlist into this
+    run's watchlist results, so they show in this report.
+
+    landed: [{"ticker", "name"}]. A name this run already analyzed — on another
+    list, or pinned as recently held — reuses that analysis (`analyzed`, by
+    ticker); the rest go through `analyze(rows)` in one batch. A pinned name
+    leaves the recently-held group, since it is on a real list now. Returns the
+    analyses added.
+    """
+    group = list(watchlists_analyzed.get(SCREEN_WATCHLIST) or [])
+    present = {pa.ticker for pa in group}
+    new = [it for it in landed if it["ticker"] not in present]
+    to_run = [{"ticker": it["ticker"], "name": it["name"], "shares": 0,
+               "market_value": 0, "pct_portfolio": 0}
+              for it in new if it["ticker"] not in analyzed]
+    fresh = {pa.ticker: pa for pa in analyze(to_run)} if to_run else {}
+    added = [analyzed.get(it["ticker"]) or fresh[it["ticker"]] for it in new
+             if it["ticker"] in analyzed or it["ticker"] in fresh]
+    if added:
+        watchlists_analyzed[SCREEN_WATCHLIST] = group + added
+        moved = {pa.ticker for pa in added}
+        pinned = [pa for pa in watchlists_analyzed.get(RECENTLY_HELD_GROUP) or []
+                  if pa.ticker not in moved]
+        if pinned:
+            watchlists_analyzed[RECENTLY_HELD_GROUP] = pinned
+        else:
+            watchlists_analyzed.pop(RECENTLY_HELD_GROUP, None)
+    return added
+
+
 # The nine filters' short names, as the Screening table lists a near miss's
 # failures ("eps_growth, fcf"). A filter missing here is listed by its name.
 _SCREEN_FILTER_KEYS = {
@@ -11830,9 +11862,64 @@ def main():
         print(f"[verdict] Carrying last run's label for {_prior_n} ticker(s) "
               f"(recalibrated scoring only).")
 
+    print(f"Analyzing {len(rows)} positions...")
+    results: list[PositionAnalysis] = analyze_positions_parallel(
+        rows, use_robinhood_ratings=use_rh_ratings)
+
+    # Analyze watchlists. Dedupe by ticker (a stock in multiple lists is
+    # analyzed once), then fan the cached results back out per list.
+    watchlists_analyzed: dict[str, list[PositionAnalysis]] = {}
+    # Finding 5: names held within the last PIN_RECENT_HOLDINGS_DAYS that are on
+    # no watchlist any more still get analyzed, under their own group, so
+    # selling a position does not silently end the analyzer's coverage of it.
+    if args.pin_recent_holdings:
+        try:
+            _held_now = {r["ticker"] for r in rows}
+            _on_a_list = {it["ticker"]
+                          for items in (watchlist_lookup or {}).values()
+                          for it in items}
+            _pin = {t: n for t, n in recently_held_tickers(_prior_history).items()
+                    if t not in _held_now and t not in _on_a_list}
+            if _pin:
+                watchlist_lookup = dict(watchlist_lookup or {})
+                watchlist_lookup[RECENTLY_HELD_GROUP] = [
+                    {"ticker": t, "name": n} for t, n in sorted(_pin.items())]
+                print(f"[universe] Keeping {len(_pin)} recently-held name(s) in "
+                      f"the run: {', '.join(sorted(_pin))}")
+        except Exception as e:
+            print(f"[universe] Could not pin recently-held names: {e}")
+    ticker_cache: dict[str, PositionAnalysis] = {}
+    if watchlist_lookup:
+        held_set = {r.ticker for r in results}
+        unique_rows: dict[str, dict] = {}
+        for items in watchlist_lookup.values():
+            for it in items:
+                t = it["ticker"]
+                if t not in held_set and t not in unique_rows:
+                    unique_rows[t] = {
+                        "ticker": t, "name": it["name"],
+                        "shares": 0, "market_value": 0, "pct_portfolio": 0,
+                    }
+        print(f"\nAnalyzing {len(unique_rows)} unique watchlist tickers...")
+        analyzed = analyze_positions_parallel(
+            list(unique_rows.values()),
+            use_robinhood_ratings=use_rh_ratings,
+            is_watchlist=True,
+        )
+        ticker_cache = {pa.ticker: pa for pa in analyzed}
+        for wl_name, items in watchlist_lookup.items():
+            analyzed_items = [ticker_cache[it["ticker"]] for it in items
+                              if it["ticker"] in ticker_cache]
+            if analyzed_items:
+                watchlists_analyzed[wl_name] = analyzed_items
+
     # ---------- Optional: screen the S&P 500/400 universe ----------
-    # Runs before watchlist analysis so a name the scan finds this morning is
-    # analyzed, scored and ranked in this same report rather than the next one.
+    # Runs after the holdings and watchlists are analyzed, so they always get
+    # the runner's Yahoo allowance first. A runner that refuses partway through
+    # the scan stays blocked for minutes, and on 2026-10-06 the holdings
+    # analysis that came right after the scan ran into exactly that. Names the
+    # scan adds to the Screening watchlist are analyzed straight away, so they
+    # still show in this run's report.
     screening_results = None
     if args.screen:
         try:
@@ -11886,68 +11973,23 @@ def main():
                               f"Robinhood — create it in the app and the scan "
                               f"will fill it.")
                     landed = res["to_add"] if args.sync_dry_run else res["added"]
-                    if landed:
+                    if landed and screening_results.get("refused"):
+                        print(f"[screen] Yahoo is refusing this runner; "
+                              f"{', '.join(landed)} will be analyzed next run.")
+                    elif landed:
                         names = {r.ticker: (r.name or r.ticker) for r in passed}
-                        watchlist_lookup = dict(watchlist_lookup or {})
-                        existing = list(watchlist_lookup.get(SCREEN_WATCHLIST) or [])
-                        seen = {it["ticker"] for it in existing}
-                        existing += [{"ticker": t, "name": names.get(t, t)}
-                                     for t in landed if t not in seen]
-                        watchlist_lookup[SCREEN_WATCHLIST] = existing
                         print(f"[screen] Analyzing {len(landed)} newly screened "
                               f"name(s) in this run: {', '.join(landed)}")
+                        add_screened_names(
+                            watchlists_analyzed,
+                            [{"ticker": t, "name": names.get(t, t)}
+                             for t in landed],
+                            analyzed=ticker_cache,
+                            analyze=lambda new_rows: analyze_positions_parallel(
+                                new_rows, use_robinhood_ratings=use_rh_ratings,
+                                is_watchlist=True))
         except Exception as e:
             print(f"[screen] Error: {e}")
-
-    print(f"Analyzing {len(rows)} positions...")
-    results: list[PositionAnalysis] = analyze_positions_parallel(
-        rows, use_robinhood_ratings=use_rh_ratings)
-
-    # Analyze watchlists. Dedupe by ticker (a stock in multiple lists is
-    # analyzed once), then fan the cached results back out per list.
-    watchlists_analyzed: dict[str, list[PositionAnalysis]] = {}
-    # Finding 5: names held within the last PIN_RECENT_HOLDINGS_DAYS that are on
-    # no watchlist any more still get analyzed, under their own group, so
-    # selling a position does not silently end the analyzer's coverage of it.
-    if args.pin_recent_holdings:
-        try:
-            _held_now = {r["ticker"] for r in rows}
-            _on_a_list = {it["ticker"]
-                          for items in (watchlist_lookup or {}).values()
-                          for it in items}
-            _pin = {t: n for t, n in recently_held_tickers(_prior_history).items()
-                    if t not in _held_now and t not in _on_a_list}
-            if _pin:
-                watchlist_lookup = dict(watchlist_lookup or {})
-                watchlist_lookup[RECENTLY_HELD_GROUP] = [
-                    {"ticker": t, "name": n} for t, n in sorted(_pin.items())]
-                print(f"[universe] Keeping {len(_pin)} recently-held name(s) in "
-                      f"the run: {', '.join(sorted(_pin))}")
-        except Exception as e:
-            print(f"[universe] Could not pin recently-held names: {e}")
-    if watchlist_lookup:
-        held_set = {r.ticker for r in results}
-        unique_rows: dict[str, dict] = {}
-        for items in watchlist_lookup.values():
-            for it in items:
-                t = it["ticker"]
-                if t not in held_set and t not in unique_rows:
-                    unique_rows[t] = {
-                        "ticker": t, "name": it["name"],
-                        "shares": 0, "market_value": 0, "pct_portfolio": 0,
-                    }
-        print(f"\nAnalyzing {len(unique_rows)} unique watchlist tickers...")
-        analyzed = analyze_positions_parallel(
-            list(unique_rows.values()),
-            use_robinhood_ratings=use_rh_ratings,
-            is_watchlist=True,
-        )
-        ticker_cache = {pa.ticker: pa for pa in analyzed}
-        for wl_name, items in watchlist_lookup.items():
-            analyzed_items = [ticker_cache[it["ticker"]] for it in items
-                              if it["ticker"] in ticker_cache]
-            if analyzed_items:
-                watchlists_analyzed[wl_name] = analyzed_items
 
     # Prune weak watchlist tickers (verdict score below threshold) from the
     # actual Robinhood watchlists. Removal is verified by re-reading, and
