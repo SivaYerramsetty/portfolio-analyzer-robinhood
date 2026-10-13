@@ -559,7 +559,7 @@ def _save_screen_state(state: dict, verbose: bool = True) -> None:
             print(f"[screen] Could not write scan cache ({e})")
 
 
-def _scan_output(state: dict, from_cache: bool) -> dict:
+def _scan_output(state: dict, from_cache: bool, refused: bool = False) -> dict:
     passed, near = split_passers_and_near_misses(state["shown"])
     return {
         "passed": passed,
@@ -569,6 +569,7 @@ def _scan_output(state: dict, from_cache: bool) -> dict:
         "pending": len(state["to_prefilter"]) + len(state["to_score"]),
         "scanned_at": state["scanned_at"],
         "from_cache": from_cache,
+        "refused": refused,
     }
 
 
@@ -594,8 +595,10 @@ def screen_universe(
     run. Its Yahoo work should go through the budget it is handed.
 
     Returns {"passed", "near_miss", "universe_size", "unscreened", "pending",
-    "scanned_at", "from_cache"}. `pending` counts the names still to prefilter
-    or score; `unscreened` lists the names Yahoo had no data for. `limit` caps
+    "scanned_at", "from_cache", "refused"}. `pending` counts the names still to
+    prefilter or score; `unscreened` lists the names Yahoo had no data for;
+    `refused` says Yahoo turned this run away, so more Yahoo work now would
+    fail too. `limit` caps
     the universe for a fast test, lifts the request budget, and neither reads
     nor writes the day's cache, so a test run can't stand in for the real scan.
     """
@@ -649,7 +652,7 @@ def screen_universe(
         state["shown"] += passed + near
         state["to_score"] = left
 
-    out = _scan_output(state, from_cache=False)
+    out = _scan_output(state, from_cache=False, refused=budget.stopped)
     if verbose and out["pending"]:
         why = "Yahoo refused" if budget.stopped else "request budget spent"
         print(f"[screen] {out['pending']} name(s) left for the next run "
