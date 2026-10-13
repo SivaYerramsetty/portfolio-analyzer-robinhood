@@ -182,6 +182,7 @@ from typing import Optional
 
 import yfinance as yf
 
+import risk_signals
 import scorecard
 import yahoo_limits
 
@@ -2490,6 +2491,127 @@ def _flush_fund_cache() -> None:
             pass
 
 
+# --- Daily price history (risk_signals) disk cache -----------------------------
+# Six years of daily closes per name feed the drop-vs-normal read, and the last
+# year of them the volatility and the risk shares. Closes change once a day, so
+# each name is fetched once per ET day (one Yahoo request) and only a summary is
+# kept: a year of closes plus the drawdown history's quantiles. Today's bar is
+# left out, since it is a quote rather than a close; the live price stands in
+# for today. Holdings and watchlists only; the screen never fetches history.
+_PRICE_HISTORY_CACHE_PATH = (Path(__file__).resolve().parent / ".cache"
+                             / "price_history.json")
+# Entries for names no run has asked about in this many days are dropped.
+_PRICE_HISTORY_KEEP_DAYS = 10
+_price_cache_lock = threading.Lock()
+_price_cache: Optional[dict] = None
+_price_cache_dirty = False
+_price_hits = 0
+_price_misses = 0
+_price_held_back = 0
+
+
+def _load_price_cache() -> dict:
+    global _price_cache
+    if _price_cache is None:
+        try:
+            data = json.loads(_PRICE_HISTORY_CACHE_PATH.read_text())
+            _price_cache = data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            _price_cache = {}
+    return _price_cache
+
+
+def _fetch_price_history(tkr, today: date) -> tuple[Optional[dict], bool]:
+    """(summary, refused) for one ticker: its daily closes from six years back
+    through yesterday, summarized by risk_signals.summarize_history. One
+    request. A refusal yfinance swallows into an empty frame still counts,
+    through yahoo_limits' counter; an empty answer from a refused fetch is
+    unknown (None), not "no history"."""
+    before = yahoo_limits.refusals()
+    try:
+        hist = tkr.history(start=risk_signals.history_start(today),
+                           interval="1d", auto_adjust=False, actions=False)
+    except Exception as e:
+        return None, (yahoo_limits.is_rate_limited(e)
+                      or yahoo_limits.refusals() != before)
+    refused = yahoo_limits.refusals() != before
+    if hist is None or hist.empty or "Close" not in hist:
+        return (None if refused else risk_signals.summarize_history([], [])), refused
+    pairs = [(idx.date().isoformat(), float(c))
+             for idx, c in hist["Close"].dropna().items() if idx.date() < today]
+    return (risk_signals.summarize_history([d for d, _ in pairs],
+                                           [c for _, c in pairs]), refused)
+
+
+def _price_history_cached(tkr, ticker: str) -> Optional[dict]:
+    """The ticker's price-history summary: today's from the cache, else
+    fetched now. A fetch is cached only if no Yahoo refusal landed meanwhile
+    (another thread's included), as with the fundamentals. Once this run has
+    been refused, nothing new is fetched, because probing a block keeps it
+    alive; an older day's entry stands in, else there is none."""
+    global _price_cache_dirty, _price_hits, _price_misses, _price_held_back
+    today = _et_now().date()
+    with _price_cache_lock:
+        entry = _load_price_cache().get(ticker)
+    if entry and entry.get("day") == today.isoformat():
+        with _price_cache_lock:
+            _price_hits += 1
+        return entry
+    if yahoo_limits.refusals():
+        with _price_cache_lock:
+            _price_held_back += 1
+        return entry
+    got, refused = _fetch_price_history(tkr, today)
+    with _price_cache_lock:
+        _price_misses += 1
+        if got is not None and not refused:
+            got["day"] = today.isoformat()
+            _load_price_cache()[ticker] = got
+            _price_cache_dirty = True
+    return got if got is not None else entry
+
+
+def _flush_price_cache() -> None:
+    """Write the price-history cache once per batch, dropping names no run has
+    asked about lately."""
+    global _price_cache_dirty
+    with _price_cache_lock:
+        if not _price_cache_dirty or _price_cache is None:
+            return
+        cutoff = (_et_now().date()
+                  - timedelta(days=_PRICE_HISTORY_KEEP_DAYS)).isoformat()
+        for t in [t for t, e in _price_cache.items()
+                  if (e.get("day") or "") < cutoff]:
+            del _price_cache[t]
+        try:
+            _PRICE_HISTORY_CACHE_PATH.parent.mkdir(exist_ok=True)
+            _PRICE_HISTORY_CACHE_PATH.write_text(
+                json.dumps(_price_cache, separators=(",", ":")))
+            _price_cache_dirty = False
+        except OSError:
+            pass
+
+
+def _set_price_risk(pa, tkr, ticker: str) -> None:
+    """pa's volatility and drop-vs-normal read (risk_signals.price_stats), from
+    the cached price history and the live price, plus the year of closes the
+    risk shares need. Best-effort: a failure leaves the fields empty and the
+    rest of the analysis untouched."""
+    try:
+        entry = _price_history_cached(tkr, ticker)
+        stats = risk_signals.price_stats(entry, pa.current_price)
+        pa.volatility = stats["volatility"]
+        pa.drop_pct = stats["drop"]
+        pa.drop_severity = stats["severity"]
+        pa.drop_typical = stats["typical"]
+        pa.drop_tail = stats["tail"]
+        pa.drop_years = stats["years"]
+        if entry and entry.get("c"):
+            pa.price_closes = (entry["d"], entry["c"])
+    except Exception as e:
+        print(f"[risk] {ticker}: {type(e).__name__}: {e}")
+
+
 def apply_quality_filters(info: dict) -> list[FilterResult]:
     """
     Apply the nine-filter quality compounder framework.
@@ -2950,6 +3072,11 @@ class Verdict:
     # the run log can compare them before anyone switches.
     base_mode: Optional[str] = None
     alternates: Optional[dict] = None
+    # Holdings only, display-only: (label, score) this verdict would have if the
+    # position-size rule read the holding's share of the portfolio's risk
+    # instead of its share of the value. Set only when that changes the size
+    # penalty (see _verdict_v2_under).
+    risk_sized: Optional[tuple] = None
 
 
 def _clip01(x: float) -> float:
@@ -3217,6 +3344,27 @@ VERDICT_BANDS_WATCHLIST = (
 )
 
 
+# Position-size bands for holdings, largest first: (at least this % of the
+# portfolio, score delta, flag, description). The flag triggers the ADD ceiling
+# in compute_verdict_v2.
+POSITION_SIZE_BANDS = (
+    (25.0, -8, "very_overweight", "Already very overweight"),
+    (15.0, -4, "overweight", "Already overweight"),
+    (10.0, -2, None, "Sizeable position"),
+)
+
+
+def _position_size_penalty(pct: Optional[float]
+                           ) -> tuple[int, Optional[str], Optional[str]]:
+    """(score delta, ADD-ceiling flag, description) for a position that is
+    `pct` percent of the portfolio: (0, None, None) under the smallest band."""
+    if pct is not None:
+        for floor, delta, flag, desc in POSITION_SIZE_BANDS:
+            if pct >= floor:
+                return delta, flag, desc
+    return 0, None, None
+
+
 def _verdict_label(score: float, is_holding: bool, *,
                    prior_label: Optional[str] = None,
                    hysteresis: float = 0.0) -> tuple[str, str, Optional[str]]:
@@ -3463,26 +3611,17 @@ def compute_verdict_v2(
     # thinking (single-name risk, sector overlap, sequence-of-returns sensitivity).
     # Magnitudes are deliberately moderate — they nudge ADD→HOLD but don't push
     # a quality stock to SELL.
+    # The bands are POSITION_SIZE_BANDS; 10-15% carries no flag, so it nudges
+    # without triggering the ADD ceiling.
     position_size_flag = None    # used below for hard ADD-ceiling override
     if is_holding and position_pct_portfolio is not None:
-        if position_pct_portfolio >= 25:
-            score -= 8
+        size_delta, position_size_flag, size_desc = _position_size_penalty(
+            position_pct_portfolio)
+        if size_delta:
+            score += size_delta
             contributors.append(
-                (f"Already very overweight ({position_pct_portfolio:.0f}% of portfolio)", -8)
-            )
-            position_size_flag = "very_overweight"
-        elif position_pct_portfolio >= 15:
-            score -= 4
-            contributors.append(
-                (f"Already overweight ({position_pct_portfolio:.0f}% of portfolio)", -4)
-            )
-            position_size_flag = "overweight"
-        elif position_pct_portfolio >= 10:
-            score -= 2
-            contributors.append(
-                (f"Sizeable position ({position_pct_portfolio:.0f}% of portfolio)", -2)
-            )
-            # No flag — 10-15% doesn't trigger the ADD ceiling, just a small nudge
+                (f"{size_desc} ({position_pct_portfolio:.0f}% of portfolio)",
+                 size_delta))
 
     # ---- Realized strength vs the 200-day line (recalibrated only) ----
     # Finding 3b: the standard scoring rewards strength only through the trend
@@ -3743,13 +3882,81 @@ def has_verdict_base(pa, mode: str) -> bool:
     return vals["composite_score"] is not None
 
 
+def _add_verdict_note(verdict: Verdict, note: str) -> None:
+    """Add a display-only line to a v2 verdict's breakdown, just before its
+    closing "= verdict score N" segment, where compute_verdict_v2 puts its own
+    zero-impact notes ("· ..."). The score and label are untouched. A note
+    must not contain "|", which separates the breakdown's segments."""
+    parts = verdict.reason.split(" | ")
+    at = len(parts) - 1 if parts[-1].startswith("= verdict score") else len(parts)
+    parts.insert(at, f"· {note}")
+    verdict.reason = " | ".join(parts)
+
+
+def _signed_points(delta: float) -> str:
+    return "0" if not delta else f"{'+' if delta > 0 else '−'}{abs(delta):.0f}"
+
+
+def _share_of_days(pct: float) -> str:
+    """A share of trading days, without rounding 99.6% up to all of them."""
+    return "more than 99%" if 99.5 <= pct < 100 else f"{pct:.0f}%"
+
+
+def _drop_note(pa, detail: bool = False) -> Optional[str]:
+    """The drop-vs-normal read as a sentence, or None when the stock is within
+    risk_signals.DROP_MIN_PCT of its 52-week high or has too little history
+    to say what is normal for it. `detail` adds how far down the stock
+    typically sits, and how far 1 day in 10."""
+    band = risk_signals.drop_band(pa.drop_pct, pa.drop_severity)
+    if band is None:
+        return None
+    key, label = band
+    years = max(1, round(pa.drop_years or 0))
+    over = f"over the past {years} year{'' if years == 1 else 's'}"
+    sev = pa.drop_severity
+    if key == "normal":
+        how = (f"normal for this stock, which was this far down or further on "
+               f"{_share_of_days(100 - sev)} of trading days {over}")
+    elif sev >= 99.95:
+        how = f"{label} for this stock: further down than at any point {over}"
+    else:
+        how = (f"{label} for this stock: further down than on "
+               f"{_share_of_days(sev)} of trading days {over}")
+    extra = ""
+    if detail and pa.drop_typical is not None and pa.drop_tail is not None:
+        extra = (f" It typically sits {abs(pa.drop_typical):.0f}% below its "
+                 f"52-week high; 1 day in 10, {abs(pa.drop_tail):.0f}% or "
+                 f"more.")
+    return (f"Down {abs(pa.drop_pct):.0f}% from its 52-week high, {how}."
+            f"{extra} Shown, not scored")
+
+
+def _risk_sizing_note(risk_share: float, value_share: float,
+                      alt: Verdict, verdict: Verdict) -> str:
+    """What the position-size rule would do if it read the holding's share of
+    the portfolio's risk instead of its share of the value."""
+    on_risk = _position_size_penalty(risk_share)[0]
+    on_value = _position_size_penalty(value_share)[0]
+    outcome = (f"score {alt.score:.0f}, still {alt.label}" if alt.label == verdict.label
+               else f"making it {alt.label} {alt.score:.0f}")
+    return (f"Sized by risk: {risk_share:.1f}% of the portfolio's risk vs "
+            f"{value_share:.1f}% of its value. The size rule would give "
+            f"{_signed_points(on_risk)} instead of {_signed_points(on_value)}, "
+            f"{outcome}. Shown, not scored")
+
+
 def _verdict_v2_under(pa, mode: str, is_holding: bool,
                       position_pct: Optional[float]) -> Optional[Verdict]:
+    """pa's v2 verdict under `mode`, with the price-risk reads added to its
+    breakdown as notes that move nothing: the drop vs the stock's normal and,
+    for a holding whose share of the portfolio's risk falls in a different
+    size band than its share of the value, what the size rule would make of
+    the risk share instead (also kept on the verdict as risk_sized)."""
     if not has_verdict_base(pa, mode):
         return None
     _, calibration = split_base_mode(mode)
     vals = _calibration_inputs(pa, calibration)
-    return compute_verdict_v2(
+    inputs = dict(
         composite_score=vals["composite_score"],
         filters=pa.filters,
         current_price=pa.current_price,
@@ -3760,7 +3967,6 @@ def _verdict_v2_under(pa, mode: str, is_holding: bool,
         week52_position=pa.week52_position,
         sector_label=(pa.sector_momentum or {}).get("label"),
         insider_signal=_insider_signal(pa),
-        position_pct_portfolio=position_pct,
         is_holding=is_holding,
         news_signal=pa.news_sentiment,
         coverage=vals["coverage"],
@@ -3773,6 +3979,18 @@ def _verdict_v2_under(pa, mode: str, is_holding: bool,
         days_to_earnings=pa.days_to_earnings,
         prior_label=prior_verdict_label(pa.ticker, mode),
     )
+    verdict = compute_verdict_v2(position_pct_portfolio=position_pct, **inputs)
+    drop = _drop_note(pa)
+    if drop:
+        _add_verdict_note(verdict, drop)
+    if (is_holding and position_pct is not None and pa.risk_share is not None
+            and _position_size_penalty(pa.risk_share)[0]
+            != _position_size_penalty(position_pct)[0]):
+        alt = compute_verdict_v2(position_pct_portfolio=pa.risk_share, **inputs)
+        verdict.risk_sized = (alt.label, alt.score)
+        _add_verdict_note(verdict, _risk_sizing_note(pa.risk_share, position_pct,
+                                                     alt, verdict))
+    return verdict
 
 
 def verdicts_v2_for(pa, *, is_holding: bool,
@@ -4156,6 +4374,26 @@ class PositionAnalysis:
     insider_activity: Optional[dict] = None
     # Latest-news sentiment from Claude: {score, label, rationale, headlines, as_of}
     news_sentiment: Optional[dict] = None
+    # Price risk (risk_signals), shown beside the verdict but not scored.
+    # volatility: annualized, from a year of daily returns (%). drop_pct: %
+    # below the 52-week closing high (<= 0). drop_severity: share of trading
+    # days over the past five years that were less far down (0-100);
+    # drop_typical / drop_tail: the median drawdown and the one only 1 day in
+    # 10 was worse than (%); drop_years: years of history behind them.
+    volatility: Optional[float] = None
+    drop_pct: Optional[float] = None
+    drop_severity: Optional[float] = None
+    drop_typical: Optional[float] = None
+    drop_tail: Optional[float] = None
+    drop_years: Optional[float] = None
+    # The last year of daily closes, (dates, closes), for the risk shares.
+    price_closes: Optional[tuple] = field(default=None, repr=False)
+    # Holdings only, set by finalize_holding_verdicts: % of the portfolio's
+    # volatility this position accounts for, and its correlation with the
+    # portfolio. What the size rule would make of risk_share sits on each
+    # mode's Verdict (risk_sized).
+    risk_share: Optional[float] = None
+    risk_corr: Optional[float] = None
     # Output
     verdict: Optional[Verdict] = None
     # v2 verdict under every base-score mode ({mode: Verdict}); `verdict` is
@@ -4511,6 +4749,10 @@ def analyze_position(
             else:
                 pa.trend = "sideways"
 
+        # Volatility and the drop vs the stock's own history: shown next to
+        # the verdict and logged for the scorecard, not scored.
+        _set_price_risk(pa, tkr, ticker)
+
         # Aggregated ratings: Robinhood + Finnhub + Yahoo
         _gather_analyst_ratings(pa, tkr, info, ticker, use_robinhood_ratings)
 
@@ -4710,6 +4952,12 @@ def analyze_positions_parallel(
     if _fund_hits or _fund_misses:
         print(f"[fundamentals-cache] {_fund_hits} hit / {_fund_misses} miss "
               f"(skipped {_fund_hits} statement-fetch pairs)")
+    _flush_price_cache()
+    if _price_hits or _price_misses or _price_held_back:
+        print(f"[risk] Price history: {_price_hits} cached today / "
+              f"{_price_misses} fetched"
+              + (f" / {_price_held_back} not fetched after a Yahoo refusal"
+                 if _price_held_back else ""))
     # Same for the news-sentiment cache (headlines fetched + scored on misses;
     # scoring is Claude when keyed, else the free lexicon).
     # Same for the news-sentiment cache. A ticker scored by the batch pre-pass
@@ -5531,6 +5779,7 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
     # last = "= verdict score N"
     base_line = ""
     factor_rows = []
+    note_rows = []
     for seg in parts[1:]:
         if seg.startswith("= verdict score"):
             continue
@@ -5544,6 +5793,13 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
                 f"<div class='vrow'><span class='vd {cls}'>{_esc(disp)}</span>"
                 f"<span class='vt'>{_esc(desc)}</span></div>"
             )
+        elif seg.startswith("· "):
+            # A line that moves no points: a factor deliberately not
+            # re-scored, a label held or capped, a price-risk read. A
+            # holding's report date is left to the earnings footer below.
+            note = seg[2:]
+            if not note.startswith("Reports "):
+                note_rows.append(f"<div class='vnote'>· {_esc(note)}</div>")
         elif not base_line:
             base_line = seg
 
@@ -5601,7 +5857,8 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
         f"<span class='vcard-score' style='color:{sc};'>{score:.0f}</span></div>"
         f"{bar}{conf_html}{base_html}"
         f"<div class='vrows'>{''.join(factor_rows)}</div>"
-        f"{alt_html}{earn_html}"
+        + (f"<div class='vnotes'>{''.join(note_rows)}</div>" if note_rows else "")
+        + f"{alt_html}{earn_html}"
         f"</div>"
     )
     # No native title= (it duplicated, and lagged behind, the styled card on
@@ -5980,7 +6237,8 @@ def _name_sector_cell(r) -> str:
 
 
 def _position_cell(r) -> str:
-    """Combined Mkt Val + %Port — value primary, percent as subtitle."""
+    """Combined Mkt Val + %Port — value primary, percent as subtitle, and the
+    holding's share of the portfolio's risk beside it once that's measured."""
     if r.live_market_value is None and r.live_pct_portfolio is None:
         return "—"
     val = _fmt_money(r.live_market_value) if r.live_market_value is not None else "—"
@@ -5988,8 +6246,44 @@ def _position_cell(r) -> str:
     return (
         f"<div>{val}</div>"
         f"<div style='font-size:10px;color:var(--fg-muted);margin-top:1px;'>"
-        f"{pct}</div>"
+        f"{pct}{_risk_share_html(r)}</div>"
     )
+
+
+def _attr_esc(s: object) -> str:
+    """Text for a quoted HTML attribute: both quote marks escaped, so an
+    apostrophe can't end a single-quoted title=."""
+    import html as _html
+    return _html.escape(str(s), quote=True)
+
+
+def _pct_short(x: float) -> str:
+    """A percentage with a decimal only where it matters: 0.4%, 8.2%, 26%."""
+    return f"{x:.1f}%" if abs(x) < 10 else f"{x:.0f}%"
+
+
+def _risk_share_html(r) -> str:
+    """' · 19% of risk' for the Position cell, amber when the size rule would
+    treat the risk share more harshly than the value share, with the
+    volatility and correlation behind it on hover. Empty when unmeasured."""
+    if r.risk_share is None:
+        return ""
+    harsher = (_position_size_penalty(r.risk_share)[0]
+               < _position_size_penalty(r.live_pct_portfolio)[0])
+    tip = (f"{r.live_pct_portfolio or 0:.1f}% of the portfolio's value and "
+           f"{r.risk_share:.1f}% of its risk: its part in the portfolio's "
+           f"daily swings over the past year.")
+    if r.volatility is not None:
+        tip += f" It swings about {r.volatility:.0f}% a year"
+        tip += (f", with a {r.risk_corr:.2f} correlation to the portfolio."
+                if r.risk_corr is not None else ".")
+    if harsher and r.verdicts:
+        tip += (" Read by risk, the position-size rule would mark it down "
+                "more; the verdict shows by how much.")
+    tip += " Shown, not scored."
+    color = "var(--fg-chip-amber)" if harsher else "var(--fg-muted)"
+    return (f" · <span style='color:{color};cursor:help;' "
+            f"title='{_attr_esc(tip)}'>{_pct_short(r.risk_share)} of risk</span>")
 
 
 def _cost_gain_cell(r) -> str:
@@ -6090,7 +6384,30 @@ def _range_trend_cell(r) -> str:
             f"padding:1px 6px;border-radius:8px;font-size:10px;"
             f"font-weight:600;'>{icon} {label}</span>{ma_part}</div>"
         )
-    return "".join(parts) if parts else "—"
+    # Bottom: the drop vs the stock's normal, once it is 5%+ off its high
+    parts.append(_drop_html(r))
+    return "".join(parts) if any(parts) else "—"
+
+
+# Drop-band colors: a normal pullback stays quiet; the further outside the
+# stock's normal, the louder.
+_DROP_COLORS = {"normal": "var(--fg-muted)", "deep": "var(--fg-chip-amber)",
+                "unusual": "var(--pos-down)", "rare": "var(--pos-down)"}
+
+
+def _drop_html(r) -> str:
+    """The Range / Trend cell's drop line: how far below its 52-week closing
+    high the stock is and how unusual that is for it, with the history behind
+    it on hover. Empty within 5% of the high, or without enough history."""
+    band = risk_signals.drop_band(r.drop_pct, r.drop_severity)
+    if band is None:
+        return ""
+    key, label = band
+    weight = 600 if key in ("unusual", "rare") else 400
+    return (f"<div style='margin-top:3px;font-size:10px;color:{_DROP_COLORS[key]};"
+            f"font-weight:{weight};cursor:help;' "
+            f"title='{_attr_esc(_drop_note(r, detail=True) + '.')}'>"
+            f"−{abs(r.drop_pct):.0f}% off high · {label} for it</div>")
 
 
 def _score_cell(score: Optional[float], q: Optional[float] = None,
@@ -6970,6 +7287,27 @@ def _render_tax_section(flagged: list,
     return html
 
 
+def portfolio_risk(results: list[PositionAnalysis], *,
+                   set_shares: bool = False) -> Optional[dict]:
+    """The holdings' risk shares (risk_signals.risk_contributions), from the
+    year of closes analyze_position kept on each. With set_shares, writes
+    each holding's risk_share and risk_corr (None where unmeasured).
+    Positions in one ticker held in more than one account count as one."""
+    values: dict[str, float] = {}
+    series: dict[str, tuple] = {}
+    for r in results:
+        if (r.live_market_value or 0) > 0:
+            values[r.ticker] = values.get(r.ticker, 0.0) + r.live_market_value
+            if r.price_closes:
+                series[r.ticker] = r.price_closes
+    risk = risk_signals.risk_contributions(series, values) if values else None
+    if set_shares:
+        for r in results:
+            r.risk_share = (risk or {}).get("share", {}).get(r.ticker)
+            r.risk_corr = (risk or {}).get("corr", {}).get(r.ticker)
+    return risk
+
+
 def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
     """Populate live_pct_portfolio and re-run the v2 verdict with position size.
 
@@ -6981,6 +7319,9 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
     MUST run before tax analysis: the tax section selects SELL/TRIM positions,
     so any verdict that flips after the tax loop would silently get no tax card.
     Watchlist items aren't re-run (you don't own them, so size doesn't apply).
+
+    Also sets each holding's share of the portfolio's risk, which the verdicts
+    show next to the size rule without scoring it.
     """
     live_total = sum(
         r.live_market_value for r in results if r.live_market_value is not None
@@ -6988,6 +7329,7 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
     for r in results:
         if r.live_market_value is not None and live_total > 0:
             r.live_pct_portfolio = r.live_market_value / live_total * 100
+    portfolio_risk(results, set_shares=True)
 
     mode = base_score_mode()
     for r in results:
@@ -6997,6 +7339,54 @@ def finalize_holding_verdicts(results: list[PositionAnalysis]) -> float:
             # Reuses r.news_sentiment scored in analyze_position.
             set_v2_verdicts(r, is_holding=True, position_pct=r.live_pct_portfolio)
     return live_total
+
+
+def describe_price_risk(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+    mode: Optional[str] = None,
+) -> list[str]:
+    """Run-log lines for the price-risk reads, which the verdicts show without
+    scoring: the portfolio's volatility and its largest shares of risk, which
+    verdicts would change if the size rule read risk instead of value (under
+    `mode`, default the run's), and the names in unusual drops. The numbers
+    to check before letting either read move a verdict."""
+    mode = mode or base_score_mode()
+    lines = []
+    risk = portfolio_risk(results)
+    if risk:
+        value = {r.ticker: r.live_pct_portfolio or 0 for r in results}
+        top = sorted(risk["share"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+        lines.append(
+            f"[risk] Portfolio volatility ~{risk['portfolio_vol']:.0f}% a year. "
+            "Largest shares of risk: " + ", ".join(
+                f"{t} {s:.0f}% ({value.get(t, 0):.0f}% of value)" for t, s in top)
+            + ".")
+        if risk["missing"]:
+            lines.append("[risk] Too little price history to measure: "
+                         + ", ".join(risk["missing"]) + ".")
+    sized = [(r, v) for r in results
+             if (v := verdict_in(r, mode)) is not None and v.risk_sized]
+    flips = sum(1 for _, v in sized if v.risk_sized[0] != v.label)
+    lines.append(
+        f"[risk] Sizing by risk instead of value ({BASE_SCORE_LABELS.get(mode, mode)}): "
+        + ("; ".join(f"{r.ticker} {v.label} {v.score:.0f} → {v.risk_sized[0]} "
+                     f"{v.risk_sized[1]:.0f}" for r, v in sized)
+           + f" ({flips} label change{'' if flips == 1 else 's'})."
+           if sized else "no holding changes size band."))
+    seen, drops = set(), []
+    for r in list(results) + [r for items in (watchlists or {}).values()
+                              for r in items]:
+        band = risk_signals.drop_band(r.drop_pct, r.drop_severity)
+        if r.ticker not in seen and band and band[0] in ("unusual", "rare"):
+            seen.add(r.ticker)
+            drops.append((r.drop_severity,
+                          f"{r.ticker} −{abs(r.drop_pct):.0f}% "
+                          f"({band[1]}: deeper than on {r.drop_severity:.0f}% of days)"))
+    if drops:
+        lines.append("[risk] Unusual drops: " + ", ".join(
+            text for _, text in sorted(drops, reverse=True)) + ".")
+    return lines
 
 
 def compare_base_modes(
@@ -7233,6 +7623,12 @@ def _rec_factors(r: PositionAnalysis) -> dict:
         "quality_filters_passed": (sum(1 for f in r.filters if f.passed)
                                    if r.filters else None),
         "quality_filters_total": (len(r.filters) if r.filters else None),
+        # Price risk, shown but not scored (risk_signals), so the scorecard
+        # can grade it before it is allowed to move a verdict.
+        "volatility": _r(r.volatility, 1),
+        "drop_pct": _r(r.drop_pct, 1),
+        "drop_severity": _r(r.drop_severity, 1),
+        "risk_share": _r(r.risk_share, 1),
     }
     return {k: v for k, v in factors.items() if v is not None}
 
@@ -9216,7 +9612,7 @@ def _sc_factor_table(sc: dict) -> str:
         if not any((by_h.get(h) or {}).get("ic") is not None
                    for h, _ in scorecard.HORIZONS):
             continue
-        lean_note = "" if lean > 0 else " (lower is treated as better)"
+        lean_note = " (lower is treated as better)" if lean < 0 else ""
         rows += (f"<tr><td data-sort='{_miss_esc(label)}'><strong>{_miss_esc(label)}</strong></td>"
                  f"<td data-sort='{_miss_esc(role)}'><span style='color:var(--fg-muted);"
                  f"font-size:11.5px;'>{_miss_esc(role + lean_note)}</span></td>"
@@ -9360,6 +9756,20 @@ def _portfolio_insights(results: list[PositionAnalysis],
                     "detail": f"{parts} — sizeable position(s); consider "
                               f"rebalancing."})
 
+    # Holdings the size rule would mark down further if it read their share
+    # of the portfolio's risk rather than of its value (shown, not scored).
+    heavier = sorted((r for r in held if r.risk_share is not None
+                      and _position_size_penalty(r.risk_share)[0]
+                      < _position_size_penalty(r.live_pct_portfolio)[0]),
+                     key=lambda r: r.risk_share, reverse=True)
+    if heavier:
+        parts = ", ".join(f"{r.ticker} ({r.live_pct_portfolio or 0:.0f}% of "
+                          f"value, {r.risk_share:.0f}% of risk)"
+                          for r in heavier[:3])
+        out.append({"icon": "⚖️", "label": "Risk concentration", "tone": "warn",
+                    "detail": f"{parts} — a bigger share of the portfolio's "
+                              f"swings than of its value."})
+
     adds = [r for r in held if label(r) == "ADD"]
     if adds:
         out.append({"icon": "➕", "label": "High-conviction adds", "tone": "good",
@@ -9371,6 +9781,19 @@ def _portfolio_insights(results: list[PositionAnalysis],
     if stretched:
         out.append({"icon": "🎯", "label": "Above analyst target", "tone": "warn",
                     "detail": f"{names(stretched)} — limited upside to consensus."})
+
+    unusual = sorted((r for r in held
+                      if (risk_signals.drop_band(r.drop_pct, r.drop_severity)
+                          or ("",))[0] in ("unusual", "rare")),
+                     key=lambda r: r.drop_severity, reverse=True)
+    if unusual:
+        parts = ", ".join(f"{r.ticker} (−{abs(r.drop_pct):.0f}%)"
+                          for r in unusual[:3])
+        if len(unusual) > 3:
+            parts += f" +{len(unusual) - 3} more"
+        out.append({"icon": "📉", "label": "Unusual drops", "tone": "warn",
+                    "detail": f"{parts} — further below their 52-week high "
+                              f"than they usually fall."})
 
     weak = [r for r in held
             if qpass(r) is not None and qpass(r) <= 4
@@ -10075,6 +10498,11 @@ def generate_html_report(
   .vd-pos {{ color: var(--pos-up); }}
   .vd-neg {{ color: var(--pos-down); }}
   .vt {{ color: var(--fg-body); }}
+  /* Lines that move no points: factors not re-scored, held or capped labels,
+     the price-risk reads. */
+  .vnotes {{ display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
+             font-size: 11px; color: var(--fg-muted); }}
+  .vnote {{ padding-left: 9px; text-indent: -9px; }}
   /* Confidence chip inside the verdict card (Medium/Low data coverage). */
   .vconf {{ font-size: 11px; font-weight: 600; padding: 4px 8px;
             border-radius: 6px; margin-bottom: 8px; line-height: 1.35; }}
@@ -12505,6 +12933,14 @@ def main():
     # generate_html_report() meant such positions showed TRIM in the report but
     # were never flagged for tax analysis — missing from the tax section.
     finalize_holding_verdicts(results)
+
+    # The price-risk reads the verdicts show without scoring: what sizing by
+    # risk would change, and which names are in unusual drops.
+    try:
+        for line in describe_price_risk(results, watchlists_analyzed or None):
+            print(line)
+    except Exception as e:
+        print(f"[risk] Skipped the summary: {e}")
 
     # What the other base-score modes would have decided (and pruned) — the
     # numbers to check before switching BASE_SCORE_MODE.

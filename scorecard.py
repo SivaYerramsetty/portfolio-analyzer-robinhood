@@ -116,7 +116,8 @@ NEAR_BAR_BUCKET = "70–75"
 # in the verdict, the direction the model leans on it). Direction +1: the
 # model treats a higher value as better. 52-week position is the exception:
 # the verdict docks names near their high and credits quality names near
-# their low.
+# their low. Direction 0: shown beside the verdict but not scored (see
+# UNSCORED_FACTORS).
 FACTORS = (
     ("q", "Quality", "30% of the Composite", +1),
     ("g", "Growth", "20% of the Composite", +1),
@@ -132,10 +133,33 @@ FACTORS = (
     ("n", "News sentiment", "a modifier, ±6", +1),
     ("c", "Composite", "the Composite base", +1),
     ("qb", "Quality base", "the Quality base", +1),
+    ("vol", "Volatility", "shown, not scored", 0),
+    ("ddp", "Drop vs its normal", "shown, not scored", 0),
 )
 # Only these get weight suggestions; c and qb are whole bases, and vc is a
 # variant the mode comparison already covers.
 WEIGHTED_FACTORS = ("q", "g", "v", "a", "i", "ma", "w52", "up", "sm", "n")
+# Price-risk reads the report shows but doesn't score (risk_signals): a year's
+# volatility, and how far below its 52-week high a stock is against its own
+# history (the share of days it was less far down). They are graded like the
+# inputs, and a significant result says which way scoring them would lean:
+# {key: (finding when the rank correlation is negative, when positive)}.
+UNSCORED_FACTORS = {
+    "vol": ("Higher-volatility names lagged the S&P over {span} (rank "
+            "correlation {ic:+.2f}, {windows} independent periods). "
+            "Volatility is shown, not scored; this is the case for docking it.",
+            "Higher-volatility names beat the S&P over {span} (rank "
+            "correlation {ic:+.2f}, {windows} independent periods). Docking "
+            "volatility would have cost returns."),
+    "ddp": ("Names further below their 52-week high than usual kept lagging "
+            "the S&P over {span} (rank correlation {ic:+.2f}, {windows} "
+            "independent periods). The drop read is shown, not scored; this "
+            "is the case for scoring an unusual drop as a warning.",
+            "Names further below their 52-week high than usual went on to "
+            "beat the S&P over {span} (rank correlation {ic:+.2f}, {windows} "
+            "independent periods). An unusual drop has not been a reason to "
+            "rate a name lower."),
+}
 
 # The recs ledger's factor names (analyze_portfolio._rec_factors) -> the
 # short keys stored here. Short keys keep a year of daily calls near 10 MB.
@@ -144,6 +168,7 @@ LEDGER_FACTOR_KEYS = {
     "score_value_cal": "vc", "score_analyst": "a", "score_insider": "i",
     "filter_score": "fs", "pct_above_ma200": "ma", "week52_position": "w52",
     "upside_pct": "up", "composite_score": "c", "quality_base": "qb",
+    "volatility": "vol", "drop_severity": "ddp",
 }
 SECTOR_MOMENTUM_VALUE = {"Hot": 1, "Neutral": 0, "Cool": -1}
 
@@ -583,7 +608,7 @@ def _number(v) -> float:
 class _Columns:
     """The evaluated calls as numpy columns, so each table is a mask rather
     than another pass over every call: a year of daily calls is ~40,000 rows,
-    graded under six modes and fourteen inputs at three horizons."""
+    graded under six modes and sixteen inputs at three horizons."""
 
     def __init__(self, calls: list[dict], modes: tuple, horizons):
         n = len(calls)
@@ -897,6 +922,13 @@ def suggest(sc: dict, mode: str, modes: tuple, labels: dict,
                 f"{f['ic']:+.2f}). It is {role}; a candidate for more weight.")))
     factor_notes.sort(key=lambda x: x[0], reverse=True)
     out.extend(note for _, note in factor_notes[:3])
+
+    # 4b. Do the reads shown beside the verdict, but not scored, carry signal?
+    for key, texts in UNSCORED_FACTORS.items():
+        f = (sc["factors"].get(key) or {}).get(h) or {}
+        if significant(f):
+            out.append(("neutral", texts[f["ic"] > 0].format(
+                span=span, ic=f["ic"], windows=f["windows"])))
 
     # 5. Are the BUY/ADD bars in the right place?
     near = (block["buckets"].get(NEAR_BAR_BUCKET) or {}).get(h) or {}
