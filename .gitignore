@@ -20,6 +20,11 @@ universe_cache.json
 # CI runs via the GitHub Actions cache instead (see .github/workflows/portfolio.yml).
 recs_history.json
 
+# The Report Scorecard's ledger (scorecard.py): every day's verdicts for every
+# analyzed name, holdings included, so it stays out of this public repo too and
+# rides the CI cache.
+verdict_log.json
+
 # Account-equity ledger for the cash-flow-adjusted YTD return. One equity value
 # per day, used to pin the year-start anchor each January. Real account values,
 # so like recs_history.json it stays out of this public repo and rides the CI
