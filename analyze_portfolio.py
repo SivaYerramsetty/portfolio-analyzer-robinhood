@@ -182,6 +182,7 @@ from typing import Optional
 
 import yfinance as yf
 
+import scorecard
 import yahoo_limits
 
 # Count every 429 Yahoo sends, so data fetched while Yahoo was refusing is
@@ -8172,7 +8173,8 @@ def _strip_html_to_text(s: str) -> str:
 
 
 def _build_miss_analysis_prompt(
-    missed: list[dict], avoided: list[dict], insights: dict
+    missed: list[dict], avoided: list[dict], insights: dict,
+    scorecard_text: Optional[str] = None,
 ) -> str:
     """Render the computed miss/avoided rows + base-rate insights into a compact,
     plain-text brief for the model. Sends signal (alpha, horizons, factors, the
@@ -8250,6 +8252,16 @@ def _build_miss_analysis_prompt(
             lines.append(f"- {a['ticker']} ({a.get('sector') or '—'}): "
                          f"{a.get('dodge_type')} dodge, {_n(a.get('loss_pct'), sign=True)}%; {why}")
 
+    if scorecard_text:
+        lines.append("\nREPORT SCORECARD (every daily call, graded against the "
+                     "S&P 500 afterwards; IC = rank correlation between a score "
+                     "and the forward return vs the S&P):")
+        lines.append(scorecard_text)
+        lines.append("Use the scorecard to tell a systematic weakness, visible "
+                     "across all graded calls, from a one-off miss. Treat any "
+                     "number over fewer than 3 independent periods as "
+                     "provisional.")
+
     lines.append(
         "\nWrite a post-mortem in Markdown with these sections:\n"
         "1. **Headline** — 2-3 sentences: are these misses real signal or the "
@@ -8273,8 +8285,11 @@ def analyze_missed_opportunities_ai(
     insights: Optional[dict] = None,
     *,
     model: Optional[str] = None,
+    scorecard_text: Optional[str] = None,
 ) -> Optional[str]:
-    """On-demand AI post-mortem over the captured miss data. Returns a Markdown
+    """On-demand AI post-mortem over the captured miss data. `scorecard_text`
+    (scorecard.digest) adds how every graded call did, so the analysis can tell
+    a systematic weakness from a one-off miss. Returns a Markdown
     analysis, or None when no API key is configured or the call fails/declines.
     Best-effort and side-effect-free beyond the API call — the caller decides
     what to do with the text. NOT invoked by the normal report path."""
@@ -8289,7 +8304,8 @@ def analyze_missed_opportunities_ai(
               "written analysis.")
         return None
     mdl = model or MISSED_OPP_MODEL
-    prompt = _build_miss_analysis_prompt(missed, avoided or [], insights or {})
+    prompt = _build_miss_analysis_prompt(missed, avoided or [], insights or {},
+                                         scorecard_text)
     print(f"[miss-analysis] Analyzing {len(missed)} missed opportunit"
           f"{'y' if len(missed) == 1 else 'ies'} with {mdl} …")
     try:
@@ -8798,6 +8814,470 @@ def _render_avoided_losses(avoided: list[dict]) -> str:
     return html
 
 
+# ---------------------------------------------------------------------------
+# Report scorecard
+# ---------------------------------------------------------------------------
+# The recs ledger keeps each name's first and latest call; the scorecard keeps
+# every day's (verdict_log.json, see scorecard.py) and grades each one against
+# the S&P 500 a week, a month and three months later. That is what says
+# whether the verdicts work, and which inputs and which base deserve more
+# weight. The log holds real holdings, so like the ledger it is gitignored and
+# rides the Actions cache.
+
+# Most Yahoo requests one run may spend fetching closes for the scorecard.
+# About one per series (two the first time a runner sees a ticker), once per
+# session, after the close.
+SCORECARD_REQUEST_BUDGET = int(os.environ.get("SCORECARD_REQUEST_BUDGET") or 500)
+
+
+def _scorecard_call(r: PositionAnalysis, held: bool) -> Optional[dict]:
+    """One ticker's call for the verdict log: price, held flag, verdict and
+    score under every base-score mode, and the inputs behind them. None for a
+    failed analysis, or for an ETF/thematic verdict, which has no per-mode
+    scores to grade."""
+    if r.error or not r.verdicts or r.current_price is None:
+        return None
+    news = r.news_sentiment or {}
+    age = _news_signal_age_days(news) if news else None
+    # Only a read from today counts as a news input: a carried-over score
+    # would grade last week's headline against this week's return.
+    news_score = (news.get("score")
+                  if age is None or age <= _NEWS_FULL_WEIGHT_DAYS else None)
+    return {
+        "p": round(float(r.current_price), 4),
+        "h": 1 if held else 0,
+        "v": {m: [v.label, round(v.score, 1) if v.score is not None else None]
+              for m, v in r.verdicts.items()},
+        "f": scorecard.compact_factors(_rec_factors(r), news_score),
+    }
+
+
+def scorecard_calls(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
+) -> dict[str, dict]:
+    """{ticker: call} for everything this run analyzed. Holdings win, as in
+    the ledger."""
+    calls: dict[str, dict] = {}
+    for items in (watchlists or {}).values():
+        for r in items:
+            call = _scorecard_call(r, held=False)
+            if call:
+                calls[r.ticker] = call
+    for r in results:
+        call = _scorecard_call(r, held=True)
+        if call:
+            calls[r.ticker] = call
+    return calls
+
+
+def _fetch_daily_closes(ticker: str, start: str) -> tuple[Optional[dict], bool]:
+    """Daily closes from `start` (ISO date) to now, as {date: close}, and
+    whether Yahoo refused. Split-adjusted, not dividend-adjusted, matching the
+    ^GSPC price index. One request. A refusal yfinance swallows into an empty
+    frame still counts, through yahoo_limits' counter."""
+    before = yahoo_limits.refusals()
+    try:
+        hist = yf.Ticker(ticker).history(start=start, interval="1d",
+                                         auto_adjust=False, actions=False)
+    except Exception as e:
+        return None, (yahoo_limits.is_rate_limited(e)
+                      or yahoo_limits.refusals() != before)
+    if yahoo_limits.refusals() != before:
+        return None, True
+    if hist is None or hist.empty or "Close" not in hist:
+        return {}, False
+    return ({idx.date().isoformat(): float(c)
+             for idx, c in hist["Close"].dropna().items()}, False)
+
+
+def update_scorecard(
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]],
+    ledger: Optional[dict],
+    *,
+    run_date: str,
+    now_et: Optional[datetime] = None,
+    path: str = scorecard.LOG_FILE,
+    fetch=None,
+    budget: Optional[int] = None,
+) -> dict:
+    """Log this run's calls, fetch the closes still missing, and grade every
+    matured call. Returns the scorecard (scorecard.build_scorecard).
+
+    The first run also recovers the ledger's first-sighting calls, so the
+    section has results from day one. Closes are fetched only when this run
+    has had no Yahoo refusal: probing a block keeps it alive, and the next run
+    picks up whatever is left."""
+    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
+    log = scorecard.load_log(path)
+    seeded = scorecard.seed_from_ledger(log, ledger, run_date)
+    if seeded:
+        print(f"[scorecard] Recovered {seeded} first-sighting call(s) from the "
+              f"recommendation ledger.")
+    logged = scorecard.record_day(log, run_date, scorecard_calls(results, watchlists))
+
+    if yahoo_limits.refusals():
+        print("[scorecard] Yahoo refused this runner earlier; fetching closes "
+              "next run.")
+    else:
+        allowance = yahoo_limits.YahooBudget(
+            SCORECARD_REQUEST_BUDGET if budget is None else budget)
+        got = scorecard.refresh_closes(
+            log, now_et, fetch or _fetch_daily_closes,
+            run=lambda items, fn: yahoo_limits.run_gated(
+                items, fn, budget=allowance, workers=4, watch_counter=True))
+        if got["wanted"]:
+            print(f"[scorecard] Closes: {got['fetched']}/{got['wanted']} "
+                  f"series updated ({allowance.used()} Yahoo requests)"
+                  + (f"; {got['left']} left for the next run."
+                     if got["left"] else "."))
+
+    scorecard.prune_log(log, now_et.date())
+    scorecard.save_log(log, path)
+    sc = scorecard.build_scorecard(log, BASE_SCORE_MODES, base_score_mode(),
+                                   BASE_SCORE_LABELS)
+    meta = sc["meta"]
+    print(f"[scorecard] Logged {logged} call(s) for {run_date}; "
+          f"{meta['days_logged']} day(s) in the log"
+          + (f" plus {meta['seed_calls']} recovered" if meta["seed_calls"] else "")
+          + ". Matured: " + ", ".join(f"{h} {n}" for h, n in meta["matured"].items())
+          + ".")
+    for tone, text in sc["suggestions"].get(base_score_mode()) or []:
+        print(f"[scorecard] ({tone}) {text}")
+    return sc
+
+
+_SC_TONES = {"good": ("var(--pos-up)", "▲"), "bad": ("var(--pos-down)", "▼"),
+             "neutral": ("var(--fg-muted)", "●")}
+
+
+def _sc_horizon(sc: dict) -> str:
+    """The horizon the summary cards show: the suggestions' horizon when there
+    is one, else the longest horizon with any matured call."""
+    h = scorecard.suggestion_horizon(sc)
+    if h:
+        return h
+    matured = sc["meta"]["matured"]
+    return next((h for h, _ in reversed(scorecard.HORIZONS) if matured.get(h)),
+                scorecard.HORIZONS[0][0])
+
+
+def _sc_alpha_cell(g: Optional[dict], span: str) -> str:
+    """A table cell: mean return vs the S&P 500, with the share that beat it
+    and the number of calls underneath."""
+    if not g or not g.get("n"):
+        return ("<td class='num' data-sort=''>"
+                "<span style='color:var(--fg-faint);'>—</span></td>")
+    a = g["alpha"]
+    cls = "pos-up" if a > 0 else "pos-down" if a < 0 else ""
+    tip = (f"{g['n']} calls. Mean return {g['ret']:+.1f}% over {span}, "
+           f"{a:+.1f} points against the S&P 500; {g['beat']:.0%} beat it.")
+    return (f"<td class='num' data-sort='{a:.2f}' title='{_miss_esc(tip)}'>"
+            f"<span class='{cls}'>{a:+.1f}%</span>"
+            f"<div style='font-size:10px;color:var(--fg-muted);'>"
+            f"beat {g['beat']:.0%} · {g['n']}</div></td>")
+
+
+def _sc_ic_cell(ic: Optional[dict], span: str) -> str:
+    """A table cell: rank correlation with the forward return vs the S&P 500,
+    colored only once it is significant, with its independent periods under."""
+    if not ic or ic.get("ic") is None:
+        return ("<td class='num' data-sort='' title='Needs a day with at least "
+                f"{scorecard.MIN_IC_CALLS} matured, scored calls.'>"
+                "<span style='color:var(--fg-faint);'>—</span></td>")
+    v = ic["ic"]
+    strong = scorecard.significant(ic)
+    style = (f"color:{'var(--pos-up)' if v > 0 else 'var(--pos-down)'};"
+             "font-weight:600;" if strong else "color:var(--fg-body);")
+    t = f"t = {ic['t']:+.1f}" if ic.get("t") is not None else "t n/a"
+    tip = (f"Rank correlation with the next {span}'s return vs the S&P 500, "
+           f"averaged over {ic['days']} days ({ic['n']} calls). "
+           f"{ic['windows']} non-overlapping periods; {t}. "
+           + ("Significant." if strong else "Not significant yet."))
+    periods = _sc_plural(ic["windows"], "period")
+    return (f"<td class='num' data-sort='{v:.4f}' title='{_miss_esc(tip)}'>"
+            f"<span style='{style}'>{v:+.2f}</span>"
+            f"<div style='font-size:10px;color:var(--fg-muted);'>{periods}</div></td>")
+
+
+def _sc_plural(n: int, word: str) -> str:
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+
+def _sc_card(big: str, label: str, sub: str = "", color: str = "var(--fg-strong)") -> str:
+    sub_html = (f"<div style='font-size:10px;color:var(--fg-muted);margin-top:2px;'>"
+                f"{sub}</div>") if sub else ""
+    return ("<div style='flex:1 1 150px;min-width:150px;background:var(--bg-card);"
+            "border:1px solid var(--border-medium);border-radius:8px;padding:12px 14px;'>"
+            f"<div style='font-size:22px;font-weight:700;line-height:1;color:{color};"
+            f"font-variant-numeric:tabular-nums;'>{big}</div>"
+            f"<div style='font-size:11px;color:var(--fg-muted);margin-top:4px;'>{label}</div>"
+            f"{sub_html}</div>")
+
+
+def _sc_signed_color(x: Optional[float]) -> str:
+    if x is None:
+        return "var(--fg-faint)"
+    return "var(--pos-up)" if x > 0 else "var(--pos-down)" if x < 0 else "var(--fg-strong)"
+
+
+def _sc_summary(sc: dict, mode: str) -> str:
+    """The four cards above the tables, at the summary horizon."""
+    h = _sc_horizon(sc)
+    span = scorecard.HORIZON_NAMES[h]
+    block = sc["modes"][mode]
+    t = block["tiers"][h]
+    ic = block["ic"][h]
+
+    def small(g: dict) -> bool:
+        return g["n"] < scorecard.MIN_GROUP_CALLS
+
+    def tier_card(key: str, label: str) -> str:
+        g = t[key]
+        if not g["n"]:
+            return _sc_card("—", label, f"no matured calls at {span}",
+                            "var(--fg-faint)")
+        # A handful of calls is shown, but not colored as if it meant much.
+        return _sc_card(f"{g['alpha']:+.1f}%", label,
+                        f"vs the S&P · {_sc_plural(g['n'], 'call')} · "
+                        f"beat {g['beat']:.0%}"
+                        + (" · small sample" if small(g) else ""),
+                        "var(--fg-strong)" if small(g)
+                        else _sc_signed_color(g["alpha"]))
+
+    spread = t["spread"]
+    thin = spread is not None and (small(t["buy"]) or small(t["below"]))
+    edge = (_sc_card(f"{spread:+.1f}", f"Edge over {span} (points)",
+                     "buy-grade minus below the bar"
+                     + (" · small sample" if thin else ""),
+                     "var(--fg-strong)" if thin else _sc_signed_color(spread))
+            if spread is not None else
+            _sc_card("—", f"Edge over {span}", "needs both kinds of call",
+                     "var(--fg-faint)"))
+    if ic.get("ic") is not None:
+        skill = _sc_card(f"{ic['ic']:+.2f}", "Ranking skill",
+                         f"score vs next {span} · "
+                         f"{_sc_plural(ic['windows'], 'period')}, "
+                         f"{scorecard.confidence(ic['windows'])}",
+                         _sc_signed_color(ic["ic"]) if scorecard.significant(ic)
+                         else "var(--fg-strong)")
+    else:
+        skill = _sc_card("—", "Ranking skill", "needs more scored calls",
+                         "var(--fg-faint)")
+    return ("<div style='display:flex;flex-wrap:wrap;gap:10px;margin:12px 0 6px;'>"
+            + tier_card("buy", f"Buy-grade calls, {span}")
+            + tier_card("below", f"Below the bar, {span}")
+            + edge + skill + "</div>")
+
+
+def _sc_suggestions(sc: dict, mode: str) -> str:
+    items = sc["suggestions"].get(mode) or []
+    if not items:
+        return ""
+    lis = "".join(
+        f"<li style='margin:6px 0;list-style:none;'>"
+        f"<span style='color:{_SC_TONES.get(tone, _SC_TONES['neutral'])[0]};"
+        f"font-size:10px;margin-right:6px;'>{_SC_TONES.get(tone, _SC_TONES['neutral'])[1]}</span>"
+        f"{_miss_esc(text)}</li>"
+        for tone, text in items)
+    return ("<div style='margin:12px 0 4px;padding:10px 14px;border-radius:8px;"
+            "background:var(--bg-card);border:1px solid var(--border-medium);"
+            "font-size:12.5px;line-height:1.5;color:var(--fg-body);max-width:900px;'>"
+            "<div style='font-weight:600;margin-bottom:2px;'>What the data suggests</div>"
+            f"<ul style='margin:0;padding:0;'>{lis}</ul>"
+            "<div style='font-size:10.5px;color:var(--fg-muted);margin-top:6px;'>"
+            "Findings about the scoring model, from past calls only. A finding "
+            "appears once enough calls have matured to clear a significance bar; "
+            "none of it is advice about any stock.</div></div>")
+
+
+def _sc_horizon_ths() -> str:
+    return "".join(f"<th class='num'>{scorecard.HORIZON_NAMES[h]}</th>"
+                   for h, _ in scorecard.HORIZONS)
+
+
+def _sc_label_table(sc: dict, mode: str) -> str:
+    block = sc["modes"][mode]
+    if not block["labels"]:
+        return ""
+    rows = ""
+    for label, by_h in block["labels"].items():
+        rows += (f"<tr><td data-sort='{scorecard.LABEL_ORDER.index(label)}'>"
+                 f"<strong>{_miss_esc(label)}</strong></td>"
+                 + "".join(_sc_alpha_cell(by_h[h], scorecard.HORIZON_NAMES[h])
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    for key, title, members in scorecard.TIERS:
+        if key == "neutral":
+            continue
+        rows += (f"<tr><td data-sort='{90 if key == 'buy' else 91}'>"
+                 f"<em>All {title.lower()}</em> <span style='color:var(--fg-muted);"
+                 f"font-size:10.5px;'>({' / '.join(sorted(members))})</span></td>"
+                 + "".join(_sc_alpha_cell(block["tiers"][h][key],
+                                          scorecard.HORIZON_NAMES[h])
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    return ("<div class='table-wrap'><table><thead><tr><th>Verdict</th>"
+            + _sc_horizon_ths() + "</tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
+def _sc_bucket_table(sc: dict, mode: str) -> str:
+    block = sc["modes"][mode]
+    if not block["buckets"]:
+        return ""
+    rows = ("<tr><td data-sort='999'><em>Rank correlation</em></td>"
+            + "".join(_sc_ic_cell(block["ic"][h], scorecard.HORIZON_NAMES[h])
+                      for h, _ in scorecard.HORIZONS) + "</tr>")
+    for lo, name in scorecard.SCORE_BUCKETS:
+        by_h = block["buckets"].get(name)
+        if not by_h:
+            continue
+        rows += (f"<tr><td data-sort='{lo}'><strong>{name}</strong></td>"
+                 + "".join(_sc_alpha_cell(by_h[h], scorecard.HORIZON_NAMES[h])
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    return ("<div class='table-wrap'><table><thead><tr><th>Verdict score</th>"
+            + _sc_horizon_ths() + "</tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
+def _sc_compare_table(sc: dict) -> str:
+    h = _sc_horizon(sc)
+    span = scorecard.HORIZON_NAMES[h]
+    default = sc["meta"]["default_mode"]
+    rows = ""
+    for mode in BASE_SCORE_MODES:
+        c = sc["compare"][mode]
+        t = (c["tiers"].get(h) or {})
+        star = (" <span title='The saved default' style='color:var(--fg-chip-amber);'>★</span>"
+                if mode == default else "")
+        share = c.get("buy_share")
+        rows += (f"<tr><td data-sort='{_miss_esc(BASE_SCORE_LABELS[mode])}'>"
+                 f"{_miss_esc(BASE_SCORE_LABELS[mode])}{star}</td>"
+                 + "".join(_sc_ic_cell(c["ic"].get(hh), scorecard.HORIZON_NAMES[hh])
+                           for hh, _ in scorecard.HORIZONS)
+                 + _sc_alpha_cell(t.get("buy"), span)
+                 + (f"<td class='num' data-sort='{t['spread']:.2f}'>"
+                    f"<span style='color:{_sc_signed_color(t['spread'])};font-weight:600;'>"
+                    f"{t['spread']:+.1f}</span></td>"
+                    if t.get("spread") is not None else
+                    "<td class='num' data-sort=''><span style='color:var(--fg-faint);'>—</span></td>")
+                 + (f"<td class='num' data-sort='{share:.3f}'>{share:.0%}</td>"
+                    if share is not None else
+                    "<td class='num' data-sort=''><span style='color:var(--fg-faint);'>—</span></td>")
+                 + "</tr>")
+    return ("<div class='table-wrap'><table><thead><tr><th>Base</th>"
+            + "".join(f"<th class='num'>Rank corr, {scorecard.HORIZON_NAMES[hh]}</th>"
+                      for hh, _ in scorecard.HORIZONS)
+            + f"<th class='num'>Buy-grade vs S&amp;P, {span}</th>"
+            f"<th class='num'>Edge, {span}</th>"
+            "<th class='num' title='Share of calls rated BUY or ADD over the last "
+            "five logged days. Above "
+            f"{scorecard.MAX_BUY_SHARE:.0%} the bars stop discriminating.' "
+            "style='cursor:help;'>Rated buy-grade &#9432;</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table></div>")
+
+
+def _sc_factor_table(sc: dict) -> str:
+    rows = ""
+    for key, label, role, lean in scorecard.FACTORS:
+        by_h = sc["factors"].get(key) or {}
+        if not any((by_h.get(h) or {}).get("ic") is not None
+                   for h, _ in scorecard.HORIZONS):
+            continue
+        lean_note = "" if lean > 0 else " (lower is treated as better)"
+        rows += (f"<tr><td data-sort='{_miss_esc(label)}'><strong>{_miss_esc(label)}</strong></td>"
+                 f"<td data-sort='{_miss_esc(role)}'><span style='color:var(--fg-muted);"
+                 f"font-size:11.5px;'>{_miss_esc(role + lean_note)}</span></td>"
+                 + "".join(_sc_ic_cell(by_h.get(h), scorecard.HORIZON_NAMES[h])
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    if not rows:
+        return ""
+    return ("<div class='table-wrap'><table><thead><tr><th>Input</th>"
+            "<th>Its part in the verdict</th>" + _sc_horizon_ths()
+            + "</tr></thead><tbody>" + rows + "</tbody></table></div>")
+
+
+def _render_scorecard_section(sc: Optional[dict]) -> str:
+    """The Report Scorecard section: every logged call graded against the S&P
+    500 afterwards — by verdict, by score, by base and by input — plus the
+    findings the rules in scorecard.suggest draw from it."""
+    if not sc:
+        return ""
+    meta = sc["meta"]
+    p_style = "color:var(--fg-muted);font-size:12px;margin:4px 0 10px;max-width:900px;"
+    html = ("<h2 id='scorecard' style='margin-top:48px;'>🎯 Report Scorecard</h2>\n"
+            f"<p style='{p_style}'>Each market day's verdicts are logged and "
+            "checked against what every stock did next: its return over the "
+            "following week, month and three months, minus the S&amp;P 500's "
+            "over the same days. Names pruned from a watchlist keep being "
+            "graded, so the weakest calls count too.")
+    recovered = (f"{_sc_plural(meta['seed_calls'], 'first-sighting call')} "
+                 f"recovered from the ledger (since "
+                 f"{_fmt_short_date(meta['seed_from'])}, mostly Composite "
+                 f"verdicts)") if meta["seed_calls"] else ""
+    if meta["started"]:
+        html += (f" Logging since {_fmt_short_date(meta['started'])}: "
+                 f"{_sc_plural(meta['days_logged'], 'day')}, "
+                 f"{_sc_plural(meta['calls_logged'], 'call')}"
+                 + (f", plus {recovered}" if recovered else "") + ".")
+    elif recovered:
+        html += f" So far: {recovered}."
+    html += "</p>\n"
+
+    if not any(meta["matured"].values()):
+        first = (date.fromisoformat(meta["started"]) + timedelta(days=7)
+                 if meta["started"] else None)
+        html += ("<p style='color:var(--fg-muted);font-size:13px;background:var(--bg-card);"
+                 "border:1px dashed var(--border-medium);padding:14px 16px;"
+                 "border-radius:6px;max-width:760px;'>No call has matured yet."
+                 + (f" The first 1-week results land around "
+                    f"{_fmt_short_date(first.isoformat())}." if first else "")
+                 + "</p>\n")
+        return html
+
+    html += _mode_variants(lambda m: _sc_summary(sc, m), tag="div")
+    html += _mode_variants(lambda m: _sc_suggestions(sc, m), tag="div")
+
+    h3 = "<h3 style='margin-top:26px;margin-bottom:4px;font-size:15px;'>{}</h3>\n"
+    labels = _mode_variants(lambda m: _sc_label_table(sc, m), tag="div")
+    if labels:
+        html += h3.format("How each verdict did")
+        html += (f"<p style='{p_style}'>Mean return against the S&amp;P 500 after "
+                 "each call; underneath, the share that beat it and the number of "
+                 "calls. Watchlist names are rated BUY / WATCH / WAIT / PASS, "
+                 "holdings ADD / HOLD / TRIM / SELL. Working calls read "
+                 "strongest first within each.</p>\n" + labels)
+    buckets = _mode_variants(lambda m: _sc_bucket_table(sc, m), tag="div")
+    if buckets:
+        html += h3.format("Do higher scores do better?")
+        html += (f"<p style='{p_style}'>The same, by verdict score. The BUY bar "
+                 "is 75 and the ADD bar 78. The rank correlation row measures "
+                 "how well the score orders stocks on each day (+1 perfect, 0 "
+                 "none); it is colored once it is significant.</p>\n" + buckets)
+    if sc.get("compare_n"):
+        html += h3.format("Which base ranks stocks best")
+        html += (f"<p style='{p_style}'>All six bases graded on the same "
+                 f"{sc['compare_n']:,} calls (days every base scored; recovered "
+                 "calls left out). ★ marks the saved default.</p>\n"
+                 + _sc_compare_table(sc))
+    factors = _sc_factor_table(sc)
+    if factors:
+        html += h3.format("Which inputs carry signal")
+        html += (f"<p style='{p_style}'>Rank correlation between each input and "
+                 "the return against the S&amp;P 500 that followed. Positive: "
+                 "names scoring higher on it did better. An input whose sign "
+                 "disagrees with the part it plays is working against the "
+                 "verdict.</p>\n" + factors)
+    html += (f"<p style='{p_style}font-size:11px;'>Method: one call per ticker per "
+             "day (the day's last run). Entry and exit are official daily closes, "
+             "split-adjusted, without dividends, like the S&amp;P 500 index. Daily "
+             "calls at a long horizon overlap, so significance counts "
+             "non-overlapping periods, not calls: confidence is early under "
+             f"{scorecard.MIN_WINDOWS}, building from {scorecard.MIN_WINDOWS} and "
+             "solid from 8.</p>\n")
+    return html
+
+
 def _portfolio_insights(results: list[PositionAnalysis],
                         mode: Optional[str] = None) -> list[dict]:
     """Build prioritized, data-driven recommendations for the header chip.
@@ -8890,6 +9370,7 @@ def generate_html_report(
     missed_analysis_md: Optional[str] = None,
     account_summary: Optional[dict] = None,
     account_ytd: Optional[dict] = None,
+    report_scorecard: Optional[dict] = None,
 ) -> str:
     # Final verdicts with portfolio context (idempotent — main() already ran
     # this before tax analysis; other callers may not have).
@@ -10188,6 +10669,10 @@ def generate_html_report(
             missed_opportunities, recs_tracked_count,
             avoided=avoided_losses, insights=missed_insights,
             analysis_md=missed_analysis_md)
+
+    # ---------- Report Scorecard (how past calls performed) ----------
+    if report_scorecard is not None:
+        html += _render_scorecard_section(report_scorecard)
 
     # ---------- Screening section (passed-the-screen universe) ----------
     if screening_results:
@@ -12030,6 +12515,17 @@ def main():
     except Exception as e:
         print(f"[history] Skipped missed-opportunity tracking: {e}")
 
+    # Report scorecard: log today's calls, fetch the closes still missing, and
+    # grade every matured call against the S&P 500. Best-effort, like the
+    # ledger above: a failure here must not block the report.
+    report_scorecard = None
+    try:
+        report_scorecard = update_scorecard(
+            results, watchlists_analyzed or None, _prior_history,
+            run_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat())
+    except Exception as e:
+        print(f"[scorecard] Skipped: {e}")
+
     # On-demand AI post-mortem of the misses (opt-in via --analyze-misses; never
     # part of the normal report). Writes a dated Markdown file and echoes it to
     # stdout. Best-effort: any failure here must not block the report.
@@ -12037,7 +12533,11 @@ def main():
     if args.analyze_misses:
         try:
             _miss_md = analyze_missed_opportunities_ai(
-                missed_opportunities, avoided_losses, missed_insights)
+                missed_opportunities, avoided_losses, missed_insights,
+                scorecard_text=(scorecard.digest(report_scorecard,
+                                                 base_score_mode(),
+                                                 BASE_SCORE_LABELS)
+                                if report_scorecard else None))
             if _miss_md:
                 _miss_analysis_md = _miss_md
                 _adate = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
@@ -12159,6 +12659,7 @@ def main():
         missed_analysis_md=_miss_analysis_md,
         account_summary=account_summary,
         account_ytd=account_ytd,
+        report_scorecard=report_scorecard,
     )
 
     out = Path(args.out)

@@ -160,6 +160,18 @@ jobs:
           key: recs-history-${{ github.run_id }}
           restore-keys: recs-history-
 
+      # verdict_log.json is the Report Scorecard's ledger: every market day's
+      # verdicts, plus the daily closes that grade them a week, a month and
+      # three months later. Real holdings again, so it rides the cache like
+      # recs_history.json. Losing it costs history, not correctness: the next
+      # run starts a fresh log and re-seeds it from recs_history.json.
+      - name: Restore verdict log
+        uses: actions/cache@v4
+        with:
+          path: verdict_log.json
+          key: verdict-log-${{ github.run_id }}
+          restore-keys: verdict-log-
+
       # equity_history.json is one account-equity value per day. It is what makes
       # the cash-flow-adjusted YTD return self-sufficient: once a December is on
       # disk, the following January's year-start anchor needs no manual value.
@@ -193,6 +205,7 @@ jobs:
           MISSED_OPP_MODEL:   ${{ vars.MISSED_OPP_MODEL }}        # optional; missed-opp post-mortem model, defaults to claude-opus-5 (set to a model your key can use)
           NEWS_CACHE_TTL_HOURS: ${{ vars.NEWS_CACHE_TTL_HOURS }}  # optional; unset = refresh once/calendar-day. A number = rolling N-hour window; 0 = no cache
           NEWS_BATCH_WAIT_SECONDS: ${{ vars.NEWS_BATCH_WAIT_SECONDS }}  # optional; defaults to 300s before falling back to lexicon
+          SCORECARD_REQUEST_BUDGET: ${{ vars.SCORECARD_REQUEST_BUDGET }}  # optional; Yahoo requests per run for the scorecard's closes (default 500)
           # NEWS_BATCH: '0'                                       # set to disable the 50%-off Batches API pre-pass
           # Default verdict base score: composite (default) | quality | blend.
           # It drives watchlist pruning, tax flags and the history ledger; the
