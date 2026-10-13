@@ -866,6 +866,162 @@ def _render_events_stat(events: list[dict]) -> str:
     )
 
 
+# --- Today's market news (header "Today's news highlights" stat) --------------
+# Google News' US business top stories: a ranked list drawn from many
+# publishers, where each story is one cluster of coverage, so the feed order is
+# a fair proxy for importance and a story never appears twice. CNBC's top-news
+# feed stands in when Google can't be reached. Only stories published today
+# (ET) are shown. Cached in .cache/ like the other market caches (the TTL is
+# under the 10-minute CI cadence, so every scheduled run refreshes); a failed
+# fetch serves the cached list.
+_MARKET_NEWS_CACHE_PATH = (Path(__file__).resolve().parent / ".cache"
+                           / "market_news.json")
+_MARKET_NEWS_TTL_SEC = 5 * 60
+_MARKET_NEWS_FEEDS = (
+    ("Google News", "https://news.google.com/rss/headlines/section/topic/"
+                    "BUSINESS?hl=en-US&gl=US&ceid=US:en"),
+    ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+)
+
+
+def _parse_news_feed(content: bytes, feed: str) -> list[dict]:
+    """An RSS feed's items as [{"title", "source", "link", "ts"}], in feed
+    order. Google ends every title with " - Publisher"; that moves to
+    `source`. Items without a readable date are dropped, since they can't be
+    placed in a day, and links other than http(s) are blanked."""
+    import xml.etree.ElementTree as ET
+    out = []
+    for item in ET.fromstring(content).iter("item"):
+        title = " ".join((item.findtext("title") or "").split())
+        source = " ".join((item.findtext("source") or "").split()) or feed
+        if title.endswith(" - " + source):
+            title = title[:-len(source) - 3].rstrip()
+        link = (item.findtext("link") or "").strip()
+        try:
+            when = parsedate_to_datetime(item.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=ZoneInfo("UTC"))
+        if title:
+            out.append({"title": title, "source": source, "ts": when.timestamp(),
+                        "link": link if link.startswith(("https://", "http://"))
+                        else ""})
+    return out
+
+
+def _fetch_news_feed() -> Optional[dict]:
+    """The first feed in _MARKET_NEWS_FEEDS that answers with at least one
+    story from today, as {"items", "source", "fetched_at"}; None if none does.
+    Logs one line per feed tried, so a dead feed shows in the run log."""
+    if not requests:
+        return None
+    today = _et_now().date()
+    for name, url in _MARKET_NEWS_FEEDS:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if r.status_code != 200:
+                print(f"[market-news] {name}: HTTP {r.status_code}")
+                continue
+            items = _parse_news_feed(r.content, name)
+        except Exception as e:
+            print(f"[market-news] {name}: {type(e).__name__}")
+            continue
+        n = sum(1 for i in items if _et_now(i["ts"]).date() == today)
+        print(f"[market-news] {name}: {n} of {len(items)} stories are from today")
+        if n:
+            return {"items": items, "source": name, "fetched_at": time.time()}
+    return None
+
+
+def fetch_market_news() -> Optional[dict]:
+    """Today's top business stories for the header news tile:
+    {"items": [{"title", "source", "link", "ts"}], "source", "fetched_at"},
+    with items in feed order (most prominent first) and published today (ET).
+    Fresh cache, then the live feeds, then the stale cache. None when disabled
+    (MARKET_METER=0) or when nothing from today is available."""
+    if os.environ.get("MARKET_METER", "").strip() == "0":
+        return None
+    cached: Optional[dict] = None
+    age = float("inf")
+    try:
+        if _MARKET_NEWS_CACHE_PATH.exists():
+            cached = json.loads(_MARKET_NEWS_CACHE_PATH.read_text())
+            age = time.time() - float(cached.get("fetched_at", 0))
+    except Exception:
+        cached = None
+    data = cached
+    if age >= _MARKET_NEWS_TTL_SEC:
+        live = _fetch_news_feed()
+        if live:
+            data = live
+            try:
+                _MARKET_NEWS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _MARKET_NEWS_CACHE_PATH.write_text(json.dumps(live))
+            except Exception:
+                pass
+    try:
+        today = _et_now().date()
+        items = [i for i in (data or {}).get("items") or []
+                 if i.get("title") and _et_now(i["ts"]).date() == today]
+    except Exception:
+        return None
+    return {**data, "items": items} if items else None
+
+
+def _render_news_stat(news: Optional[dict]) -> str:
+    """'Today's news highlights' tile, beside Next market event. The lead story
+    is the figure, with its source, time and the day's story count on the muted
+    sub-line. Hovering (or tapping) opens a panel with every story from today,
+    most prominent first, each linking to the article (script: newsWrap)."""
+    if not news or not news.get("items"):
+        return ""
+    import html as _html
+
+    def esc(s) -> str:
+        return _html.escape(str(s or ""), quote=True)
+
+    def clock(ts) -> str:
+        return f"{_et_now(ts):%I:%M %p}".lstrip("0")
+
+    items = news["items"]
+    rows = []
+    for i in items:
+        body = (f'<span class="news-time">{clock(i["ts"])}</span>'
+                f'<span class="news-text">'
+                f'<span class="news-title">{esc(i["title"])}</span>'
+                f'<span class="news-src">{esc(i.get("source"))}</span></span>')
+        rows.append(
+            f'<li><a class="news-item" href="{esc(i["link"])}" target="_blank" '
+            f'rel="noopener noreferrer">{body}</a></li>' if i.get("link")
+            else f'<li><div class="news-item">{body}</div></li>')
+    lead, n = items[0], len(items)
+    now = _et_now()
+    stories = f"{n} {'story' if n == 1 else 'stories'}"
+    feed = news.get("source") or "the news feed"
+    updated = (f"; updated {clock(news['fetched_at'])}"
+               if news.get("fetched_at") else "")
+    return (
+        '<div class="news-wrap" id="newsWrap">'
+        '<div class="stat news-stat" id="newsStat" role="button" tabindex="0" '
+        'aria-expanded="false" aria-controls="newsPanel">'
+        f'<strong class="news-lead">{esc(lead["title"])}</strong>'
+        "Today's news highlights"
+        f'<div class="news-sub">{esc(lead.get("source"))} · {clock(lead["ts"])} · '
+        f'{stories} today</div>'
+        '</div>'
+        '<div class="news-panel" id="newsPanel" role="region" '
+        'aria-label="Today\'s news highlights">'
+        f'<div class="news-panel-head"><span>Today\'s news highlights · '
+        f'{now:%a} {now:%b} {now.day}</span><span>{stories}</span></div>'
+        f'<ol class="news-list">{"".join(rows)}</ol>'
+        f'<div class="news-foot">Top business stories from {esc(feed)}, '
+        f'most prominent first. All times ET{updated}.</div>'
+        '</div>'
+        '</div>'
+    )
+
+
 # --- True account YTD return (cash-flow adjusted) -----------------------------
 # The benchmark tile above is a price return on the CURRENT basket. It is not
 # what a broker shows you, and on an account that takes regular deposits the two
@@ -9174,6 +9330,9 @@ def generate_html_report(
     # Next market-moving event (jobs, CPI, FOMC, opex…) — sits right after the
     # Today/YTD tiles. Independent of holdings; hides itself with no data.
     events_stat_html = _render_events_stat(fetch_market_events())
+    # Today's top business stories — beside the events tile; the hover panel
+    # lists all of them. Also independent of holdings; hides with no stories.
+    news_stat_html = _render_news_stat(fetch_market_news())
 
     holdings_summary = ""
     if has_holdings:
@@ -9493,6 +9652,50 @@ def generate_html_report(
                       color: var(--fg-muted); transition: color 0.15s; }}
   a.stat.clickable:hover {{ color: var(--fg-strong); }}
   a.stat.clickable:hover strong {{ text-decoration: underline; }}
+  /* Today's news highlights: the tile shows the lead story; hovering opens a
+     panel hung from it with every story from today (see the newsWrap
+     script). A transparent strip bridges the gap so the pointer can cross
+     into the panel, and only the list scrolls. */
+  .news-wrap {{ position: relative; }}
+  .news-stat {{ cursor: pointer; }}
+  .news-stat:hover, .news-wrap.open .news-stat {{ color: var(--fg-strong); }}
+  .news-stat:focus-visible {{ outline: 2px solid var(--fg-chip-blue);
+                              outline-offset: 4px; border-radius: 4px; }}
+  /* 64px = the narrow layout's page and card padding, so a phone-width row
+     cuts the headline short instead of scrolling sideways. */
+  .news-lead {{ max-width: min(340px, calc(100vw - 64px)); overflow: hidden;
+                text-overflow: ellipsis; }}
+  .news-sub {{ font-size: 10px; color: var(--fg-muted); font-weight: 400;
+               text-transform: none; letter-spacing: 0; margin-top: 2px; }}
+  .news-panel {{ display: none; position: absolute; top: calc(100% + 8px);
+                 left: 0; z-index: 30; width: 460px; max-width: calc(100vw - 24px);
+                 background: var(--bg-card); color: var(--fg-body);
+                 border: 1px solid var(--border-medium); border-radius: 12px;
+                 box-shadow: var(--shadow-sticky); padding: 6px; text-align: left; }}
+  .news-panel::before {{ content: ""; position: absolute; left: 0; right: 0;
+                         top: -9px; height: 9px; }}
+  .news-wrap.open .news-panel {{ display: block; }}
+  .news-wrap.flip .news-panel {{ left: auto; right: 0; }}
+  .news-panel-head {{ display: flex; justify-content: space-between; gap: 10px;
+                      font-size: 10px; font-weight: 700; text-transform: uppercase;
+                      letter-spacing: 0.6px; color: var(--fg-faint);
+                      padding: 8px 10px 7px; }}
+  .news-list {{ list-style: none; margin: 0; padding: 0;
+                max-height: min(62vh, 540px); overflow-y: auto;
+                overscroll-behavior: contain; }}
+  .news-item {{ display: flex; gap: 10px; align-items: baseline;
+                padding: 7px 10px; border-radius: 8px; color: inherit;
+                text-decoration: none; transition: background 0.15s; }}
+  a.news-item:hover {{ background: var(--bg-card-hover); }}
+  a.news-item:hover .news-title {{ text-decoration: underline; }}
+  .news-time {{ flex: none; width: 56px; text-align: right; font-size: 11px;
+                color: var(--fg-muted); font-variant-numeric: tabular-nums; }}
+  .news-text {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }}
+  .news-title {{ font-size: 12.5px; line-height: 1.4; font-weight: 600;
+                 color: var(--fg-strong); }}
+  .news-src {{ font-size: 11px; color: var(--fg-muted); }}
+  .news-foot {{ font-size: 10.5px; color: var(--fg-faint); margin-top: 4px;
+                padding: 7px 10px 5px; border-top: 1px dashed var(--border-medium); }}
 
   /* Utility classes for the most-repeated cell decorations — the static box
      rules move out of every row (smaller markup, identical rendering); only
@@ -9918,6 +10121,12 @@ def generate_html_report(
     .qr-panel {{ position: fixed; top: auto; bottom: 12px;
                  left: 10px; right: 10px; width: auto; min-width: 0;
                  max-width: none; }}
+    /* Same bottom sheet for the news panel. */
+    .news-panel, .news-wrap.flip .news-panel {{ position: fixed; top: auto;
+                 bottom: 12px; left: 10px; right: 10px; width: auto;
+                 max-width: none; }}
+    .news-panel::before {{ display: none; }}
+    .news-list {{ max-height: 60vh; }}
   }}
 
   /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
@@ -10051,6 +10260,7 @@ def generate_html_report(
     {earnings_stat_html}
     {benchmark_stat_html}
     {events_stat_html}
+    {news_stat_html}
   </div>
 </div>
 
@@ -11224,6 +11434,61 @@ window.scrollToSection = function(id) {
   });
   wrap.addEventListener('mouseleave', close);
   window.addEventListener('scroll', close, { passive: true });
+})();
+</script>
+<script>
+// Today's news highlights: hovering the tile opens the list of today's
+// stories. Closing waits a moment after the pointer leaves, so it can cross
+// into the panel and click a headline. Without hover (touch screens) a tap
+// toggles it; Escape, a tap elsewhere or tabbing away closes it.
+(function() {
+  var wrap = document.getElementById('newsWrap');
+  var tile = document.getElementById('newsStat');
+  var panel = document.getElementById('newsPanel');
+  if (!wrap || !tile || !panel) return;
+  var hover = !!(window.matchMedia && window.matchMedia('(hover: hover)').matches);
+  var timer = null;
+  function isOpen() { return wrap.classList.contains('open'); }
+  function open() {
+    clearTimeout(timer);
+    if (isOpen()) return;
+    wrap.classList.remove('flip');
+    wrap.classList.add('open');
+    tile.setAttribute('aria-expanded', 'true');
+    // Hang left-aligned under the tile unless that runs off the right edge.
+    if (panel.getBoundingClientRect().right > document.documentElement.clientWidth - 8) {
+      wrap.classList.add('flip');
+    }
+  }
+  function close() {
+    clearTimeout(timer);
+    wrap.classList.remove('open');
+    tile.setAttribute('aria-expanded', 'false');
+  }
+  if (hover) {
+    wrap.addEventListener('mouseenter', open);
+    wrap.addEventListener('mouseleave', function() {
+      clearTimeout(timer);
+      timer = setTimeout(close, 250);
+    });
+  }
+  tile.addEventListener('click', function() {
+    if (isOpen() && !hover) close(); else open();
+  });
+  tile.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    if (isOpen()) close(); else open();
+  });
+  wrap.addEventListener('focusout', function(e) {
+    if (e.relatedTarget && !wrap.contains(e.relatedTarget)) close();
+  });
+  document.addEventListener('click', function(e) {
+    if (isOpen() && !wrap.contains(e.target)) close();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && isOpen()) { close(); tile.focus(); }
+  });
 })();
 </script>
 <script>
