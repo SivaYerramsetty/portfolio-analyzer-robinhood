@@ -590,6 +590,7 @@ def test_render_section() -> None:
         holding = _scored("AAA", 80, [1.0] * 9)
     stubs = {"fetch_market_fear_greed": lambda: None,
              "fetch_benchmark_returns": lambda: None,
+             "fetch_market_news": lambda: None,
              "_compute_holdings_ytd_return": lambda results: None}
     with patched(ap, **stubs), _mode_env(), \
             contextlib.redirect_stdout(io.StringIO()):
