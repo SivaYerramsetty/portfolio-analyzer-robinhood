@@ -10237,6 +10237,10 @@ def generate_html_report(
     # Today's top business stories — beside the events tile; the hover panel
     # lists all of them. Also independent of holdings; hides with no stories.
     news_stat_html = _render_news_stat(fetch_market_news())
+    # The two share one wrapper (.stat-pair) so they always sit side by side.
+    market_pair_html = (
+        f'<div class="stat-pair">{events_stat_html}{news_stat_html}</div>'
+        if events_stat_html or news_stat_html else "")
 
     holdings_summary = ""
     if has_holdings:
@@ -10535,15 +10539,21 @@ def generate_html_report(
     .fg-score {{ font-size: 19px; }}
   }}
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
-                   border-radius: 10px; padding: 14px 20px;
+                   border-radius: 10px; padding: 12px 16px;
                    margin-bottom: 16px;
                    box-shadow: var(--shadow-card); }}
   /* Stats packed left-to-right in order so each tile sits directly after the
      previous one (e.g. Missed opportunities right after Watchlist BUY signals).
-     flex-wrap still lets them stack on narrow screens; the larger column gap
-     keeps them readable without space-between flinging tiles to the edges. */
-  .summary-row {{ display: flex; gap: 14px 34px; flex-wrap: wrap;
-                  justify-content: flex-start; }}
+     flex-wrap still lets them stack on narrow screens. The gap is sized so
+     every tile (the after-hours tile and a margin caption included) fits in
+     two rows down to a 1280px-wide window. */
+  .summary-row {{ --stat-gap: 18px; display: flex; gap: 12px var(--stat-gap);
+                  flex-wrap: wrap; justify-content: flex-start; }}
+  /* Next market event + Today's news highlights travel as one item, so the
+     news never wraps onto a line of its own. The pair needs room for the
+     event plus the news tile's 180px minimum, then stretches to fill its row;
+     the news tile takes all of that stretch and truncates its headline. */
+  .stat-pair {{ display: flex; column-gap: var(--stat-gap); flex: 1 1 auto; }}
   .stat {{ font-size: 11px; color: var(--fg-muted);
            text-transform: uppercase; letter-spacing: 0.3px;
            font-weight: 600; white-space: nowrap; }}
@@ -10560,17 +10570,17 @@ def generate_html_report(
      panel hung from it with every story from today (see the newsWrap
      script). A transparent strip bridges the gap so the pointer can cross
      into the panel, and only the list scrolls. */
-  .news-wrap {{ position: relative; }}
-  .news-stat {{ cursor: pointer; }}
+  /* 180px holds the label and sub-line; the width also caps what the tile
+     asks of its row, so a long headline never pushes the pair onto a new one. */
+  .news-wrap {{ position: relative; flex: 1 0 auto; width: 180px; }}
+  .news-stat {{ cursor: pointer; overflow: hidden; text-overflow: ellipsis; }}
   .news-stat:hover, .news-wrap.open .news-stat {{ color: var(--fg-strong); }}
   .news-stat:focus-visible {{ outline: 2px solid var(--fg-chip-blue);
                               outline-offset: 4px; border-radius: 4px; }}
-  /* 64px = the narrow layout's page and card padding, so a phone-width row
-     cuts the headline short instead of scrolling sideways. */
-  .news-lead {{ max-width: min(340px, calc(100vw - 64px)); overflow: hidden;
-                text-overflow: ellipsis; }}
+  .news-lead {{ overflow: hidden; text-overflow: ellipsis; }}
   .news-sub {{ font-size: 10px; color: var(--fg-muted); font-weight: 400;
-               text-transform: none; letter-spacing: 0; margin-top: 2px; }}
+               text-transform: none; letter-spacing: 0; margin-top: 2px;
+               overflow: hidden; text-overflow: ellipsis; }}
   .news-panel {{ display: none; position: absolute; top: calc(100% + 8px);
                  left: 0; z-index: 30; width: 460px; max-width: calc(100vw - 24px);
                  background: var(--bg-card); color: var(--fg-body);
@@ -11036,6 +11046,9 @@ def generate_html_report(
                  max-width: none; }}
     .news-panel::before {{ display: none; }}
     .news-list {{ max-height: 60vh; }}
+    /* A phone row is too narrow for the pair side by side: the news drops
+       under the event, still inside the pair, at full width. */
+    .stat-pair {{ flex-wrap: wrap; row-gap: 12px; min-width: 0; }}
   }}
 
   /* ---------- Mobile tap-to-reveal tooltip (bottom sheet) ----------
@@ -11168,8 +11181,7 @@ def generate_html_report(
     {missed_stat_html}
     {earnings_stat_html}
     {benchmark_stat_html}
-    {events_stat_html}
-    {news_stat_html}
+    {market_pair_html}
   </div>
 </div>
 

@@ -181,6 +181,36 @@ def _tag_errors(html: str) -> list[str]:
     return checker.errors + [f"unclosed <{t}>" for t in checker.stack]
 
 
+class _PairChildren(HTMLParser):
+    """The direct children of the summary row's .stat-pair wrapper, as
+    (tag, class, id) tuples; `children` stays None when there is no pair."""
+
+    def __init__(self):
+        super().__init__()
+        self.depth = 0                    # 0 = outside the pair
+        self.children: list[tuple] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self.depth:
+            if self.depth == 1:
+                self.children.append((tag, a.get("class"), a.get("id")))
+            if tag not in _TagChecker.VOID:
+                self.depth += 1
+        elif tag == "div" and a.get("class") == "stat-pair":
+            self.depth, self.children = 1, []
+
+    def handle_endtag(self, tag):
+        if self.depth and tag not in _TagChecker.VOID:
+            self.depth -= 1
+
+
+def _pair_children(html: str) -> list[tuple] | None:
+    parser = _PairChildren()
+    parser.feed(html)
+    return parser.children
+
+
 # ------------------------------------------------------------- 1. parsing ----
 
 def test_parse() -> None:
@@ -331,7 +361,7 @@ def test_render() -> None:
 
 
 def test_report() -> None:
-    section("generate_html_report: the tile sits after Next market event")
+    section("generate_html_report: the tile sits beside Next market event")
     stubs = {
         "fetch_market_fear_greed": lambda: None,
         "fetch_benchmark_returns": lambda: None,
@@ -354,6 +384,9 @@ def test_report() -> None:
         ap.fetch_market_news = lambda: None
         with contextlib.redirect_stdout(io.StringIO()):
             bare = ap.generate_html_report([])
+        ap.fetch_market_events = lambda: []
+        with contextlib.redirect_stdout(io.StringIO()):
+            empty = ap.generate_html_report([])
     finally:
         for name, fn in real.items():
             setattr(ap, name, fn)
@@ -365,8 +398,16 @@ def test_report() -> None:
     row = html[html.index('<div class="summary-row">'):html.index('id="fltBar"')]
     check(0 <= row.find("Next market event") < row.find('id="newsWrap"'), True,
           "the news tile follows the events tile in the summary row")
+    check(_pair_children(row), [("div", "stat", None),
+                                ("div", "news-wrap", "newsWrap")],
+          "the two share one .stat-pair, so they can't wrap apart")
+    check((".stat-pair {" in html, "--stat-gap" in html), (True, True),
+          "the pair and the row's shared gap are styled")
     check(('id="newsWrap"' in bare, "Next market event" in bare), (False, True),
           "no stories: the tile is left out and the row is otherwise unchanged")
+    check(_pair_children(bare), [("div", "stat", None)],
+          "no stories: the pair holds the events tile alone")
+    check(_pair_children(empty), None, "no events and no stories: no empty pair")
 
     script = next((s for s in re.findall(r"<script>(.*?)</script>", html, re.S)
                    if "getElementById('newsWrap')" in s), "")
