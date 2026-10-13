@@ -730,6 +730,7 @@ def _render_report(results, watchlists, env=None) -> str:
     """generate_html_report with its network lookups stubbed out."""
     stubs = {"fetch_market_fear_greed": lambda: None,
              "fetch_benchmark_returns": lambda: None,
+             "fetch_market_news": lambda: None,
              "_compute_holdings_ytd_return": lambda results: None}
     real = {name: getattr(ap, name) for name in stubs}
     over = {"GITHUB_REPOSITORY": "owner/repo", **(env or {})}
