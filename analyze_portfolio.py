@@ -139,13 +139,16 @@ COMMAND REFERENCE — every way to run this script
 
     • Click any column header to sort; click again to reverse.
     • Filter bar at top: search box + one-click Quick screens + an expandable
-      faceted panel. Facets (verdict, sector, analyst, insider, trend, …) OR
-      within a group and AND across groups; every numeric metric (upside, gain,
-      composite/verdict/quality score, position size, days held, …) has a
-      min/max range slider. Active filters show as removable chips with live
-      per-option counts. ☆ Save names the current combo and pins it to the bar
-      (rename or delete it from the same button); the ✕ on any pill takes it
-      off the bar. All of it lives in your browser's localStorage, per browser.
+      faceted panel. Facets (verdict, agreement across bases, data
+      confidence, list, sector, analyst, insider, trend, drop vs its normal,
+      …) OR within a group and AND across groups; every numeric metric
+      (upside, gain, composite/verdict/quality score, position size, days
+      held, distance below the 52-week high, volatility, share of portfolio
+      risk, …) has a min/max range slider. Active filters show as removable
+      chips with live per-option counts. ☆ Save names the current combo and
+      pins it to the bar (rename or delete it from the same button); the ✕ on
+      any pill takes it off the bar. All of it lives in your browser's
+      localStorage, per browser.
     • Live prices via yfinance; analyst ratings via Robinhood/Finnhub/yfinance.
 
 --- GITHUB ACTIONS (manual trigger, see portfolio.yml) --------------------
@@ -6055,13 +6058,56 @@ def _rank_move_attrs(move: Optional[dict]) -> tuple[str, object]:
     return "", ""
 
 
-def _tr_open(r, orders: Optional[dict[str, int]] = None) -> str:
+# The filter bar's List facet: holding rows read HOLDINGS_LIST_KEY, watchlist
+# rows their list's key from _watchlist_filter_keys.
+HOLDINGS_LIST_KEY = "held"
+
+
+def _watchlist_filter_keys(watchlists: Optional[dict]) -> dict[str, str]:
+    """{watchlist name: List-facet value}, in report order. The value is 'wl-'
+    plus the name lowercased with every other run of characters folded to
+    '-', because saved filter combos are stored as signatures that split on
+    ',' and '|', which a list name may contain. Names that fold to the same
+    value get -2, -3, … so two lists never merge."""
+    import re as _re
+    keys: dict[str, str] = {}
+    for name in (watchlists or {}):
+        slug = _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "list"
+        key, n = f"wl-{slug}", 2
+        while key in keys.values():
+            key, n = f"wl-{slug}-{n}", n + 1
+        keys[name] = key
+    return keys
+
+
+def _confidence_attr(v: Optional[Verdict]) -> str:
+    """The Data confidence filter value: 'high' / 'medium' / 'low', or ''."""
+    return ((getattr(v, "confidence", None) if v else None) or "").lower()
+
+
+def _base_agreement(r, mode: str) -> str:
+    """The Across bases filter value under `mode`: 'agree' when Composite,
+    Quality and Blend give r the same verdict at that mode's calibration (the
+    Base switch wouldn't change it), 'split' when they don't, '' for rows
+    without per-mode verdicts (ETF/thematic)."""
+    _, cal = split_base_mode(mode)
+    verdicts = [(getattr(r, "verdicts", None) or {}).get(join_base_mode(b, cal))
+                for b in BASE_SCORE_BASES]
+    if any(v is None for v in verdicts):
+        return ""
+    return "agree" if len({v.label for v in verdicts}) == 1 else "split"
+
+
+def _tr_open(r, orders: Optional[dict[str, int]] = None,
+             list_key: str = HOLDINGS_LIST_KEY) -> str:
     """Open a <tr> with data attributes used by the filter bar.
 
     Rows with per-mode verdicts also carry each mode's verdict, score, rank
-    movement and tax flag (data-<attr>-<mode>), which the base switch copies
-    into the plain attributes. `orders` ({mode: index}) is the row's place in
-    its table's default order under each mode."""
+    movement, tax flag, data confidence and base agreement
+    (data-<attr>-<mode>), which the base switch copies into the plain
+    attributes. `orders` ({mode: index}) is the row's place in its table's
+    default order under each mode. `list_key` is the row's List-facet value:
+    HOLDINGS_LIST_KEY, or its watchlist's from _watchlist_filter_keys."""
     verdict = (r.verdict.label if r.verdict else "") or ""
     # Verdict numeric score (0-100), separate from the label
     verdict_score = ("" if (not r.verdict or r.verdict.score is None)
@@ -6125,7 +6171,9 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None) -> str:
             per_mode += (f"data-verdict-{m}='{v.label if v else ''}' "
                          f"data-verdict-score-{m}='{'' if not v or v.score is None else v.score}' "
                          f"data-rank-move-{m}='{m_move}' data-rank-delta-{m}='{m_delta}' "
-                         f"data-has-tax-{m}='{m_tax}' ")
+                         f"data-has-tax-{m}='{m_tax}' "
+                         f"data-confidence-{m}='{_confidence_attr(v)}' "
+                         f"data-bases-{m}='{_base_agreement(r, m)}' ")
     for m, index in (orders or {}).items():
         per_mode += f"data-order-{m}='{index}' "
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
@@ -6135,6 +6183,15 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None) -> str:
     _ns = getattr(r, "news_sentiment", None) or {}
     news = (_ns.get("label") or "").lower()
     news_score = "" if _ns.get("score") is None else _ns.get("score")
+    # Price risk (risk_signals), for the Risk filters: the drop's band against
+    # the stock's own history, how far below its 52-week closing high it sits
+    # (a positive %), its yearly volatility and, for holdings, its share of
+    # the portfolio's risk.
+    band = risk_signals.drop_band(r.drop_pct, r.drop_severity)
+    drop_band = band[0] if band else ""
+    off_high = "" if r.drop_pct is None else round(abs(r.drop_pct), 1)
+    vol = "" if r.volatility is None else round(r.volatility, 1)
+    risk_share = "" if r.risk_share is None else round(r.risk_share, 1)
     # Combined search text — lowercased for case-insensitive contains() matching
     search_text = f"{r.ticker} {r.name} {r.sector or ''}".lower()
     return (
@@ -6155,6 +6212,11 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None) -> str:
         f"data-recommendation='{recommendation}' "
         f"data-has-tax='{has_tax}' "
         f"data-rank-move='{rank_move}' data-rank-delta='{rank_delta}' "
+        f"data-confidence='{_confidence_attr(r.verdict)}' "
+        f"data-bases='{_base_agreement(r, base_score_mode())}' "
+        f"data-drop-band='{drop_band}' data-off-high='{off_high}' "
+        f"data-vol='{vol}' data-risk-share='{risk_share}' "
+        f"data-list='{list_key}' "
         f"{per_mode}"
         f"data-search='{search_text}'>"
     )
@@ -10311,6 +10373,13 @@ def generate_html_report(
     <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{action_count_html}</strong>Sell / Trim flags</a>
     <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{add_count_html}</strong>Add candidates</a>"""
 
+    # The filter bar's List facet: each row's value, and the bar's
+    # [[value, label], …] for every list in report order.
+    list_keys = _watchlist_filter_keys(watchlists)
+    lists_attr = _attr_esc(json.dumps(
+        [[HOLDINGS_LIST_KEY, "Holdings"]]
+        + [[key, name] for name, key in list_keys.items()]))
+
     html = f"""<!DOCTYPE html>
 <html data-base-view="{base_score_mode()}">
 <head>
@@ -10914,6 +10983,8 @@ def generate_html_report(
                     cursor: pointer; text-transform: none; letter-spacing: 0; display: none; }}
   .flt-card.narrowed .flt-card-reset {{ display: inline; }}
   .flt-card-reset:hover {{ color: var(--fg-chip-red); }}
+  .flt-tip {{ cursor: help; }}
+  .flt-tip::after {{ content: " ⓘ"; color: var(--fg-faint); font-weight: 400; }}
 
   /* ---- Facet option pills ---- */
   .flt-opts {{ display: flex; flex-wrap: wrap; gap: 5px; }}
@@ -11185,7 +11256,7 @@ def generate_html_report(
   </div>
 </div>
 
-<div class="flt-bar" id="fltBar">
+<div class="flt-bar" id="fltBar" data-lists='{lists_attr}'>
   <div class="flt-top">
     <span class="flt-search" id="fltSearchWrap">
       <input type="text" id="searchInput" placeholder="🔍 Search ticker, name or sector…" autocomplete="off">
@@ -11291,7 +11362,8 @@ def generate_html_report(
             # Default order: verdict score high → low (upside as tiebreak).
             # Shared with compute_run_ranks so rank badges match the display.
             items.sort(key=_watchlist_rank_key, reverse=True)
-            html += f"<h3 style='margin-top:24px;color:#34495e;'>📋 {wl_name} ({len(items)})</h3>\n"
+            html += (f"<h3 style='margin-top:24px;color:#34495e;'>📋 {_attr_esc(wl_name)} "
+                     f"({len(items)})</h3>\n")
             html += "<div class='table-wrap'><table>\n<thead><tr>"
             html += (
                 "<th>Ticker</th>"
@@ -11322,7 +11394,7 @@ def generate_html_report(
                     f"{_filter_dots(r.filters)} {_filter_count_html(r, passed)}"
                     if r.filters else "<span style='color:var(--fg-faint);'>n/a</span>"
                 )
-                html += _tr_open(r, orders.get(id(r)))
+                html += _tr_open(r, orders.get(id(r)), list_key=list_keys[wl_name])
                 html += _td(_ticker_cell(r), r.ticker, "ticker")
                 html += _td(_name_sector_cell(r), r.name)
                 # Watchlist items omit Position / Cost-Gain (you don't own them)
@@ -11433,10 +11505,11 @@ Verdicts are framework outputs, not investment advice.
 <script>
 // Base-score view switch. Every verdict-dependent piece of the report is
 // rendered once per base-score mode (.bmode copies, shown by CSS from
-// html[data-base-view]), and rows carry each mode's verdict, score, rank move
-// and tax flag as data-<attr>-<mode>. Switching copies the viewed mode's
-// values into the plain attributes that sorting and the filter bar read,
-// restores the table order, and remembers the choice in this browser.
+// html[data-base-view]), and rows carry each mode's verdict, score, rank move,
+// tax flag, data confidence and base agreement as data-<attr>-<mode>.
+// Switching copies the viewed mode's values into the plain attributes that
+// sorting and the filter bar read, restores the table order, and remembers
+// the choice in this browser.
 (function() {
   var MODES = window.BASE_SCORE_MODES || [];
   var BASES = window.BASE_SCORE_BASES || [];
@@ -11456,7 +11529,8 @@ Verdicts are framework outputs, not investment advice.
   function joinMode(base, cal) {
     return base + (cal === 'cal' ? CAL_SUFFIX : '');
   }
-  var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax'];
+  var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax',
+                  'confidence', 'bases'];
   var root = document.documentElement;
   var sw = document.getElementById('baseScoreSwitch');
 
@@ -11681,15 +11755,34 @@ Verdicts are framework outputs, not investment advice.
   var rows = Array.prototype.slice.call(document.querySelectorAll('tbody tr'))
                .filter(function(r) { return r.hasAttribute('data-verdict'); });
 
+  // The List facet's values and labels come from the page, [[value, label], …]
+  // in report order: values are slugs of the watchlist names.
+  var LISTS = [];
+  try { LISTS = JSON.parse(document.getElementById('fltBar').getAttribute('data-lists')) || []; }
+  catch (e) {}
+  var listLabels = {};
+  LISTS.forEach(function(p) { listLabels[p[0]] = p[1]; });
+
   // ---- Config: every metric a row exposes, grouped into collapsible sections.
   //      type:'facet'  -> categorical, OR within a card, AND across cards.
   //      type:'range'  -> numeric min/max dual slider (AND).
   //      Controls render only when the data actually varies, so reports with
-  //      no tax/watchlist/insider rows simply don't show those controls. ----
+  //      no tax/watchlist/insider rows simply don't show those controls.
+  //      flag:true lets a facet with one option render (its other value is
+  //      skipped) when some rows have it and some don't. tip: the card
+  //      label's hover text. comboLabels: option names for the Most used
+  //      bar, where no card label says what "Low" is low on. ----
   var SECTIONS = [
     { id: 'verdict', title: 'Verdict & signals', cards: [
       { type:'facet', attr:'verdict', label:'Verdict',
         order:['ADD','BUY','HOLD','WAIT','WATCH','TRIM','SELL','PASS'] },
+      { type:'facet', attr:'bases', label:'Across bases', short:'Bases', skip:[''],
+        order:['agree','split'], labels:{agree:'Same on every base',split:'Differs by base'},
+        tip:'Whether Composite, Quality and Blend give the same verdict under the current Scoring. Differs means the Base switch changes it.' },
+      { type:'facet', attr:'confidence', label:'Data confidence', short:'Confidence', skip:[''],
+        order:['high','medium','low'], labels:{high:'High',medium:'Medium',low:'Low'},
+        comboLabels:{high:'High confidence',medium:'Medium confidence',low:'Low confidence'},
+        tip:'How much of the verdict’s base score had data behind it: High is 85% or more, Medium 55% or more, Low less.' },
       { type:'facet', attr:'recommendation', label:'Analyst rating', short:'Analyst', skip:['none',''],
         order:['strong_buy','buy','hold','sell','strong_sell'],
         labels:{strong_buy:'Strong Buy',buy:'Buy',hold:'Hold',sell:'Sell',strong_sell:'Strong Sell'} },
@@ -11712,7 +11805,21 @@ Verdicts are framework outputs, not investment advice.
       { type:'range', attr:'pos52', label:'52-wk position', short:'52-wk', unit:'%' },
       { type:'range', attr:'ma-pct', label:'vs 200-day MA', short:'vs 200d', unit:'%' },
     ]},
+    { id: 'risk', title: 'Risk', cards: [
+      { type:'facet', attr:'drop-band', label:'Drop vs its normal', short:'Drop', skip:[''],
+        order:['normal','deep','unusual','rare'],
+        labels:{normal:'Normal',deep:'Deep',unusual:'Unusual',rare:'Rare'},
+        comboLabels:{normal:'Normal drop',deep:'Deep drop',unusual:'Unusual drop',rare:'Rare drop'},
+        tip:'How far below its 52-week high the stock sits, against its own history (up to five years). Deep: further down than on 75% of days; Unusual: 90%; Rare: 97.5%. Drops under 5% get no label.' },
+      { type:'range', attr:'off-high', label:'Below 52-wk high', short:'Off high', unit:'%' },
+      { type:'range', attr:'vol', label:'Volatility', unit:'%',
+        tip:'How much the price swings in a year, from the past year of daily moves.' },
+      { type:'range', attr:'risk-share', label:'Share of portfolio risk', short:'Risk share', unit:'%',
+        tip:'Holdings only: the part of the portfolio’s daily swings this position accounts for. Compare it with Position size.' },
+    ]},
     { id: 'class', title: 'Classification', cards: [
+      { type:'facet', attr:'list', label:'List', skip:[''],
+        order:LISTS.map(function(p) { return p[0]; }), labels:listLabels },
       { type:'facet', attr:'sector', label:'Sector', skip:[''] },
       { type:'facet', attr:'bucket', label:'Type', skip:[''],
         labels:{compounder:'Compounder',thematic:'Thematic',etf:'ETF'} },
@@ -11731,7 +11838,8 @@ Verdicts are framework outputs, not investment advice.
         order:['up','down','new'],
         labels:{up:'▲ Moved up',down:'▼ Moved down','new':'★ New today'} },
       { type:'range', attr:'rank-delta', label:'Rank Δ (places)', short:'Rank Δ', integer:true },
-      { type:'facet', attr:'has-tax', label:'Tax', skip:['0',''], labels:{'1':'Has tax detail'} },
+      { type:'facet', attr:'has-tax', label:'Tax', skip:['0',''], flag:true,
+        labels:{'1':'Has tax detail'} },
     ]},
   ];
 
@@ -11750,6 +11858,8 @@ Verdicts are framework outputs, not investment advice.
     { key:'big-upside',    label:'Upside ≥15%',      ranges:{upside:[15,null]} },
     { key:'earnings-soon', label:'📅 Reports ≤7d', ranges:{'earnings-days':[0,7]} },
     { key:'tax-loss',      label:'Loss harvest',          ranges:{'gain-pct':[null,-5]} },
+    { key:'drop-unusual',  label:'📉 Unusual drop',  facets:{'drop-band':['unusual','rare']} },
+    { key:'risk-heavy',    label:'⚖️ Risk share ≥10%', ranges:{'risk-share':[10,null]} },
   ];
   var USAGE_KEY  = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
   var SAVED_KEY  = 'fltSavedViews';   // [{ sig, name, t }] — combos you named; pinned first
@@ -11810,8 +11920,27 @@ Verdicts are framework outputs, not investment advice.
     });
     return keys;
   }
+  // A facet needs a real choice: two options, or one a flag facet's rows
+  // split on (some have it, some don't).
+  function facetLive(card) {
+    var vals = presentValues(card);
+    if (vals.length >= 2) return true;
+    if (!card.flag || !vals.length) return false;
+    return rows.some(function(r) { return attrRaw(r, card.attr) !== vals[0]; });
+  }
   function cardFor(attr) { return cardEls[attr] ? cardEls[attr].card : null; }
   function optLabel(card, v) { return (card && card.labels && card.labels[v]) || v; }
+  // Option labels can be data (sector and watchlist names), so markup built
+  // from them escapes them.
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+  function labelHtml(card) {
+    return card.tip ? '<span class="flt-tip" title="' + esc(card.tip) + '">' + card.label + '</span>'
+                    : '<span>' + card.label + '</span>';
+  }
 
   function fmtNum(v, card) {
     if (card.money) {
@@ -11857,7 +11986,7 @@ Verdicts are framework outputs, not investment advice.
     SECTIONS.forEach(function(sec) {
       var live = sec.cards.filter(function(card) {
         if (card.type === 'range') { var d = computeDomain(card); if (!d) return false; domains[card.attr] = d; return true; }
-        return presentValues(card).length >= 2;   // a facet needs a real choice
+        return facetLive(card);
       });
       if (!live.length) return;
 
@@ -11889,12 +12018,12 @@ Verdicts are framework outputs, not investment advice.
     var el = document.createElement('div');
     el.className = 'flt-card'; el.setAttribute('data-attr', card.attr);
     var reset = '<span class="flt-card-reset" data-reset="' + card.attr + '">reset</span>';
-    el.innerHTML = '<div class="flt-card-label"><span>' + card.label + '</span>' + reset + '</div>';
+    el.innerHTML = '<div class="flt-card-label">' + labelHtml(card) + reset + '</div>';
     var opts = document.createElement('div'); opts.className = 'flt-opts';
     presentValues(card).forEach(function(v) {
       var b = document.createElement('button');
       b.className = 'flt-opt'; b.setAttribute('data-val', v);
-      b.innerHTML = '<span>' + optLabel(card, v) + '</span><span class="flt-n"></span>';
+      b.innerHTML = '<span>' + esc(optLabel(card, v)) + '</span><span class="flt-n"></span>';
       b.addEventListener('click', function() {
         var set = state.facets[card.attr] || (state.facets[card.attr] = new Set());
         if (set.has(v)) set.delete(v); else set.add(v);
@@ -11916,7 +12045,7 @@ Verdicts are framework outputs, not investment advice.
     var el = document.createElement('div');
     el.className = 'flt-card'; el.setAttribute('data-attr', card.attr);
     el.innerHTML =
-      '<div class="flt-card-label"><span>' + card.label + '</span>' +
+      '<div class="flt-card-label">' + labelHtml(card) +
         '<span class="flt-card-reset" data-reset="' + card.attr + '">reset</span></div>' +
       '<div class="flt-range-vals"><span class="flt-lo"></span>' +
         '<span class="flt-range-n"></span><span class="flt-hi"></span></div>' +
@@ -12004,7 +12133,9 @@ Verdicts are framework outputs, not investment advice.
     var toks = [];
     Object.keys(st.facets).forEach(function(a) {
       var card = cardFor(a);
-      st.facets[a].forEach(function(v) { toks.push(card ? optLabel(card, v) : v); });
+      st.facets[a].forEach(function(v) {
+        toks.push(card ? (card.comboLabels && card.comboLabels[v]) || optLabel(card, v) : v);
+      });
     });
     Object.keys(st.ranges).forEach(function(a) {
       var card = cardFor(a), d = domains[a], r = st.ranges[a];
@@ -12268,7 +12399,7 @@ Verdicts are framework outputs, not investment advice.
       (function(attr) {
         var card = cardFor(attr), lbl = card ? card.label : attr;
         state.facets[attr].forEach(function(v) {
-          chips.push({ text: lbl + ': <b>' + (card ? optLabel(card, v) : v) + '</b>',
+          chips.push({ text: lbl + ': <b>' + esc(card ? optLabel(card, v) : v) + '</b>',
             remove: function() { state.facets[attr].delete(v); if (!state.facets[attr].size) delete state.facets[attr]; refresh(); } });
         });
       })(attr);

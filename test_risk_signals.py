@@ -558,12 +558,28 @@ def test_full_report() -> None:
         holdings[2].price_closes = (d, _pattern_closes([1, -1, -1, 1], 0.01))
         watch = {"Tech": [_risky("WWW", 72, value=0, shares=0, drop=-31.0,
                                  severity=99.0)]}
+        holdings[0].volatility = 41.26
         html = _render_report(holdings, watch)
     check(_tag_errors(html), [], "tags balance")
     check("% of risk</span>" in html and "off high · rare for it" in html, True,
           "risk share and drop lines render")
     check(holdings[0].risk_share is not None, True,
           "the report finalizes the risk shares itself")
+
+    def attrs(ticker):
+        tr = re.search(r"<tr data-verdict='[^>]*data-search='%s [^>]*>"
+                       % ticker.lower(), html).group(0)
+        got = dict(re.findall(r"data-([\w-]+)='([^']*)'", tr))
+        return tuple(got[k] for k in ("drop-band", "off-high", "vol", "risk-share"))
+    check(attrs("AAA"), ("unusual", "24.0", "41.3",
+                         str(round(holdings[0].risk_share, 1))),
+          "the Risk filters read a holding's band, drop, volatility and risk share")
+    ccc = attrs("CCC")
+    check((attrs("BBB")[:2], ccc[:3], ccc[3] != ""),
+          (("normal", "12.0"), ("", "", ""), True),
+          "a normal drop is labeled; with no drop on file, no band or distance")
+    check(attrs("WWW"), ("rare", "31.0", "", ""),
+          "a watchlist name has a drop but no share of the portfolio's risk")
     scripts = [js for js in re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S)
                if js.strip()]
     with tempfile.TemporaryDirectory() as tmp:
