@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+from html import unescape
 from html.parser import HTMLParser
+import json
 import os
 import re
 import shutil
@@ -884,6 +886,86 @@ def test_full_report() -> None:
     check((len(scripts) >= 5, bad), (True, []), "every inline script parses")
 
 
+def _row_attrs(page: str, ticker: str) -> dict:
+    """The data-* attributes of `ticker`'s table row."""
+    tr = re.search(r"<tr data-verdict='[^>]*data-search='%s [^>]*>" % ticker.lower(),
+                   page).group(0)
+    return dict(re.findall(r"data-([\w-]+)='([^']*)'", tr))
+
+
+def test_filter_bar_options() -> None:
+    section("filter bar: list, base agreement and confidence options")
+    check(ap._watchlist_filter_keys({"Screening": [], "Tech, AI & <chips>": [],
+                                     "Tech AI chips": [], "★": [],
+                                     ap.RECENTLY_HELD_GROUP: []}),
+          {"Screening": "wl-screening", "Tech, AI & <chips>": "wl-tech-ai-chips",
+           "Tech AI chips": "wl-tech-ai-chips-2", "★": "wl-list",
+           ap.RECENTLY_HELD_GROUP: "wl-recently-held"},
+          "list values are slugs a saved combo can hold, and two lists never merge")
+    check(ap._watchlist_filter_keys(None), {}, "no watchlists, no list values")
+
+    all_pass, all_fail = [1.0] * 9, [0.0] * 9
+    with _mode_env():
+        holdings = [
+            _scored("AAA", 80, all_pass),     # ADD under every base
+            _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD
+            *(_scored(t, 65, all_pass) for t in ("DDD", "EEE", "FFF", "GGG")),
+        ]
+        thin = _scored("CCC", 70, all_pass)
+        thin.composite_coverage = thin.composite_coverage_cal = 0.5
+        ap.compute_quality_base(thin)
+        ap.set_v2_verdicts(thin, is_holding=True)
+        etf = _position(ticker="ETF", bucket="thematic", shares=10,
+                        statement_market_value=1000.0, live_market_value=1000.0,
+                        current_price=100.0,
+                        verdict=ap.Verdict(label="HOLD", color="#2c3e50",
+                                           reason="Thematic hold"))
+        watch = {"Screening": [_scored("WWW", 50, all_pass, shares=0, value=0.0,
+                                       upside_pct=5.0)],
+                 "Tech, AI & <chips>": [_scored("XXX", 75, all_fail, shares=0,
+                                                value=0.0, upside_pct=5.0)]}
+        page = _render_report(holdings + [thin, etf], watch)
+
+    aaa, bbb, ccc = (_row_attrs(page, t) for t in ("AAA", "BBB", "CCC"))
+    check((aaa["bases"], aaa["bases-quality"], aaa["bases-blend-cal"], bbb["bases"]),
+          ("agree", "agree", "agree", "split"),
+          "Across bases: agree when every base gives the same verdict, per mode")
+    check((ccc["confidence"], ccc["confidence-composite"], ccc["confidence-quality"],
+           ccc["confidence-blend"], aaa["confidence"]),
+          ("low", "low", "high", "medium", "high"),
+          "Data confidence follows each mode's own coverage")
+    etf_row = _row_attrs(page, "ETF")
+    check((etf_row["bases"], etf_row["confidence"], etf_row["list"]), ("", "", "held"),
+          "an ETF has no per-mode verdicts to compare, but is still a holding")
+    check((aaa["list"], _row_attrs(page, "WWW")["list"], _row_attrs(page, "XXX")["list"]),
+          ("held", "wl-screening", "wl-tech-ai-chips"), "each row names its list")
+    lists = re.search(r"id=\"fltBar\" data-lists='([^']*)'", page).group(1)
+    check(json.loads(unescape(lists)),
+          [["held", "Holdings"], ["wl-screening", "Screening"],
+           ["wl-tech-ai-chips", "Tech, AI & <chips>"]],
+          "the bar labels every list, in report order, escaped in the page")
+
+    script = re.search(r"/\* ---------- Filter bar:.*?\n\}\)\(\);", page, re.S).group(0)
+    per_mode = re.search(r"var PER_MODE = \[([^\]]*)\]", page).group(1)
+    check(("'confidence'" in per_mode, "'bases'" in per_mode), (True, True),
+          "the base switch copies confidence and agreement with the verdict")
+    sections = script.split("var SECTIONS = [", 1)[1].split("var PRESETS", 1)[0]
+    cards = re.findall(r"type:'(?:facet|range)', attr:'([\w-]+)'", sections)
+    check([c for c in ("bases", "confidence", "drop-band", "off-high", "vol",
+                       "risk-share", "list") if c not in cards], [],
+          "the panel has the new cards")
+    check([c for c in cards if f"data-{c}=" not in page], [],
+          "every card reads an attribute the rows carry")
+    check("attr:'has-tax', label:'Tax', skip:['0',''], flag:true" in sections, True,
+          "the one-option Tax card is a flag, so it can render")
+    presets = script.split("var PRESETS = [", 1)[1].split("];", 1)[0]
+    used = re.findall(r"(?:facets|ranges):\{'?([\w-]+)'?:", presets)
+    check(("key:'drop-unusual'" in presets, "key:'risk-heavy'" in presets,
+           [a for a in used if a not in cards]),
+          (True, True, []), "the new quick screens, each on a real card")
+    check(_tag_errors(page), [], "the page's tags balance")
+
+
 def test_refresh_script_parses() -> None:
     section("report: the dispatch script (with Make default) is valid JS")
     old = os.environ.get("GITHUB_REPOSITORY")
@@ -1719,7 +1801,8 @@ def main() -> int:
               test_rank_badges_per_mode, test_ledger_ranks_per_mode,
               test_compare_base_modes, test_mode_variants, test_report_markup,
               test_missed_opps_per_mode, test_missed_opps_markup,
-              test_full_report, test_refresh_script_parses,
+              test_full_report, test_filter_bar_options,
+              test_refresh_script_parses,
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
               test_recently_held_universe, test_screen_additions,
