@@ -10610,7 +10610,11 @@ def generate_html_report(
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
                    border-radius: 10px; padding: 12px 16px;
                    margin-bottom: 16px;
-                   box-shadow: var(--shadow-card); }}
+                   box-shadow: var(--shadow-card);
+                   /* Nothing in the header may widen the page: the news panel
+                      hangs below the tiles (y stays visible), but anything
+                      reaching past the card's sides is cut, never scrolled. */
+                   overflow-x: clip; }}
   /* Stats packed left-to-right in order so each tile sits directly after the
      previous one (e.g. Missed opportunities right after Watchlist BUY signals).
      flex-wrap still lets them stack on narrow screens. The gap is sized so
@@ -12516,14 +12520,23 @@ window.scrollToSection = function(id) {
   function open() {
     clearTimeout(timer);
     if (isOpen()) return;
-    wrap.classList.remove('flip');
     wrap.classList.add('open');
     tile.setAttribute('aria-expanded', 'true');
-    // Hang left-aligned under the tile unless that runs off the right edge.
+    place();
+  }
+  // Hang left-aligned under the tile unless that runs off the right edge.
+  // Re-checked whenever the tile moves or the window resizes while the panel
+  // is open: after a reload the header settles late (saved base mode, fonts,
+  // the scrollbar), so a side picked at open time can go stale.
+  function place() {
+    if (!isOpen()) return;
+    wrap.classList.remove('flip');
     if (panel.getBoundingClientRect().right > document.documentElement.clientWidth - 8) {
       wrap.classList.add('flip');
     }
   }
+  window.addEventListener('resize', place);
+  if (window.ResizeObserver) new ResizeObserver(place).observe(wrap);
   function close() {
     clearTimeout(timer);
     wrap.classList.remove('open');
