@@ -10646,7 +10646,15 @@ def generate_html_report(
   .news-stat:hover, .news-wrap.open .news-stat {{ color: var(--fg-strong); }}
   .news-stat:focus-visible {{ outline: 2px solid var(--fg-chip-blue);
                               outline-offset: 4px; border-radius: 4px; }}
-  .news-lead {{ overflow: hidden; text-overflow: ellipsis; }}
+  /* The headline wraps inside the tile instead of running off its edge. At
+     14px a typical 60-110 character headline fits in three lines even in the
+     narrowest two-row layout (~300px wide at 1280px); anything longer ends in
+     an ellipsis on line three, and the panel shows it in full. `.news-stat`
+     in the selector outranks `.stat strong`, which sets the 19px figures. */
+  .news-stat .news-lead {{ font-size: 14px; line-height: 1.3; letter-spacing: 0;
+                           white-space: normal; overflow-wrap: anywhere;
+                           display: -webkit-box; -webkit-box-orient: vertical;
+                           -webkit-line-clamp: 3; overflow: hidden; }}
   .news-sub {{ font-size: 10px; color: var(--fg-muted); font-weight: 400;
                text-transform: none; letter-spacing: 0; margin-top: 2px;
                overflow: hidden; text-overflow: ellipsis; }}
