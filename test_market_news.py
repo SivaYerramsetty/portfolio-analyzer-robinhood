@@ -403,6 +403,11 @@ def test_report() -> None:
           "the two share one .stat-pair, so they can't wrap apart")
     check((".stat-pair {" in html, "--stat-gap" in html), (True, True),
           "the pair and the row's shared gap are styled")
+    lead_css = re.search(r"\.news-stat \.news-lead \{([^}]*)\}", html)
+    check(bool(lead_css) and all(rule in lead_css.group(1) for rule in (
+              "white-space: normal", "overflow-wrap: anywhere",
+              "-webkit-line-clamp: 3")), True,
+          "the headline wraps (up to three lines) instead of running off the tile")
     check(('id="newsWrap"' in bare, "Next market event" in bare), (False, True),
           "no stories: the tile is left out and the row is otherwise unchanged")
     check(_pair_children(bare), [("div", "stat", None)],
