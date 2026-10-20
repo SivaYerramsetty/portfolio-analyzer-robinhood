@@ -408,6 +408,9 @@ def test_report() -> None:
               "white-space: normal", "overflow-wrap: anywhere",
               "-webkit-line-clamp: 3")), True,
           "the headline wraps (up to three lines) instead of running off the tile")
+    card_css = re.search(r"\.summary-card \{([^}]*)\}", html)
+    check(bool(card_css) and "overflow-x: clip" in card_css.group(1), True,
+          "the header card clips sideways, so the news panel can't widen the page")
     check(('id="newsWrap"' in bare, "Next market event" in bare), (False, True),
           "no stories: the tile is left out and the row is otherwise unchanged")
     check(_pair_children(bare), [("div", "stat", None)],
@@ -417,6 +420,9 @@ def test_report() -> None:
     script = next((s for s in re.findall(r"<script>(.*?)</script>", html, re.S)
                    if "getElementById('newsWrap')" in s), "")
     check(bool(script), True, "the page carries the panel script")
+    check(("addEventListener('resize', place)" in script,
+           "new ResizeObserver(place).observe(wrap)" in script), (True, True),
+          "an open panel re-picks its side when the window or the tile moves")
     node = shutil.which("node")
     if not node:
         print("  (node not found — skipping the JS syntax check)")
