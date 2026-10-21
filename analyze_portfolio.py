@@ -5939,7 +5939,8 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None,
     At-a-glance markers sit beside the score: an amber dot for thin-data (Low)
     confidence and a calendar glyph when earnings are within a week. A verdict
     that `turned` BUY/ADD in the past week (attach_turned_buy) gets a green
-    "↑ was HOLD" chip, solid on the day it turned, and a line in the card.
+    "↑ was HOLD" chip on a line of its own under the pill, solid on the day it
+    turned, and a line in the card.
 
     v2 verdict reasons are structured as
         headline | <base line> | +X · factor | -Y · factor | = verdict score N
@@ -6068,12 +6069,16 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None,
     mobile_tip = _esc((f"↑ {turn_tip}\n" if turn_tip else "")
                       + reason.replace(" | ", "\n")
                       + ("\n" + " · ".join(alt_bits) if alt_bits else ""))
-    return (
-        f"<span class='vcell' data-tip='{mobile_tip}'>"
-        f"<span class='verdict' style='background:{color};'>{label}</span>"
-        f"<span class='vscore' style='color:{sc};'>{score:.0f}</span>"
-        f"{cell_marker}{turn_chip}{card}</span>"
-    )
+    line = (f"<span class='verdict' style='background:{color};'>{label}</span>"
+            f"<span class='vscore' style='color:{sc};'>{score:.0f}</span>"
+            f"{cell_marker}")
+    if turn_chip:
+        # The chip goes under the pill and score, not beside them: verdict is
+        # every table's last column, and the extra width pushed the table past
+        # the window, cutting the chip off at the table's edge.
+        return (f"<span class='vcell vcell-turn' data-tip='{mobile_tip}'>"
+                f"<span class='vline'>{line}</span>{turn_chip}{card}</span>")
+    return f"<span class='vcell' data-tip='{mobile_tip}'>{line}{card}</span>"
 
 
 def _td(value: str, sort_value, css_class: str = "") -> str:
@@ -10943,7 +10948,10 @@ def generate_html_report(
                  color: var(--fg-chip-green);
                  border: 1px solid var(--fg-chip-green); }}
   .vturn-chip.fresh {{ background: var(--bg-chip-green); border-color: transparent; }}
-  .verdict + .vturn-chip {{ margin-left: 6px; }}
+  /* The chip sits under the pill, so it never widens the verdict column. */
+  .vcell-turn {{ flex-direction: column; align-items: flex-start; gap: 4px; }}
+  .vline {{ display: inline-flex; align-items: center; gap: 6px; }}
+  .verdict + .vturn-chip {{ display: block; width: max-content; margin-top: 4px; }}
   .vturn {{ font-size: 11px; font-weight: 600; padding: 4px 8px;
             border-radius: 6px; margin-bottom: 8px; line-height: 1.35;
             background: var(--bg-chip-green); color: var(--fg-chip-green); }}

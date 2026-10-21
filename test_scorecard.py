@@ -684,6 +684,10 @@ def test_attach_turned_buy() -> None:
     check(("<span class='vturn-chip fresh'>↑ was HOLD</span>" in page,
            "<span class='vturn-chip'>↑ was WATCH</span>" in page),
           (True, True), "a chip on each: solid the day it turned, outlined after")
+    check(re.search(r"<span class='vcell vcell-turn'[^>]*><span class='vline'>"
+                    r"<span class='verdict'[^>]*>ADD</span>.*?</span></span>"
+                    r"<span class='vturn-chip fresh'>", page) is not None, True,
+          "the chip sits under the pill and score, so it adds no column width")
     check(("Turned ADD today; it was HOLD at the Tue, Oct 20 close." in page,
            "Turned BUY on Mon, Oct 19; it was WATCH at the Fri, Oct 16 close."
            in page), (True, True), "the card and the tap tip say what and when")
