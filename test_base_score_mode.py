@@ -1417,8 +1417,47 @@ def test_screen_additions() -> None:
 
 
 def select(passed, held, hist, limit=25, today=None):
-    return ap.select_screen_additions(passed, held, hist, limit=limit,
-                                      threshold=60.0, today=today)
+    """One channel's picks and skips."""
+    return ap.select_screen_additions({"quality": passed}, held, hist,
+                                      limit=limit, threshold=60.0,
+                                      today=today)[:2]
+
+
+def test_screen_channels() -> None:
+    section("two channels split the additions and tag what they nominate")
+    today = date(2026, 10, 21)
+
+    def cand(ticker: str, composite: float) -> SimpleNamespace:
+        return SimpleNamespace(ticker=ticker, score_composite=composite)
+
+    quality = [cand("AAA", 90.0), cand("BBB", 85.0), cand("CCC", 80.0)]
+    fcf = [cand("CCC", 80.0), cand("DDD", 70.0), cand("EEE", 65.0),
+           cand("FFF", 60.0)]
+    pick = lambda chans, limit, held=frozenset(): ap.select_screen_additions(
+        chans, set(held), None, limit=limit, threshold=60.0, today=today)
+
+    picks, skipped, tags = pick({"quality": quality, "fcf": fcf}, 4)
+    check(picks, ["AAA", "BBB", "CCC", "DDD"],
+          "four slots: the nine filters' best two, then the cash-flow screen's")
+    check((tags["CCC"], tags["AAA"], tags["DDD"]),
+          (["quality", "fcf"], ["quality"], ["fcf"]),
+          "each pick names every channel that nominated it")
+    check((skipped["EEE"], skipped["FFF"]), ("past the top 4", "past the top 4"),
+          "and the rest are cut by the cap")
+
+    picks = pick({"quality": quality, "fcf": fcf}, 5)[0]
+    check(picks, ["AAA", "BBB", "CCC", "DDD", "EEE"],
+          "an odd slot goes to the first channel; a shared name doesn't use "
+          "the second channel's share")
+
+    picks = pick({"quality": quality[:1], "fcf": fcf}, 4)[0]
+    check(picks, ["AAA", "CCC", "DDD", "EEE"],
+          "a share one channel can't fill goes to the best names left")
+
+    picks, skipped, _ = pick({"quality": quality, "fcf": fcf}, 25, held={"CCC"})
+    check(("CCC" in picks, skipped["CCC"]), (False, "already held"),
+          "a held name is passed over in both channels")
+    check(pick({}, 25)[0], [], "no channels, no picks")
 
 
 def test_holdings_ytd_weighting() -> None:
@@ -1822,6 +1861,7 @@ def main() -> int:
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
               test_recently_held_universe, test_screen_additions,
+              test_screen_channels,
               test_holdings_ytd_weighting,
               test_account_ytd_return, test_external_flow_scoping):
         before = len(_results)
