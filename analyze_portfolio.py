@@ -115,7 +115,7 @@ COMMAND REFERENCE — every way to run this script
     --save-positions FILE  With --source robinhood: dump positions snapshot CSV.
     --out FILE             Output HTML path (default: portfolio_report.html).
     --email                Also send the report via SMTP (uses env vars).
-    --screen               Screen US-listed stocks over $1B; adds Screening section.
+    --screen               Screen US-listed stocks over $1B for the Screening list.
                            Scans at most once per market day (cached in .cache/).
     --screen-limit N       Cap screened universe for testing.
     --rescan               Ignore today's cached scan and screen again.
@@ -165,7 +165,6 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo   # Python 3.9+; add near top of file if not already there
 import math as _math
 import argparse
-import copy
 import csv
 import io
 import json
@@ -3268,8 +3267,8 @@ def compute_composite_score(pa, info: dict) -> None:
     """
     Populate pa.score_{quality,growth,value,analyst} and pa.composite_score:
     quality 30%, growth 20%, value 20%, analyst 15%, insider 15%. This is the
-    report's one Composite — the Screening table scores its names through it
-    too (score_screen_shortlist).
+    report's one Composite — the universe scan scores its names through it
+    too (score_screen_shortlist), so the names it adds rank the same way.
 
     Each sub-score is 0-100. Missing data sub-scores are dropped from the
     weighted average rather than treated as 0 — fairer to limited-coverage
@@ -5268,8 +5267,8 @@ def add_screened_names(watchlists_analyzed: dict, landed: list[dict], *,
     return added
 
 
-# The nine filters' short names, as the Screening table lists a near miss's
-# failures ("eps_growth, fcf"). A filter missing here is listed by its name.
+# The nine filters' short names: the keys of a screened name's `passes`. A
+# filter missing here is keyed by its name.
 _SCREEN_FILTER_KEYS = {
     "Revenue growth >=10%": "rev_growth", "EPS growth >=10%": "eps_growth",
     "P/E < 30": "pe", "PEG < 2": "peg", "ROE >= 15%": "roe",
@@ -6969,169 +6968,6 @@ def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
         count = f" ({num_analysts})" if num_analysts else ""
         return f'<span style="font-size:12px;">{label}{count}</span>'
     return "—"
-
-
-def _screen_rows_with_live_scores(rows: list, analyzed: dict) -> list:
-    """The scan's rows, with this run's scores on every name the run analyzed.
-
-    The scan is from the first run of the day; a held or watchlisted name was
-    scored again minutes ago, by the same formulas but on current prices and
-    with its Robinhood ratings. Showing those numbers keeps the Screening table
-    from disagreeing with that name's own row. Best Composite first."""
-    out = []
-    for r in rows:
-        pa = analyzed.get(r.ticker)
-        if pa is not None and not pa.error and pa.composite_score is not None:
-            r = copy.copy(r)
-            r.score_quality, r.score_growth = pa.score_quality, pa.score_growth
-            r.score_value, r.score_analyst = pa.score_value, pa.score_analyst
-            r.score_insider = pa.score_insider
-            r.insider_activity = pa.insider_activity
-            r.score_composite = pa.composite_score
-        out.append(r)
-    out.sort(key=lambda r: (r.score_composite if r.score_composite is not None
-                            else -1), reverse=True)
-    return out
-
-
-def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
-    """
-    Render the universe scan's output (screener.screen_universe).
-    sr: {"passed": [ScreenResult], "near_miss": [ScreenResult],
-         "universe_size": int, "universe_label": str, "universe_note": str,
-         "unscreened": [ticker], "scanned_at": iso}
-    analyzed: {ticker: PositionAnalysis} for every name this run analyzed —
-    those rows show this run's scores (see _screen_rows_with_live_scores).
-    """
-    analyzed = analyzed or {}
-    passed = _screen_rows_with_live_scores(sr.get("passed") or [], analyzed)
-    near_miss = _screen_rows_with_live_scores(sr.get("near_miss") or [], analyzed)
-    uni = sr.get("universe_size", 0)
-    unscreened = len(sr.get("unscreened") or [])
-    pending = sr.get("pending") or 0
-    scanned = ""
-    try:
-        at = datetime.fromisoformat(sr.get("scanned_at") or "")
-        scanned = f" at {at.strftime('%I:%M %p').lstrip('0')} ET"
-    except ValueError:
-        pass
-
-    label = _miss_esc(sr.get("universe_label") or "US market")
-    html = f"<h2 style='margin-top:48px;'>📊 Screening — {label}</h2>\n"
-    what = _miss_esc(sr.get("universe_note") or "tickers")
-    framework = "against the 9-filter quality framework"
-    if pending:
-        screened = (f"Screening {uni:,} {what} {framework}; {pending:,} are "
-                    f"still to go, and the next runs fill them in. So far")
-    elif unscreened:
-        screened = (f"Screened {uni - unscreened:,} of {uni:,} {what} "
-                    f"{framework} ({unscreened} could not be fetched from "
-                    f"Yahoo).")
-    else:
-        screened = f"Screened {uni:,} {what} {framework}."
-    html += (
-        f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:8px;">'
-        f"{screened} "
-        f"<strong>{len(passed)}</strong> passed all 9; "
-        f"<strong>{len(near_miss)}</strong> failed only 1-2 (near misses, sorted by score). "
-        f"Scores are the report's Composite, from the day's scan{scanned}; a name "
-        f"this run analyzed (held or on a watchlist) shows this run's numbers.</p>\n"
-    )
-    html += (
-        '<p style="background:#f1f8e9;border-left:3px solid #689f38;padding:8px 12px;'
-        'font-size:11px;color:#33691e;margin-bottom:16px;border-radius:3px;">'
-        "<strong>Filters:</strong> Rev/EPS Growth ≥10%/yr · ROE ≥15% · Op Margin ≥15% · "
-        "D/E &lt;1.0 · Quick &gt;1.0 · FCF positive &amp; growing · P/E &lt;30 · PEG &lt;2.0 "
-        "<br><strong>RecAvg:</strong> 1 = Strong Buy, 5 = Strong Sell · "
-        "<strong>52w Pos:</strong> 0% = at 52-wk low, 100% = at 52-wk high · "
-        "<strong>Insider 90d:</strong> Decision verdict — Supports buy / No signal / Caution · "
-        "<strong>Score:</strong> Composite of Quality 30% · Growth 20% · Value 20% · Analyst 15% · Insider 15% · "
-        "<strong>#F:</strong> Number of filters failed (1 or 2 for near misses) · "
-        "<strong>Where:</strong> in the S&amp;P 500/400, another US company, or "
-        "the home country of a company based abroad (most trade here as ADRs)</p>\n"
-    )
-
-    import screener
-
-    def _where_cell(r) -> str:
-        key = screener.pond(r)
-        text = (r.country if key == "intl" and r.country
-                else screener.POND_LABELS.get(key, "—"))
-        order = {"sp": 0, "us": 1, "intl": 2}.get(key, 3)
-        return _td(f"<span style='white-space:nowrap;'>{_miss_esc(text)}</span>",
-                   f"{order}{_miss_esc(text)}")
-
-    def _render_table(rows: list, is_near_miss: bool) -> str:
-        if not rows:
-            return ""
-        h = "<div class='table-wrap'><table>\n<thead><tr>"
-        h += "<th>Ticker</th><th>Name</th><th>Sector</th><th>Where</th>"
-        h += "<th class='num'>Price</th><th class='num'>Target</th>"
-        h += "<th class='num'>Upside</th><th class='num'>52w Pos</th>"
-        h += "<th class='num'>RecAvg</th><th class='num'># Analysts</th>"
-        h += "<th class='num'>Quality</th><th class='num'>Growth</th>"
-        h += "<th class='num'>Value</th><th class='num'>Analyst</th>"
-        h += "<th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th>"
-        h += "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
-        if is_near_miss:
-            h += "<th class='num'>#F</th><th>Failed</th>"
-        h += "</tr></thead><tbody>\n"
-        for r in rows:
-            upside_class = ""
-            if r.upside_pct is not None:
-                upside_class = "pos-up" if r.upside_pct > 0 else "pos-down"
-            failed_list = ""
-            n_failed = 0
-            if is_near_miss:
-                fails = [k for k, v in (r.passes or {}).items() if v is False]
-                n_failed = len(fails)
-                failed_list = ", ".join(fails)
-            h += "<tr>"
-            h += _td(r.ticker, r.ticker, "ticker")
-            h += _td(r.name or r.ticker, r.name or r.ticker)
-            h += _td(r.sector or "—", r.sector or "zzz")
-            h += _where_cell(r)
-            h += _td(_fmt_money(r.price), r.price or -1, "num")
-            h += _td(_fmt_money(r.target_mean), r.target_mean or -1, "num")
-            h += _td(_fmt_pct(r.upside_pct, 1, True),
-                     r.upside_pct if r.upside_pct is not None else -1e6,
-                     f"num {upside_class}")
-            h += _td(f"{r.week52_pos:.0f}%" if r.week52_pos is not None else "—",
-                     r.week52_pos if r.week52_pos is not None else -1, "num")
-            h += _td(f"{r.rec_avg:.2f}" if r.rec_avg is not None else "—",
-                     r.rec_avg if r.rec_avg is not None else 99, "num")
-            h += _td(str(r.num_analysts) if r.num_analysts else "—",
-                     r.num_analysts or 0, "num")
-            h += _td(f"{r.score_quality:.0f}" if r.score_quality is not None else "—",
-                     r.score_quality if r.score_quality is not None else -1, "num")
-            h += _td(f"{r.score_growth:.0f}" if r.score_growth is not None else "—",
-                     r.score_growth if r.score_growth is not None else -1, "num")
-            h += _td(f"{r.score_value:.0f}" if r.score_value is not None else "—",
-                     r.score_value if r.score_value is not None else -1, "num")
-            h += _td(f"{r.score_analyst:.0f}" if r.score_analyst is not None else "—",
-                     r.score_analyst if r.score_analyst is not None else -1, "num")
-            h += _td(_insider_cell(getattr(r, 'insider_activity', None)),
-                     getattr(r, 'score_insider', None) if getattr(r, 'score_insider', None) is not None else -1)
-            score_cell = _score_cell(
-                r.score_composite, r.score_quality, r.score_growth,
-                r.score_value, r.score_analyst,
-                getattr(r, 'score_insider', None),
-            )
-            h += _td(score_cell, r.score_composite if r.score_composite is not None else -1, "num")
-            if is_near_miss:
-                h += _td(str(n_failed), n_failed, "num")
-                h += _td(failed_list, failed_list)
-            h += "</tr>\n"
-        h += "</tbody></table></div>\n"
-        return h
-
-    if passed:
-        html += f"<h3 style='margin-top:18px;'>✓ Passed all 9 filters ({len(passed)})</h3>\n"
-        html += _render_table(passed, is_near_miss=False)
-    if near_miss:
-        html += f"<h3 style='margin-top:18px;'>≈ Near misses (failed 1-2) ({len(near_miss)})</h3>\n"
-        html += _render_table(near_miss, is_near_miss=True)
-    return html
 
 
 def _render_ytd_summary(ytd, cfg=None) -> str:
@@ -10167,7 +10003,6 @@ def _portfolio_insights(results: list[PositionAnalysis],
 def generate_html_report(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
-    screening_results: Optional[dict] = None,
     realized_ytd: Optional[dict] = None,
     missed_opportunities: Optional[list[dict]] = None,
     recs_tracked_count: int = 0,
@@ -11631,14 +11466,6 @@ def generate_html_report(
     if report_scorecard is not None:
         html += _render_scorecard_section(report_scorecard)
 
-    # ---------- Screening section (passed-the-screen universe) ----------
-    if screening_results:
-        analyzed = {r.ticker: r for r in results}
-        for items in (watchlists or {}).values():
-            for r in items:
-                analyzed.setdefault(r.ticker, r)
-        html += _render_screening_section(screening_results, analyzed)
-
     # ---------- ETFs & Thematic positions (moved before Tax section) ----------
     if thematics:
         html += "<h2 id='thematic'>ETFs &amp; Thematic Positions</h2>\n"
@@ -13068,7 +12895,9 @@ def main():
                          "— no auth needed. Useful for quick stock lookups.")
     ap.add_argument("--screen", action="store_true",
                     help="Screen every profitable US-listed stock over $1B "
-                         "(ADRs included) and add the screening section. The "
+                         "(ADRs included); with --sync-screening-watchlist the "
+                         "best passers join the Screening watchlist. The report "
+                         "shows no scan tables, only the names added. The "
                          "scan runs at most once per market day and is cached "
                          "in .cache/. Each run spends at most "
                          "SCREEN_REQUEST_BUDGET Yahoo requests on it (default "
@@ -13781,7 +13610,6 @@ def main():
 
     html = generate_html_report(
         results, watchlists=watchlists_analyzed or None,
-        screening_results=screening_results,
         realized_ytd=realized_ytd,   # None unless --tax populated it
         missed_opportunities=missed_opportunities,
         recs_tracked_count=recs_tracked_count,

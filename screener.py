@@ -33,12 +33,11 @@ The scan runs in two stages:
   2. Scoring — the caller scores the shortlist. The report passes
      analyze_portfolio.score_screen_shortlist, which runs the same filters,
      sub-scores and Composite as every holding and watchlist row, so the
-     Screening table's numbers are the report's numbers.
+     names the scan adds to the Screening watchlist rank by the report's
+     numbers.
 
-Per-stock fields the Screening table shows besides the scores:
-    RecAvg     — Yahoo's analyst recommendation mean (1 strong buy ... 5 strong sell)
-    52w Pos    — where price sits in 52-week range (0% = low, 100% = high)
-    #F         — number of filters failed (near misses fail 1 or 2)
+The report doesn't show the scan itself: the best passers join the Screening
+watchlist and appear there with their verdicts.
 
 screen_universe() is the entry point the report uses. It scans once per
 market day (cached in .cache/screen.json), spending a capped number of Yahoo
@@ -109,23 +108,6 @@ def _fmt_dollars(x: float) -> str:
         if x >= size:
             return f"${x / size:g}{unit}"
     return f"${x:,.0f}"
-
-
-def universe_label(source: str) -> str:
-    """The Screening section's name for the universe a scan covered."""
-    if source == "sp":
-        return "S&P 500 + 400"
-    return f"US-listed, {_fmt_dollars(min_market_cap())}+"
-
-
-def universe_note(source: str) -> str:
-    """What the universe holds, for the Screening section's summary line."""
-    if source == "sp":
-        return ("S&P 500 + 400 stocks (Yahoo's screener was unavailable for "
-                "today's scan)")
-    return (f"profitable US-listed stocks worth {_fmt_dollars(min_market_cap())}+"
-            f" and trading {_fmt_dollars(min_dollar_volume())}+ a day, ADRs "
-            f"included,")
 
 
 def _universe_key() -> str:
@@ -471,17 +453,14 @@ class ScreenResult:
     error: Optional[str] = None
 
 
-# Where a screened name was found, for the Screening table and for grading the
-# screen's additions by where they came from (scorecard.py):
-#   "sp"   — in the S&P 500 or 400, the old universe
-#   "us"   — another US company, which only the wider universe reaches
-#   "intl" — based outside the US; most trade here as ADRs
-POND_LABELS = {"sp": "S&P 500/400", "us": "Other US", "intl": "Outside the US"}
-
-
 def pond(r: ScreenResult) -> Optional[str]:
-    """r's POND_LABELS key. None for a US company on a day the S&P list
-    couldn't be fetched, when membership is unknown."""
+    """Where a screened name was found, for grading the screen's additions by
+    where they came from (scorecard.py):
+      "sp"   — in the S&P 500 or 400, the old universe
+      "us"   — another US company, which only the wider universe reaches
+      "intl" — based outside the US; most trade here as ADRs
+    None for a US company on a day the S&P list couldn't be fetched, when
+    membership is unknown."""
     if r.in_sp:
         return "sp"
     if r.country and r.country != "United States":
@@ -734,8 +713,6 @@ def _scan_output(state: dict, from_cache: bool, refused: bool = False) -> dict:
         "passed": passed,
         "near_miss": near,
         "universe_size": state["universe_size"],
-        "universe_label": universe_label(state["source"]),
-        "universe_note": universe_note(state["source"]),
         "unscreened": sorted(state["unscreened"]),
         "pending": len(state["to_prefilter"]) + len(state["to_score"]),
         "scanned_at": state["scanned_at"],
@@ -797,9 +774,8 @@ def screen_universe(
     didn't get to (budget spent, or Yahoo refused), which wait for the next
     run. Its Yahoo work should go through the budget it is handed.
 
-    Returns {"passed", "near_miss", "universe_size", "universe_label",
-    "universe_note", "unscreened", "pending", "scanned_at", "from_cache",
-    "refused"}.
+    Returns {"passed", "near_miss", "universe_size", "unscreened", "pending",
+    "scanned_at", "from_cache", "refused"}.
     `pending` counts the names still to prefilter or score; `unscreened` lists
     the names Yahoo had no data for; `refused` says Yahoo turned this run
     away, so more Yahoo work now would fail too. `limit` caps the universe for

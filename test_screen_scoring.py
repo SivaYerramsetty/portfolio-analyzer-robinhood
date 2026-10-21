@@ -528,8 +528,7 @@ def test_fetch_us_universe() -> None:
 
     with patched(sc.os, environ={"SCREEN_MIN_DOLLAR_VOLUME": "20e6",
                                  "SCREEN_MIN_MARKET_CAP": "2e9"}):
-        check((sc.min_dollar_volume(), sc.min_market_cap(),
-               sc.universe_label("us")), (20e6, 2e9, "US-listed, $2B+"),
+        check((sc.min_dollar_volume(), sc.min_market_cap()), (20e6, 2e9),
               "both floors can be set from the environment")
         floors = sc._universe_key()
     check(floors != sc._universe_key(), True,
@@ -588,8 +587,6 @@ def test_screen_universe_tags() -> None:
         ponds = {r.ticker: sc.pond(r) for r in out["passed"]}
         check(ponds, {"SPX": "sp", "USCO": "us", "ADR": "intl", "NOWHERE": "us"},
               "S&P members, other US companies and companies based abroad")
-        check((out["universe_label"], "ADRs included" in out["universe_note"]),
-              ("US-listed, $1B+", True), "the output names the universe")
         again = sc.screen_universe(score, max_workers=1, verbose=False)
         check({r.ticker: sc.pond(r) for r in again["passed"]}, ponds,
               "the tags survive the day's cache")
@@ -672,68 +669,20 @@ def test_split() -> None:
 
 # ------------------------------------------------------------ 5. rendering ----
 
-def test_render_live_scores() -> None:
-    section("Screening table: this run's numbers for names it analyzed")
-    rows = [sc.ScreenResult(ticker=t, name=t, num_passed=9, num_failed=0,
-                            score_composite=c, score_quality=c)
-            for t, c in (("HELD", 60.0), ("SCAN", 65.0))]
-    sr = {"passed": rows, "near_miss": [], "universe_size": 900,
-          "unscreened": ["X", "Y"], "scanned_at": "2026-10-05T07:01:55-04:00"}
-    held = ap.PositionAnalysis(ticker="HELD", name="Held", shares=5,
-                               statement_market_value=0,
-                               statement_pct_portfolio=0)
-    held.composite_score, held.score_quality = 72.4, 81.0
-    html = ap._render_screening_section(sr, {"HELD": held})
-    check("Screened 898 of 900 tickers against the 9-filter quality framework "
-          "(2 could not be fetched from Yahoo)." in html,
-          True, "the header counts what was actually screened")
-    check("from the day's scan at 7:01 AM ET" in html, True,
-          "and says when the scan ran")
-    check(html.index(">HELD<") < html.index(">SCAN<"), True,
-          "a live score re-sorts the table")
-    check("Composite Score: 72" in html, True, "the held name shows its run score")
-    check(rows[0].score_composite, 60.0, "the scan's own rows are left untouched")
-
-    errored = ap.PositionAnalysis(ticker="SCAN", name="S", shares=0,
-                                  statement_market_value=0,
-                                  statement_pct_portfolio=0, error="boom")
-    html = ap._render_screening_section(sr, {"SCAN": errored})
-    check("Composite Score: 65" in html, True,
-          "an analysis that errored doesn't replace the scan's score")
-
-    html = ap._render_screening_section(dict(sr, pending=415), {})
-    check("Screening 900 tickers against the 9-filter quality framework; 415 "
-          "are still to go, and the next runs fill them in. So far" in html,
-          True, "a scan still in progress says so")
-
-    rows = [sc.ScreenResult(ticker="TSM", name="TSMC", num_passed=9,
-                            num_failed=0, score_composite=80.0, country="Taiwan",
-                            in_sp=False),
-            sc.ScreenResult(ticker="ZWS", name="Zurn", num_passed=9,
-                            num_failed=0, score_composite=70.0,
-                            country="United States", in_sp=False),
-            sc.ScreenResult(ticker="NVDA", name="Nvidia", num_passed=9,
-                            num_failed=0, score_composite=60.0,
-                            country="United States", in_sp=True)]
-    html = ap._render_screening_section(
-        {"passed": rows, "near_miss": [], "universe_size": 1887,
-         "universe_label": "US-listed, $1B+",
-         "universe_note": "profitable US-listed stocks worth $1B+ and trading "
-                          "$5M+ a day, ADRs included,",
-         "unscreened": []}, {})
-    check("📊 Screening — US-listed, $1B+</h2>" in html, True,
-          "the heading names the universe")
-    check("Screened 1,887 profitable US-listed stocks worth $1B+ and trading "
-          "$5M+ a day, ADRs included, against the 9-filter" in html, True,
-          "and the summary says what it holds")
-    check(all(f">{w}</span></td>" in html
-              for w in ("Taiwan", "Other US", "S&amp;P 500/400")),
-          True, "each row says where it was found: home country, other US, S&P")
-    html = ap._render_screening_section(
-        {"passed": [], "near_miss": [], "universe_size": 901,
-         "universe_label": "S&P 500 + 400", "unscreened": []}, {})
-    check("📊 Screening — S&amp;P 500 + 400</h2>" in html, True,
-          "the S&P fallback is named, and escaped")
+def test_report_has_no_scan_tables() -> None:
+    section("The report: the names the scan added, not the scan")
+    import inspect
+    import test_base_score_mode as tb
+    with tb._mode_env():
+        added = tb._scored("ZWS", 80, [1.0] * 9)
+    page = tb._render_report([], {ap.SCREEN_WATCHLIST: [added]})
+    check(("ZWS" in page, "📊 Screening" in page, "Near misses" in page),
+          (True, False, False),
+          "an added name shows on the Screening watchlist; no pass or "
+          "near-miss tables")
+    check("screening_results" in inspect.signature(
+        ap.generate_html_report).parameters, False,
+          "and generate_html_report no longer takes the scan")
 
 
 # -------------------------------------------------------------------- main ----
@@ -745,7 +694,8 @@ def main() -> int:
               test_growth_cache_guard, test_fetch_us_universe,
               test_fetch_universe_fallback, test_screen_universe,
               test_screen_universe_refusal, test_screen_universe_tags,
-              test_add_screened_names, test_split, test_render_live_scores):
+              test_add_screened_names, test_split,
+              test_report_has_no_scan_tables):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)
