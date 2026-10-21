@@ -10610,11 +10610,7 @@ def generate_html_report(
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
                    border-radius: 10px; padding: 12px 16px;
                    margin-bottom: 16px;
-                   box-shadow: var(--shadow-card);
-                   /* Nothing in the header may widen the page: the news panel
-                      hangs below the tiles (y stays visible), but anything
-                      reaching past the card's sides is cut, never scrolled. */
-                   overflow-x: clip; }}
+                   box-shadow: var(--shadow-card); }}
   /* Stats packed left-to-right in order so each tile sits directly after the
      previous one (e.g. Missed opportunities right after Watchlist BUY signals).
      flex-wrap still lets them stack on narrow screens. The gap is sized so
@@ -10670,7 +10666,21 @@ def generate_html_report(
   .news-panel::before {{ content: ""; position: absolute; left: 0; right: 0;
                          top: -9px; height: 9px; }}
   .news-wrap.open .news-panel {{ display: block; }}
-  .news-wrap.flip .news-panel {{ left: auto; right: 0; }}
+  /* The panel's side is picked in CSS from the tile's own width, so it is
+     right for whatever layout the header settles into (nothing measured at
+     open time to go stale): left-aligned under the tile when the tile is at
+     least the panel's width, else hung from the tile's right end. The tile
+     always runs to the end of its row, so either way the panel stays inside
+     the header and can never widen the page. No clipping ancestor: Safari
+     clips both axes under overflow-x: clip, which hid the whole panel.
+     Desktop only, since a query container is a containing block for fixed
+     descendants and phones show the panel as a fixed bottom sheet. */
+  @media (min-width: 901px) {{
+    .news-wrap {{ container: news / inline-size; }}
+    @container news (max-width: 459px) {{
+      .news-panel {{ left: auto; right: 0; }}
+    }}
+  }}
   .news-panel-head {{ display: flex; justify-content: space-between; gap: 10px;
                       font-size: 10px; font-weight: 700; text-transform: uppercase;
                       letter-spacing: 0.6px; color: var(--fg-faint);
@@ -10730,6 +10740,13 @@ def generate_html_report(
                 box-shadow: inset 0 -2px 0 var(--border-medium); }}
     thead th:first-child {{ border-top-left-radius: 9px; }}
     thead th:last-child {{ border-top-right-radius: 9px; }}
+    /* A table too wide for the window (the 17-column screen tables need
+       ~1270px) scrolls inside its own box instead of pushing the whole page
+       sideways. It gives up the pinned header: inside a scrolling box a
+       sticky th would pin to the box, not the window, and slide down over
+       the rows. The tableFit script sets the class. */
+    .table-wrap.too-wide {{ overflow-x: auto; }}
+    .table-wrap.too-wide thead th {{ position: static; }}
   }}
   td {{ padding: 9px 8px; border-bottom: 1px solid var(--border-soft);
         vertical-align: middle; color: var(--fg-body); }}
@@ -11124,7 +11141,7 @@ def generate_html_report(
                  left: 10px; right: 10px; width: auto; min-width: 0;
                  max-width: none; }}
     /* Same bottom sheet for the news panel. */
-    .news-panel, .news-wrap.flip .news-panel {{ position: fixed; top: auto;
+    .news-panel {{ position: fixed; top: auto;
                  bottom: 12px; left: 10px; right: 10px; width: auto;
                  max-width: none; }}
     .news-panel::before {{ display: none; }}
@@ -11638,6 +11655,33 @@ Verdicts are framework outputs, not investment advice.
   setPinOffset();
   window.addEventListener('resize', setPinOffset);
   window.addEventListener('load', setPinOffset);
+})();
+// tableFit: a table wider than its box gets .too-wide, so it scrolls inside
+// the box instead of pushing the page sideways (desktop CSS). Re-checked
+// whenever a box or its table changes size: a resize, the Base switch or a
+// filter re-flowing the cells. Both are watched because a table already at
+// its narrowest keeps its width while the box around it shrinks.
+(function() {
+  var wraps = document.querySelectorAll('.table-wrap');
+  function fit(wrap) {
+    var table = wrap.querySelector('table');
+    if (table) wrap.classList.toggle('too-wide', table.offsetWidth > wrap.clientWidth + 1);
+  }
+  if (window.ResizeObserver) {
+    var ro = new ResizeObserver(function(entries) {
+      entries.forEach(function(e) { fit(e.target.closest('.table-wrap')); });
+    });
+    wraps.forEach(function(wrap) {
+      ro.observe(wrap);
+      var table = wrap.querySelector('table');
+      if (table) ro.observe(table);
+    });
+  } else {
+    var all = function() { wraps.forEach(fit); };
+    all();
+    window.addEventListener('resize', all);
+    window.addEventListener('load', all);
+  }
 })();
 // Browser reload button. GitHub Pages caches the report, so this uses the
 // cache-busting reload (reloadFreshReport) to fetch whatever is currently
@@ -12522,21 +12566,7 @@ window.scrollToSection = function(id) {
     if (isOpen()) return;
     wrap.classList.add('open');
     tile.setAttribute('aria-expanded', 'true');
-    place();
   }
-  // Hang left-aligned under the tile unless that runs off the right edge.
-  // Re-checked whenever the tile moves or the window resizes while the panel
-  // is open: after a reload the header settles late (saved base mode, fonts,
-  // the scrollbar), so a side picked at open time can go stale.
-  function place() {
-    if (!isOpen()) return;
-    wrap.classList.remove('flip');
-    if (panel.getBoundingClientRect().right > document.documentElement.clientWidth - 8) {
-      wrap.classList.add('flip');
-    }
-  }
-  window.addEventListener('resize', place);
-  if (window.ResizeObserver) new ResizeObserver(place).observe(wrap);
   function close() {
     clearTimeout(timer);
     wrap.classList.remove('open');
