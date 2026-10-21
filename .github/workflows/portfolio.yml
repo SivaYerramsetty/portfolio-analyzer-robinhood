@@ -244,7 +244,8 @@ jobs:
           # --screen scans every profitable US-listed stock over $1B (ADRs
           # included) once per market day, spread over the first ~7 runs (the
           # result is cached in .cache/, which rides the Actions cache),
-          # appends the best passers to the "Screening" watchlist and analyzes
+          # appends the best names of its two channels (the nine filters and
+          # the cash-flow screen) to the "Screening" watchlist and analyzes
           # them the same run. --prune-watchlists is the other half: it
           # removes them again when the verdict decays, so the list needs no
           # hand-curation.

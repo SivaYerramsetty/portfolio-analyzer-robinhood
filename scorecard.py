@@ -16,8 +16,8 @@ verdict_log.json:
   * closes  — daily closes for every ticker with a call still maturing, plus
               the S&P 500. Fetched once per session, after the close.
   * found   — every name the universe scan added to the Screening watchlist:
-              the day, the channel that found it and where it was found (in
-              the S&P 500/400, another US company, or based abroad). Graded
+              the day, the channels that nominated it and where it was found
+              (in the S&P 500/400, another US company, or based abroad). Graded
               from the day it was added, so each source has a track record.
 
 From those it measures each call's return, and its excess over the S&P 500
@@ -110,9 +110,10 @@ TIERS = (("buy", "Buy-grade", BUY_GRADE),
 LABEL_ORDER = ("BUY", "WATCH", "WAIT", "PASS", "ADD", "HOLD", "TRIM", "SELL")
 
 # How the screen's additions are grouped (record_found). Channels are the
-# screen's ways of finding a name; ponds say where it was found, which grades
-# the move from the S&P 500/400 to the whole US market.
-FOUND_CHANNELS = (("quality", "Nine-filter screen"),)
+# screen's ways of finding a name (screener.CHANNELS); ponds say where it was
+# found, which grades the move from the S&P 500/400 to the whole US market.
+FOUND_CHANNELS = (("quality", "Nine-filter screen"),
+                  ("fcf", "Cash-flow screen"))
 FOUND_PONDS = (("sp", "In the S&P 500/400"),
                ("us", "Other US companies"),
                ("intl", "Based outside the US"))
@@ -254,9 +255,16 @@ def record_day(log: dict, day: str, calls: dict) -> int:
     return len(calls)
 
 
+def _channels(e: dict) -> list[str]:
+    """An addition's channels. Logged as a list; a single name before the
+    second channel."""
+    ch = e.get("ch")
+    return [ch] if isinstance(ch, str) else list(ch or [])
+
+
 def record_found(log: dict, day: str, entries: list[dict]) -> int:
     """Log the names the screen added to the Screening watchlist today:
-    entries of {"t": ticker, "ch": channel, "pond": pond or None}. A name
+    entries of {"t": ticker, "ch": [channels], "pond": pond or None}. A name
     already logged for the day isn't logged twice. Returns how many it wrote."""
     found = log.setdefault("found", [])
     seen = {(e.get("t"), e.get("d")) for e in found}
@@ -264,7 +272,7 @@ def record_found(log: dict, day: str, entries: list[dict]) -> int:
     for e in entries:
         if not e.get("t") or (e["t"], day) in seen:
             continue
-        found.append({"t": e["t"], "d": day, "ch": e.get("ch"),
+        found.append({"t": e["t"], "d": day, "ch": _channels(e),
                       "pond": e.get("pond")})
         seen.add((e["t"], day))
         added += 1
@@ -644,13 +652,14 @@ def _found_group(rows: list[dict], h: str) -> dict:
 
 def found_scorecard(log: dict, horizons=HORIZONS) -> dict:
     """How the screen's additions did since the day each was added: all of
-    them, by channel (once there is more than one) and by pond. Rows are
-    (key, label, {horizon: group}); a group nothing was found in is left out."""
+    them, by channel (once there is more than one; a name both channels
+    nominated counts in each) and by pond. Rows are (key, label, {horizon:
+    group}); a group nothing was found in is left out."""
     found = log.get("found") or []
     rows = evaluate_found(log, horizons)
     groups = [("all", "All screen additions", lambda e: True)]
-    if len({e.get("ch") for e in found}) > 1:
-        groups += [(f"ch:{key}", label, lambda e, k=key: e.get("ch") == k)
+    if len({c for e in found for c in _channels(e)}) > 1:
+        groups += [(f"ch:{key}", label, lambda e, k=key: k in _channels(e))
                    for key, label in FOUND_CHANNELS]
     groups += [(f"pond:{key}", label, lambda e, k=key: e.get("pond") == k)
                for key, label in FOUND_PONDS]

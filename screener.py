@@ -36,8 +36,11 @@ The scan runs in two stages:
      names the scan adds to the Screening watchlist rank by the report's
      numbers.
 
-The report doesn't show the scan itself: the best passers join the Screening
-watchlist and appear there with their verdicts.
+Two channels nominate names for the Screening watchlist (CHANNELS): the nine
+filters, and a cash-flow screen (fcf_eligible). Each name added is tagged with
+the channels that nominated it, so the Report Scorecard grades one against the
+other. The report doesn't show the scan itself: the names added appear on the
+Screening watchlist with their verdicts.
 
 screen_universe() is the entry point the report uses. It scans once per
 market day (cached in .cache/screen.json), spending a capped number of Yahoo
@@ -112,7 +115,8 @@ def _fmt_dollars(x: float) -> str:
 
 def _universe_key() -> str:
     """Recorded with the day's scan, so changing a floor restarts it."""
-    return (f"us:{min_market_cap():.0f}:{min_dollar_volume():.0f}:profitable")
+    return (f"us:{min_market_cap():.0f}:{min_dollar_volume():.0f}:profitable"
+            f":fcf{fcf_min_yield():g}")
 
 
 def fetch_us_universe(verbose: bool = True, screen=None) -> list[str]:
@@ -431,6 +435,9 @@ class ScreenResult:
     de_ratio: Optional[float] = None
     fcf: Optional[float] = None
     quick: Optional[float] = None
+    net_margin: Optional[float] = None      # trailing profit margin
+    financial_currency: Optional[str] = None  # the statements' currency
+    fcf_yield: Optional[float] = None       # free cash flow / market cap, in USD
     # Analyst (Yahoo)
     rec_avg: Optional[float] = None         # 1 = strong buy, 5 = strong sell
     num_analysts: Optional[int] = None
@@ -466,6 +473,90 @@ def pond(r: ScreenResult) -> Optional[str]:
     if r.country and r.country != "United States":
         return "intl"
     return None if r.in_sp is None else "us"
+
+
+# ============================================================
+# Channels — the screen's ways of nominating a name
+# ============================================================
+#   "quality" — passes all nine filters.
+#   "fcf"     — the cash-flow screen: a free-cash-flow yield of at least
+#               fcf_min_yield(), debt/equity under 1, and profitable.
+#               Free cash flow is Yahoo's trailing levered figure, converted to
+#               dollars for a company that reports in another currency.
+# Tested over Oct 2025 -> Oct 2026 on SEC filings as they stood a year ago:
+# the top fifth of the universe by FCF yield with D/E under 1 rose a median
+# 14.6% (206 names) against 4.9% for the universe, as well as the names that
+# passed eight or nine of the nine filters (17.2%, 49 names). Of the nine, only
+# P/E and D/E carried the signal; the growth filters did worse than failing
+# them. One year is one regime, so both channels run side by side and the
+# scorecard grades them on live calls.
+CHANNELS = ("quality", "fcf")
+
+
+def fcf_min_yield() -> float:
+    """The cash-flow channel's yield bar (SCREEN_MIN_FCF_YIELD): the top
+    fifth of the universe started at 8.4% on 2026-10-21 (median 3.9%)."""
+    return _env_float("SCREEN_MIN_FCF_YIELD", 0.08)
+
+
+# A yield this high is a data error, not a bargain: before yields were put
+# into dollars, YPF read 6,309% (pesos over dollars).
+FCF_YIELD_MAX = 0.5
+
+
+def fcf_eligible(r: ScreenResult) -> bool:
+    """r qualifies for the cash-flow channel. A missing D/E doesn't qualify,
+    as in the nine filters, and nor does negative equity."""
+    return (not r.error and r.fcf_yield is not None
+            and fcf_min_yield() <= r.fcf_yield < FCF_YIELD_MAX
+            and r.de_ratio is not None and 0 <= r.de_ratio < 1
+            and (r.net_margin is None or r.net_margin > 0))
+
+
+def _usd_rate(currency: str) -> Optional[float]:
+    """Dollars per unit of `currency`, from Yahoo's last daily close. One
+    request. Raises on a refusal; None when Yahoo has no rate."""
+    hist = yf.Ticker(f"{currency}USD=X").history(period="5d")
+    closes = hist["Close"].dropna() if "Close" in hist else []
+    return float(closes.iloc[-1]) if len(closes) and closes.iloc[-1] > 0 else None
+
+
+def _set_fcf_yields(results: list[ScreenResult], rates: dict[str, float],
+                    budget: yl.YahooBudget) -> list[ScreenResult]:
+    """Fill in the FCF yield of each foreign reporter in `results`, fetching
+    the exchange rates `rates` (the day's, kept with the scan) doesn't have
+    yet. Only a refusal stops the fetch, not a spent budget: the prefilter
+    usually spends the first run's budget, a day needs ~20 rates, and a batch
+    without them would lose its foreign names from the cash-flow channel. A
+    currency Yahoo has no rate for leaves its names without a yield. Returns
+    the names left without one because Yahoo refused, to prefilter again."""
+    foreign = [r for r in results if not r.error and r.fcf is not None
+               and r.market_cap and r.financial_currency not in (None, "USD")]
+    for cur in sorted({r.financial_currency for r in foreign} - rates.keys()):
+        if budget.stopped:
+            break
+        try:
+            rate = _usd_rate(cur)
+        except Exception as e:
+            if yl.is_rate_limited(e):
+                budget.refused()
+                break
+            rate = None
+        if rate:
+            rates[cur] = rate
+    unrated = []
+    for r in foreign:
+        if r.financial_currency in rates:
+            r.fcf_yield = r.fcf * rates[r.financial_currency] / r.market_cap
+        elif budget.stopped:
+            unrated.append(r)
+    return unrated
+
+
+def channel_candidates(out: dict) -> dict[str, list]:
+    """Each channel's candidates from screen_universe's output, best
+    Composite first."""
+    return {"quality": out["passed"], "fcf": out["fcf"]}
 
 
 def _prefilter_passes(r: ScreenResult) -> dict[str, bool]:
@@ -525,6 +616,12 @@ def prefilter_one(ticker: str) -> ScreenResult:
     r.de_ratio = (de_raw / 100) if de_raw is not None else None
     r.fcf = _safe(info, "freeCashflow")
     r.quick = _safe(info, "quickRatio")
+    r.net_margin = _safe(info, "profitMargins")
+    r.financial_currency = info.get("financialCurrency")
+    # Market cap is in dollars, free cash flow in the statements' currency: a
+    # foreign reporter's yield waits for an exchange rate (_set_fcf_yields).
+    if r.fcf is not None and r.market_cap and r.financial_currency in (None, "USD"):
+        r.fcf_yield = r.fcf / r.market_cap
 
     r.rec_avg = _safe(info, "recommendationMean")
     na = info.get("numberOfAnalystOpinions")
@@ -589,7 +686,8 @@ def prefilter_universe(tickers: list[str], *, budget: yl.YahooBudget,
 # ============================================================
 # Shortlist and split
 # ============================================================
-# Names within this many prefilter misses go on to full scoring. The rough
+# Names within this many prefilter misses go on to full scoring, as does every
+# name the cash-flow channel can use (fcf_eligible), whatever it misses. The rough
 # reading disagrees with stage 2 mostly on growth (a weak last year inside a
 # strong three) and on trailing versus averaged ROE and margins, so the
 # allowance has to cover a few flips at once. Measured over the whole universe
@@ -668,6 +766,7 @@ def _load_screen_state(verbose: bool = True) -> Optional[dict]:
             "universe_size": cached.get("universe_size", 0),
             "source": cached.get("source") or "us",
             "sp_members": list(cached.get("sp_members") or []),
+            "fx": dict(cached.get("fx") or {}),
             "unscreened": list(cached.get("unscreened") or []),
             "to_prefilter": list(cached.get("to_prefilter") or []),
             "to_score": [ScreenResult(**d) for d in cached.get("to_score") or []],
@@ -697,6 +796,7 @@ def _save_screen_state(state: dict, verbose: bool = True) -> None:
             "universe_size": state["universe_size"],
             "source": state["source"],
             "sp_members": state["sp_members"],
+            "fx": state["fx"],
             "unscreened": state["unscreened"],
             "to_prefilter": state["to_prefilter"],
             "to_score": [asdict(r) for r in state["to_score"]],
@@ -709,9 +809,13 @@ def _save_screen_state(state: dict, verbose: bool = True) -> None:
 
 def _scan_output(state: dict, from_cache: bool, refused: bool = False) -> dict:
     passed, near = split_passers_and_near_misses(state["shown"])
+    cash = sorted((r for r in state["shown"] if fcf_eligible(r)
+                   and r.score_composite is not None),
+                  key=lambda r: r.score_composite, reverse=True)
     return {
         "passed": passed,
         "near_miss": near,
+        "fcf": cash,
         "universe_size": state["universe_size"],
         "unscreened": sorted(state["unscreened"]),
         "pending": len(state["to_prefilter"]) + len(state["to_score"]),
@@ -752,7 +856,7 @@ def _new_state(limit: Optional[int], verbose: bool) -> Optional[dict]:
         "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
         "universe_size": len(universe), "source": source,
         "sp_members": sorted(sp) if len(sp) > _MIN_SP_LIST else [],
-        "unscreened": [], "to_prefilter": list(universe),
+        "fx": {}, "unscreened": [], "to_prefilter": list(universe),
         "to_score": [], "shown": [],
     }
 
@@ -774,8 +878,9 @@ def screen_universe(
     didn't get to (budget spent, or Yahoo refused), which wait for the next
     run. Its Yahoo work should go through the budget it is handed.
 
-    Returns {"passed", "near_miss", "universe_size", "unscreened", "pending",
-    "scanned_at", "from_cache", "refused"}.
+    Returns {"passed", "near_miss", "fcf", "universe_size", "unscreened",
+    "pending", "scanned_at", "from_cache", "refused"}. "fcf" holds the
+    cash-flow channel's candidates (fcf_eligible), scored like the rest.
     `pending` counts the names still to prefilter or score; `unscreened` lists
     the names Yahoo had no data for; `refused` says Yahoo turned this run
     away, so more Yahoo work now would fail too. `limit` caps the universe for
@@ -802,17 +907,26 @@ def screen_universe(
                                            max_workers=workers, verbose=verbose)
         for r in fetched:
             r.in_sp = (r.ticker in sp) if sp else None
+        retry = {id(r) for r in _set_fcf_yields(fetched, state["fx"], budget)}
+        if retry:
+            left = left + [r.ticker for r in fetched if id(r) in retry]
+            fetched = [r for r in fetched if id(r) not in retry]
         state["unscreened"] += [r.ticker for r in fetched if r.error]
         # Fewest misses first: the names likeliest to pass are scored first.
+        # A cash-flow candidate goes among the names one miss out, so both
+        # channels' additions land in the first runs.
         state["to_score"] = sorted(
-            state["to_score"] + [r for r in fetched if not r.error
-                                 and r.prefilter_failed <= PREFILTER_MAX_FAILED],
-            key=lambda r: r.prefilter_failed)
+            state["to_score"] + [r for r in fetched if not r.error and (
+                r.prefilter_failed <= PREFILTER_MAX_FAILED or fcf_eligible(r))],
+            key=lambda r: (min(r.prefilter_failed, 1) if fcf_eligible(r)
+                           else r.prefilter_failed))
         state["to_prefilter"] = left
         if verbose:
+            cash = sum(1 for r in state["to_score"] if fcf_eligible(r))
             print(f"[screen] Prefilter: {len(fetched)} fetched in "
-                  f"{time.time() - start:.0f}s; {len(state['to_score'])} within "
-                  f"{PREFILTER_MAX_FAILED} misses queued for full scoring"
+                  f"{time.time() - start:.0f}s; {len(state['to_score'])} queued "
+                  f"for full scoring (within {PREFILTER_MAX_FAILED} misses, or "
+                  f"one of {cash} cash-flow candidates)"
                   + (f"; {len(left)} left for the next run" if left else "")
                   + ".")
 
@@ -824,7 +938,9 @@ def screen_universe(
         done = [r for r in batch if id(r) not in unfinished]
         state["unscreened"] += [r.ticker for r in done if r.error]
         passed, near = split_passers_and_near_misses(done)
-        state["shown"] += passed + near
+        kept = {id(r) for r in passed + near}
+        cash = [r for r in done if id(r) not in kept and fcf_eligible(r)]
+        state["shown"] += passed + near + cash
         state["to_score"] = left
 
     out = _scan_output(state, from_cache=False, refused=budget.stopped)

@@ -247,8 +247,8 @@ def test_found() -> None:
     again = sc.record_found(log, "2026-10-06", [{"t": "AAA", "ch": "quality"}])
     check((n, again, [e["t"] for e in log["found"]]), (2, 0, ["AAA", "BBB"]),
           "each name is logged once a day; an entry without a ticker is skipped")
-    check(log["found"][0], {"t": "AAA", "d": "2026-10-06", "ch": "quality",
-                            "pond": "us"}, "with its day, channel and pond")
+    check(log["found"][0], {"t": "AAA", "d": "2026-10-06", "ch": ["quality"],
+                            "pond": "us"}, "with its day, channels and pond")
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "verdict_log.json")
@@ -281,10 +281,16 @@ def test_found() -> None:
           "each pond on its own; the unpriced addition counts in none yet")
 
     two = _found_log()
-    sc.record_found(two, "2026-10-21", [{"t": "NEWCH", "ch": "revisions",
-                                         "pond": "us"}])
-    check([key for key, _, _ in sc.found_scorecard(two)["rows"]][:2],
-          ["all", "ch:quality"], "a second channel brings rows by channel")
+    two["found"][0]["ch"] = "quality"          # logged before the second channel
+    two["found"][1]["ch"] = ["quality", "fcf"]  # USCO: both nominated it
+    two["found"][2]["ch"] = ["fcf"]             # ADR: the cash-flow screen only
+    rows2 = {key: by_h for key, _, by_h in sc.found_scorecard(two)["rows"]}
+    check([key for key, _, _ in sc.found_scorecard(two)["rows"]][:3],
+          ["all", "ch:quality", "ch:fcf"], "a second channel brings rows by channel")
+    check((rows2["ch:quality"]["1M"]["n"], rows2["ch:quality"]["1M"]["alpha"],
+           rows2["ch:fcf"]["1M"]["n"], rows2["ch:fcf"]["1M"]["alpha"]),
+          (2, 7.0, 2, 1.0),
+          "a name both nominated counts in each; an old single-channel entry reads")
 
     labels = {"composite": "Composite"}
     built = sc.build_scorecard(_found_log(), ("composite",), "composite", labels)
@@ -640,7 +646,7 @@ def test_update_scorecard() -> None:
                                 found=[{"t": "TSM", "ch": "quality",
                                         "pond": "intl"}])
         check(json.loads(Path(path).read_text())["found"],
-              [{"t": "TSM", "d": "2026-10-07", "ch": "quality", "pond": "intl"}],
+              [{"t": "TSM", "d": "2026-10-07", "ch": ["quality"], "pond": "intl"}],
               "the screen's additions are logged with the day")
         check("Logged 1 screen addition(s) to grade: TSM (intl)"
               in out3.getvalue(), True, "and the run log names them")

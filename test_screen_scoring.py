@@ -228,6 +228,17 @@ def test_prefilter_one() -> None:
     check(r.prefilter_failed, 1, "only the 5% EPS growth counts against it")
     check((r.passes, r.num_failed, r.score_composite), ({}, 9, None),
           "the filters and scores are left for stage 2")
+    check((r.fcf_yield, r.net_margin), (0.04, None),
+          "FCF yield is free cash flow over market cap, from the same request")
+
+    foreign = dict(QS["quoteSummary"]["result"][0])
+    foreign["financialData"] = dict(foreign["financialData"],
+                                    financialCurrency="CNY")
+    with patched(sc.yf, Ticker=lambda t: FakeTicker(
+            payload={"quoteSummary": {"result": [foreign]}})):
+        r = sc.prefilter_one("ADR")
+    check((r.financial_currency, r.fcf_yield), ("CNY", None),
+          "a yuan reporter's yield waits for an exchange rate")
 
     thin = dict(QS["quoteSummary"]["result"][0])
     thin["financialData"] = {"currentPrice": 100.0, "debtToEquity": 50.0,
@@ -246,6 +257,73 @@ def test_prefilter_one() -> None:
             _quote=SimpleNamespace(_fetch=boom))):
         r = sc.prefilter_one("RL")
     check(yl.is_rate_limited(r.error), True, "a refusal is recorded as one")
+
+
+def test_fcf_eligible() -> None:
+    section("the cash-flow channel: FCF yield, D/E under 1, profitable")
+    base = dict(ticker="X", fcf_yield=0.10, de_ratio=0.4, net_margin=0.12)
+    r = lambda **kw: sc.ScreenResult(**{**base, **kw})
+    with patched(sc.os, environ={}):
+        check(sc.fcf_min_yield(), 0.08, "the bar defaults to an 8% yield")
+        check(sc.fcf_eligible(r()), True, "10% yield, D/E 0.4, profitable")
+        for label, kw in (("a yield under the bar", {"fcf_yield": 0.07}),
+                          ("a yield too high to be real", {"fcf_yield": 0.6}),
+                          ("no yield", {"fcf_yield": None}),
+                          ("D/E of 1 or more", {"de_ratio": 1.0}),
+                          ("negative equity", {"de_ratio": -0.3}),
+                          ("no D/E", {"de_ratio": None}),
+                          ("a loss", {"net_margin": -0.01}),
+                          ("an error", {"error": "no info"})):
+            check(sc.fcf_eligible(r(**kw)), False, f"not with {label}")
+        check(sc.fcf_eligible(r(net_margin=None)), True,
+              "a missing margin isn't held against it")
+        key = sc._universe_key()
+    with patched(sc.os, environ={"SCREEN_MIN_FCF_YIELD": "0.12"}):
+        check((sc.fcf_eligible(r()), sc._universe_key() != key), (False, True),
+              "the bar can be set from the environment, and restarts the scan")
+
+
+def test_fcf_yield_currency() -> None:
+    section("FCF yield: a foreign reporter's cash flow is put into dollars")
+    usd = sc.ScreenResult(ticker="USD", fcf=1e9, market_cap=1e10,
+                          financial_currency="USD", fcf_yield=0.1)
+    cny = sc.ScreenResult(ticker="CNY", fcf=7e9, market_cap=1e10,
+                          financial_currency="CNY")
+    ars = sc.ScreenResult(ticker="ARS", fcf=1e12, market_cap=1e10,
+                          financial_currency="ARS")
+    zzz = sc.ScreenResult(ticker="ZZZ", fcf=1e9, market_cap=1e10,
+                          financial_currency="ZZZ")
+    asked = []
+
+    def rate(cur):
+        asked.append(cur)
+        yl.note_request()
+        return {"CNY": 0.14, "ARS": 0.00065}.get(cur)
+
+    spent = quiet_budget(1)
+    yl.note_request()                          # the prefilter used the budget
+    rates = {"ARS": 0.00065}
+    with patched(sc, _usd_rate=rate):
+        retry = sc._set_fcf_yields([usd, cny, ars, zzz], rates, spent)
+    check((round(cny.fcf_yield, 3), round(ars.fcf_yield, 3), zzz.fcf_yield,
+           usd.fcf_yield), (0.098, 0.065, None, 0.1),
+          "yuan and pesos become dollars; a currency with no rate gets no yield")
+    check((sorted(asked), retry), (["CNY", "ZZZ"], []),
+          "a rate already known isn't fetched again, even with the budget spent")
+    check(rates["CNY"], 0.14, "and the day's rates are kept for later runs")
+
+    from yfinance.exceptions import YFRateLimitError
+
+    def refused(cur):
+        raise YFRateLimitError()
+
+    late = sc.ScreenResult(ticker="LATE", fcf=7e9, market_cap=1e10,
+                           financial_currency="EUR")
+    budget = quiet_budget()
+    with patched(sc, _usd_rate=refused):
+        retry = sc._set_fcf_yields([late], {}, budget)
+    check(([r.ticker for r in retry], budget.stopped), (["LATE"], True),
+          "a refusal stops the run and hands the name back to prefilter again")
 
 
 def test_prefilter_universe() -> None:
@@ -301,21 +379,27 @@ def test_scorer_matches_the_holding() -> None:
         "FAR": dict(PASSING, earningsCAGR3y=0.05, quickRatio=0.8,
                     debtToEquity=150),
     }
+    infos["CASH"] = infos["FAR"]
     rows = [sc.ScreenResult(ticker=t, name=t) for t in ("PASS", "NEAR", "FAR")]
+    rows.append(sc.ScreenResult(ticker="CASH", name="CASH", fcf_yield=0.1,
+                                de_ratio=0.5))
     with patched(ap, _screen_scoring_inputs=_inputs(infos),
                  _set_insider_scores=fake_insider,
-                 _flush_fund_cache=lambda: None):
+                 _flush_fund_cache=lambda: None), patched(sc.os, environ={}):
         left = ap.score_screen_shortlist(rows, budget=quiet_budget(),
                                          verbose=False)
-    passing, near, far = rows
+    passing, near, far, cash = rows
     check(left, [], "with room in the budget every name is scored")
     check((passing.num_passed, near.num_failed, far.num_failed), (9, 2, 3),
           "the nine filters are analyze_portfolio's")
     check(sorted(k for k, v in near.passes.items() if not v),
           ["eps_growth", "quick"], "failures are listed by their short names")
-    check(sorted(insider_reads), ["NEAR", "PASS"],
-          "the insider read is made only for names the table shows")
-    check(far.score_composite, None, "a name the table won't show isn't scored")
+    check(sorted(insider_reads), ["CASH", "NEAR", "PASS"],
+          "the insider read is made only for names a channel could add, or "
+          "near misses")
+    check(far.score_composite, None, "a name no channel can use isn't scored")
+    check((cash.num_failed, cash.score_composite is not None), (3, True),
+          "a cash-flow candidate gets its Composite whatever it fails")
 
     # The same inputs through the holdings path: compute_composite_score.
     pa = ap.PositionAnalysis(ticker="PASS", name="PASS", shares=10,
@@ -565,6 +649,72 @@ def test_fetch_universe_fallback() -> None:
     check(raised, True, "a refusal is raised, not papered over with the S&P list")
 
 
+def test_screen_universe_fcf() -> None:
+    section("screen_universe: cash-flow candidates are scored whatever they miss")
+    pre = {"PASS": (0, None), "CASH": (6, 0.10), "BOTH": (0, 0.09),
+           "NONE": (6, 0.01)}
+    verdicts = {"PASS": (0, 70.0), "CASH": (5, 64.0), "BOTH": (0, 80.0),
+                "NONE": (6, 30.0)}
+
+    def fake_prefilter(t):
+        misses, yld = pre[t]
+        return sc.ScreenResult(ticker=t, name=t, prefilter_failed=misses,
+                               fcf_yield=yld, de_ratio=0.5)
+
+    scored: list = []
+    with tempfile.TemporaryDirectory() as d, patched(sc.os, environ={}), \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (sorted(pre), "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 1000):
+        out = sc.screen_universe(_fake_scorer(verdicts, scored),
+                                 max_workers=1, verbose=False)
+        check(sorted(scored), ["BOTH", "CASH", "PASS"],
+              "a cash-flow candidate six misses out is scored; others aren't")
+        check(([r.ticker for r in out["passed"]], [r.ticker for r in out["fcf"]]),
+              (["BOTH", "PASS"], ["BOTH", "CASH"]),
+              "it comes back as a cash-flow candidate, best Composite first")
+        check({ch: [r.ticker for r in rows]
+               for ch, rows in sc.channel_candidates(out).items()},
+              {"quality": ["BOTH", "PASS"], "fcf": ["BOTH", "CASH"]},
+              "channel_candidates hands both lists on")
+        again = sc.screen_universe(_fake_scorer(verdicts, scored),
+                                   max_workers=1, verbose=False)
+        check([r.ticker for r in again["fcf"]], ["BOTH", "CASH"],
+              "and the day's cache keeps it")
+
+    def foreign_prefilter(t):
+        return sc.ScreenResult(ticker=t, name=t, prefilter_failed=6, fcf=7e9,
+                               market_cap=5e10, financial_currency="CNY",
+                               de_ratio=0.5)
+
+    from yfinance.exceptions import YFRateLimitError
+    refuse = [True]
+
+    def rate(cur):
+        if refuse[0]:
+            refuse[0] = False
+            raise YFRateLimitError()
+        return 0.7                             # 7e9 x 0.7 / 5e10 = 9.8%
+
+    scored = []
+    with tempfile.TemporaryDirectory() as d, patched(sc.os, environ={}), \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (["ADR"], "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
+                    prefilter_one=foreign_prefilter, _usd_rate=rate,
+                    _request_budget=lambda: 1000):
+        first = sc.screen_universe(_fake_scorer({"ADR": (6, 66.0)}, scored),
+                                   max_workers=1, verbose=False)
+        check((first["pending"], scored), (1, []),
+              "a refused exchange rate leaves the name to prefilter again")
+        second = sc.screen_universe(_fake_scorer({"ADR": (6, 66.0)}, scored),
+                                    max_workers=1, verbose=False)
+        check(([r.ticker for r in second["fcf"]], second["pending"]),
+              (["ADR"], 0), "next run it gets its rate and its place")
+
+
 def test_screen_universe_tags() -> None:
     section("screen_universe: where each name was found, and a refused start")
     countries = {"SPX": "United States", "USCO": "United States",
@@ -691,9 +841,12 @@ def main() -> int:
     for t in (test_rate_limit_detection, test_budget, test_run_gated,
               test_quote_summary, test_prefilter_one, test_prefilter_universe,
               test_scorer_matches_the_holding, test_scorer_refusals,
-              test_growth_cache_guard, test_fetch_us_universe,
+              test_growth_cache_guard, test_fcf_eligible,
+              test_fcf_yield_currency,
+              test_fetch_us_universe,
               test_fetch_universe_fallback, test_screen_universe,
-              test_screen_universe_refusal, test_screen_universe_tags,
+              test_screen_universe_refusal, test_screen_universe_fcf,
+              test_screen_universe_tags,
               test_add_screened_names, test_split,
               test_report_has_no_scan_tables):
         before = len(_results)

@@ -45,7 +45,8 @@ COMMAND REFERENCE — every way to run this script
         --save-positions positions.csv --out report.html --email
 
     # Self-maintaining watchlist: scan the US market once a market day, append
-    # the best passers to the "Screening" list, analyze them in the same run,
+    # each channel's best names (the nine filters, the cash-flow screen) to the
+    # "Screening" list, analyze them in the same run,
     # and prune them again when their verdict decays. Nothing to add by hand.
     python analyze_portfolio.py --source robinhood --include-watchlists \
         --screen --sync-screening-watchlist --prune-watchlists --out report.html
@@ -119,10 +120,12 @@ COMMAND REFERENCE — every way to run this script
                            Scans at most once per market day (cached in .cache/).
     --screen-limit N       Cap screened universe for testing.
     --rescan               Ignore today's cached scan and screen again.
-    --sync-screening-watchlist  Append the scan's best passers to the
-                           "Screening" watchlist and analyze them this run.
+    --sync-screening-watchlist  Append the scan's best names (nine-filter
+                           and cash-flow channels) to the "Screening"
+                           watchlist and analyze them this run.
                            Append-only; --prune-watchlists removes them later.
-    --screen-add-limit N   Most names one scan may add (default 25).
+    --screen-add-limit N   Most names one scan may add, split between the
+                           two channels (default 25).
     --add-to-watchlist NAME  Append --tickers to a Robinhood watchlist (no report).
     --sync-dry-run         Preview --add-to-watchlist / --sync without writing.
     --debug-insider TICKER Diagnose insider data sources for one stock.
@@ -5194,29 +5197,35 @@ MIN_SCREEN_UNIVERSE = 100
 
 
 def select_screen_additions(
-    passed: list,
+    channels: dict[str, list],
     held_tickers: set[str],
     history: Optional[dict] = None,
     limit: int = 25,
     threshold: float = 60.0,
     today: Optional[date] = None,
-) -> tuple[list[str], dict[str, str]]:
-    """Pick the scan's passers worth adding to the Screening watchlist.
+) -> tuple[list[str], dict[str, str], dict[str, list[str]]]:
+    """Pick the scan's names worth adding to the Screening watchlist.
 
-    Returns (tickers, skipped) — tickers highest-composite first and capped at
-    `limit`, and {ticker: why} for the ones passed over. Every added name costs
-    a full analysis on each later run, so the cap is what keeps a scan that
-    happens to pass 80 names from doubling the runtime of every run that day.
+    channels: {channel: candidates}, each best Composite first
+    (screener.channel_candidates). The channels split `limit` evenly, the
+    first taking any odd slot; a name both nominate counts once, against the
+    channel that reached it first, and a share a channel can't fill goes to
+    the best names left in either.
+
+    Returns (tickers, skipped, tags): the picks, capped at `limit`; {ticker:
+    why} for the ones passed over; and {ticker: [channels]} naming every
+    channel that nominated each pick, which the scorecard grades them by.
+    Every added name costs a full analysis on each later run, so the cap is
+    what keeps a scan that happens to pass 80 names from doubling the runtime
+    of every run that day.
     """
     today = today or datetime.now(ZoneInfo("America/New_York")).date()
     entries = (history or {}).get("tickers") or {}
-    picks: list[str] = []
     skipped: dict[str, str] = {}
-    for r in passed:                      # already sorted by composite desc
-        t = r.ticker
+
+    def blocked(t: str) -> Optional[str]:
         if t in held_tickers:
-            skipped[t] = "already held"
-            continue
+            return "already held"
         entry = entries.get(t) or {}
         score, seen = entry.get("last_verdict_score"), entry.get("last_date")
         if score is not None and score < threshold and seen:
@@ -5225,14 +5234,42 @@ def select_screen_additions(
             except (ValueError, TypeError):
                 age = None
             if age is not None and age <= SCREEN_READD_COOLDOWN_DAYS:
-                skipped[t] = (f"scored {score:.0f} {age}d ago, under the "
-                              f"{threshold:g} prune bar")
+                return (f"scored {score:.0f} {age}d ago, under the "
+                        f"{threshold:g} prune bar")
+        return None
+
+    open_: dict[str, list] = {}
+    tags: dict[str, list[str]] = {}
+    for ch, rows in channels.items():
+        open_[ch] = []
+        for r in rows:
+            why = skipped.get(r.ticker) or blocked(r.ticker)
+            if why:
+                skipped[r.ticker] = why
                 continue
+            open_[ch].append(r)
+            tags.setdefault(r.ticker, []).append(ch)
+
+    picks: list[str] = []
+    share = {ch: limit // len(channels) + (i < limit % len(channels))
+             for i, ch in enumerate(channels)} if channels else {}
+    for ch, rows in open_.items():
+        taken = 0
+        for r in rows:
+            if taken >= share[ch]:
+                break
+            if r.ticker not in picks:
+                picks.append(r.ticker)
+                taken += 1
+    rest = sorted({r.ticker: r for rows in open_.values() for r in rows
+                   if r.ticker not in picks}.values(),
+                  key=lambda r: r.score_composite or -1, reverse=True)
+    for r in rest:
         if len(picks) >= limit:
-            skipped[t] = f"past the top {limit}"
-            continue
-        picks.append(t)
-    return picks, skipped
+            skipped[r.ticker] = f"past the top {limit}"
+        else:
+            picks.append(r.ticker)
+    return picks, skipped, {t: tags[t] for t in picks}
 
 
 def add_screened_names(watchlists_analyzed: dict, landed: list[dict], *,
@@ -5311,10 +5348,10 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
     Yahoo work spends `budget` (a yahoo_limits.YahooBudget). The results it
     didn't get to — the budget ran out, or Yahoo refused — come back untouched
     for the next run; a name Yahoo has no data for gets an `error`. The
-    insider read (SEC) is made only for the names the table shows: all nine
-    filters passed, or one or two missed.
+    Composite and the insider read (SEC) are made only for the names a
+    channel could add, or that miss one or two filters: the rest are dropped.
     """
-    from screener import NEAR_MISS_MAX_FAILED
+    from screener import NEAR_MISS_MAX_FAILED, fcf_eligible
 
     gathered: dict[str, tuple] = {}
     lock = threading.Lock()
@@ -5352,12 +5389,12 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
                     for f in filters}
         r.num_passed = sum(1 for f in filters if f.passed)
         r.num_failed = len(filters) - r.num_passed
-        if r.num_failed <= NEAR_MISS_MAX_FAILED:
+        if r.num_failed <= NEAR_MISS_MAX_FAILED or fcf_eligible(r):
             shown.append((r, pa, info))
     if verbose:
         print(f"[screen] Scored {len(gathered)} of {len(results)} queued "
               f"name(s) in {time.time() - start:.0f}s; {len(shown)} pass all "
-              f"nine filters or miss one or two"
+              f"nine filters, miss one or two, or are cash-flow candidates"
               + (f"; {len(left)} wait for the next run" if left else "") + ".")
 
     start = time.time()
@@ -9879,7 +9916,9 @@ def _render_scorecard_section(sc: Optional[dict]) -> str:
         html += (f"<p style='{p_style}'>Every name the daily scan added to the "
                  f"Screening watchlist ({_sc_plural(found['n'], 'addition')} "
                  f"since {_fmt_short_date(found['since'])}), graded from the "
-                 "close on the day it was added. The rows split them by where "
+                 "close on the day it was added. The rows split them by the "
+                 "screen that nominated them (the nine filters or the cash-flow "
+                 "screen; a name both nominated counts in each) and by where "
                  "they were found: the S&amp;P 500/400 the scan used to cover, "
                  "other US companies, and companies based abroad.</p>\n"
                  + found_table)
@@ -12896,7 +12935,9 @@ def main():
     ap.add_argument("--screen", action="store_true",
                     help="Screen every profitable US-listed stock over $1B "
                          "(ADRs included); with --sync-screening-watchlist the "
-                         "best passers join the Screening watchlist. The report "
+                         "best names of its two channels (the nine filters, "
+                         "the cash-flow screen) join the Screening watchlist. "
+                         "The report "
                          "shows no scan tables, only the names added. The "
                          "scan runs at most once per market day and is cached "
                          "in .cache/. Each run spends at most "
@@ -12912,15 +12953,18 @@ def main():
                          "the universe again.")
     ap.add_argument("--sync-screening-watchlist", action="store_true",
                     help=f"When --screen is used and --source is robinhood, "
-                         f"append the scan's best passers to the "
+                         f"append the best names of the scan's two channels "
+                         f"to the "
                          f"'{SCREEN_WATCHLIST}' watchlist in Robinhood "
                          f"(read-write) and analyze them in the same run. "
                          f"Append-only: removal is --prune-watchlists' job, "
                          f"and a name it pruned is not re-added for "
                          f"{SCREEN_READD_COOLDOWN_DAYS} days.")
     ap.add_argument("--screen-add-limit", type=int, default=25,
-                    help="Most names one scan may add to the watchlist, "
-                         "highest composite first (default 25). Every added "
+                    help="Most names one scan may add to the watchlist "
+                         "(default 25), split evenly between the nine-filter "
+                         "and cash-flow channels, highest Composite first "
+                         "within each. Every added "
                          "name is analyzed on every later run, so this is the "
                          "knob that bounds run time.")
     ap.add_argument("--sync-dry-run", action="store_true",
@@ -13318,15 +13362,17 @@ def main():
             print(f"[screen] Error: {e}")
     if screening_results:
         try:
-            passed = screening_results["passed"]
+            channels = scr.channel_candidates(screening_results)
             pending = screening_results.get("pending") or 0
-            print(f"[screen] Passed: {len(passed)}  "
-                  f"Near-miss: {len(screening_results['near_miss'])}"
+            print(f"[screen] Passed: {len(channels['quality'])}  "
+                  f"Near-miss: {len(screening_results['near_miss'])}  "
+                  f"Cash-flow: {len(channels['fcf'])}"
                   + (f"  Still to screen: {pending}" if pending else ""))
+            by_ticker = {r.ticker: r for rows in channels.values() for r in rows}
 
-            # Append the best passers to the Screening watchlist, then put them
-            # straight into this run's universe. Pruning removes them again
-            # once their verdict decays, so the list maintains itself.
+            # Append each channel's best names to the Screening watchlist, then
+            # put them straight into this run's universe. Pruning removes them
+            # again once their verdict decays, so the list maintains itself.
             syncing = (args.sync_screening_watchlist
                        and args.source == "robinhood")
             if syncing and screening_results["universe_size"] < MIN_SCREEN_UNIVERSE:
@@ -13338,8 +13384,8 @@ def main():
                       f"partial scan.")
             if syncing:
                 import robinhood_source as rhs
-                adds, skipped = select_screen_additions(
-                    passed,
+                adds, skipped, tags = select_screen_additions(
+                    channels,
                     held_tickers={r["ticker"] for r in rows},
                     history=_prior_history,
                     limit=args.screen_add_limit,
@@ -13347,6 +13393,10 @@ def main():
                 )
                 for t, why in skipped.items():
                     print(f"[screen] skip {t}: {why}")
+                for ch in scr.CHANNELS:
+                    picked = [t for t in adds if ch in tags[t]]
+                    print(f"[screen] {ch} channel picks ({len(picked)}): "
+                          f"{', '.join(picked) or 'none'}")
                 if not adds:
                     print("[screen] Nothing new to add to the "
                           f"'{SCREEN_WATCHLIST}' watchlist.")
@@ -13363,15 +13413,14 @@ def main():
                               f"will fill it.")
                     landed = res["to_add"] if args.sync_dry_run else res["added"]
                     if not args.sync_dry_run:
-                        by_ticker = {r.ticker: r for r in passed}
-                        screen_found = [{"t": t, "ch": "quality",
+                        screen_found = [{"t": t, "ch": tags[t],
                                          "pond": scr.pond(by_ticker[t])}
-                                        for t in landed if t in by_ticker]
+                                        for t in landed if t in tags]
                     if landed and screening_results.get("refused"):
                         print(f"[screen] Yahoo is refusing this runner; "
                               f"{', '.join(landed)} will be analyzed next run.")
                     elif landed:
-                        names = {r.ticker: (r.name or r.ticker) for r in passed}
+                        names = {t: (r.name or t) for t, r in by_ticker.items()}
                         print(f"[screen] Analyzing {len(landed)} newly screened "
                               f"name(s) in this run: {', '.join(landed)}")
                         add_screened_names(
