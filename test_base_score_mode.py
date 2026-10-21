@@ -868,6 +868,22 @@ def test_full_report() -> None:
     ids = re.findall(r"""\sid=["']([^"']+)["']""", html)
     dupes = sorted({i for i in ids if ids.count(i) > 1})
     check(dupes, [], "no element id repeats across the mode copies")
+    fit = next((s for s in re.findall(r"<script>(.*?)</script>", html, re.S)
+                if "// tableFit:" in s), "")
+    check((".table-wrap.too-wide { overflow-x: auto; }" in html,
+           ".table-wrap.too-wide thead th { position: static; }" in html,
+           "classList.toggle('too-wide'" in fit),
+          (True, True, True),
+          "a table too wide for the window scrolls in its own box, not the page")
+    node = shutil.which("node")
+    if node and fit:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fit.js"
+            path.write_text(fit)
+            proc = subprocess.run([node, "--check", str(path)],
+                                  capture_output=True, text=True)
+        check(proc.returncode, 0, "node --check accepts the page script with tableFit"
+              + (f": {proc.stderr.strip()}" if proc.returncode else ""))
 
     node = shutil.which("node")
     if not node:
