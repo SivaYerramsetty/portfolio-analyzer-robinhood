@@ -44,7 +44,7 @@ COMMAND REFERENCE — every way to run this script
     python analyze_portfolio.py --source robinhood --include-watchlists \
         --save-positions positions.csv --out report.html --email
 
-    # Self-maintaining watchlist: scan the S&P 500/400 once a market day, append
+    # Self-maintaining watchlist: scan the US market once a market day, append
     # the best passers to the "Screening" list, analyze them in the same run,
     # and prune them again when their verdict decays. Nothing to add by hand.
     python analyze_portfolio.py --source robinhood --include-watchlists \
@@ -115,7 +115,7 @@ COMMAND REFERENCE — every way to run this script
     --save-positions FILE  With --source robinhood: dump positions snapshot CSV.
     --out FILE             Output HTML path (default: portfolio_report.html).
     --email                Also send the report via SMTP (uses env vars).
-    --screen               Run S&P 500/400 screen; adds Screening section.
+    --screen               Screen US-listed stocks over $1B; adds Screening section.
                            Scans at most once per market day (cached in .cache/).
     --screen-limit N       Cap screened universe for testing.
     --rescan               Ignore today's cached scan and screen again.
@@ -5186,10 +5186,11 @@ SCREEN_WATCHLIST = "Screening"
 # scan — the two rules would fight and churn the list daily. The scan passes
 # over anything the ledger scored below the prune threshold this recently.
 SCREEN_READD_COOLDOWN_DAYS = 30
-# A real scan covers ~900 names. Anything far below that means the universe
-# fetch fell back to its hardcoded mega-cap sample (screener.fetch_sp500_sp400),
-# and "passed the screen" would then mean "is one of 30 huge companies" — not a
-# basis for writing to a live watchlist.
+# A real scan covers ~1,900 names (~900 on the S&P fallback). Anything far
+# below that means both universe fetches failed and the S&P one fell back to
+# its hardcoded mega-cap sample (screener.fetch_sp500_sp400), and "passed the
+# screen" would then mean "is one of 30 huge companies" — not a basis for
+# writing to a live watchlist.
 MIN_SCREEN_UNIVERSE = 100
 
 
@@ -6995,9 +6996,10 @@ def _screen_rows_with_live_scores(rows: list, analyzed: dict) -> list:
 
 def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
     """
-    Render the S&P 500/400 screening output.
+    Render the universe scan's output (screener.screen_universe).
     sr: {"passed": [ScreenResult], "near_miss": [ScreenResult],
-         "universe_size": int, "unscreened": [ticker], "scanned_at": iso}
+         "universe_size": int, "universe_label": str, "universe_note": str,
+         "unscreened": [ticker], "scanned_at": iso}
     analyzed: {ticker: PositionAnalysis} for every name this run analyzed —
     those rows show this run's scores (see _screen_rows_with_live_scores).
     """
@@ -7014,16 +7016,19 @@ def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
     except ValueError:
         pass
 
-    html = "<h2 style='margin-top:48px;'>📊 Screening — S&amp;P 500 + 400</h2>\n"
+    label = _miss_esc(sr.get("universe_label") or "US market")
+    html = f"<h2 style='margin-top:48px;'>📊 Screening — {label}</h2>\n"
+    what = _miss_esc(sr.get("universe_note") or "tickers")
     framework = "against the 9-filter quality framework"
     if pending:
-        screened = (f"Screening {uni} tickers {framework}; {pending} are still "
-                    f"to go, and the next runs fill them in. So far")
+        screened = (f"Screening {uni:,} {what} {framework}; {pending:,} are "
+                    f"still to go, and the next runs fill them in. So far")
     elif unscreened:
-        screened = (f"Screened {uni - unscreened} of {uni} tickers {framework} "
-                    f"({unscreened} could not be fetched from Yahoo).")
+        screened = (f"Screened {uni - unscreened:,} of {uni:,} {what} "
+                    f"{framework} ({unscreened} could not be fetched from "
+                    f"Yahoo).")
     else:
-        screened = f"Screened {uni} tickers {framework}."
+        screened = f"Screened {uni:,} {what} {framework}."
     html += (
         f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:8px;">'
         f"{screened} "
@@ -7041,14 +7046,26 @@ def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
         "<strong>52w Pos:</strong> 0% = at 52-wk low, 100% = at 52-wk high · "
         "<strong>Insider 90d:</strong> Decision verdict — Supports buy / No signal / Caution · "
         "<strong>Score:</strong> Composite of Quality 30% · Growth 20% · Value 20% · Analyst 15% · Insider 15% · "
-        "<strong>#F:</strong> Number of filters failed (1 or 2 for near misses)</p>\n"
+        "<strong>#F:</strong> Number of filters failed (1 or 2 for near misses) · "
+        "<strong>Where:</strong> in the S&amp;P 500/400, another US company, or "
+        "the home country of a company based abroad (most trade here as ADRs)</p>\n"
     )
+
+    import screener
+
+    def _where_cell(r) -> str:
+        key = screener.pond(r)
+        text = (r.country if key == "intl" and r.country
+                else screener.POND_LABELS.get(key, "—"))
+        order = {"sp": 0, "us": 1, "intl": 2}.get(key, 3)
+        return _td(f"<span style='white-space:nowrap;'>{_miss_esc(text)}</span>",
+                   f"{order}{_miss_esc(text)}")
 
     def _render_table(rows: list, is_near_miss: bool) -> str:
         if not rows:
             return ""
         h = "<div class='table-wrap'><table>\n<thead><tr>"
-        h += "<th>Ticker</th><th>Name</th><th>Sector</th>"
+        h += "<th>Ticker</th><th>Name</th><th>Sector</th><th>Where</th>"
         h += "<th class='num'>Price</th><th class='num'>Target</th>"
         h += "<th class='num'>Upside</th><th class='num'>52w Pos</th>"
         h += "<th class='num'>RecAvg</th><th class='num'># Analysts</th>"
@@ -7073,6 +7090,7 @@ def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
             h += _td(r.ticker, r.ticker, "ticker")
             h += _td(r.name or r.ticker, r.name or r.ticker)
             h += _td(r.sector or "—", r.sector or "zzz")
+            h += _where_cell(r)
             h += _td(_fmt_money(r.price), r.price or -1, "num")
             h += _td(_fmt_money(r.target_mean), r.target_mean or -1, "num")
             h += _td(_fmt_pct(r.upside_pct, 1, True),
@@ -9625,8 +9643,10 @@ def update_scorecard(
     path: str = scorecard.LOG_FILE,
     fetch=None,
     budget: Optional[int] = None,
+    found: Optional[list[dict]] = None,
 ) -> dict:
-    """Log this run's calls, fetch the closes still missing, and grade every
+    """Log this run's calls and screen additions (`found`, see
+    scorecard.record_found), fetch the closes still missing, and grade every
     matured call. Returns the scorecard (scorecard.build_scorecard).
 
     The first run also recovers the ledger's first-sighting calls, so the
@@ -9640,6 +9660,10 @@ def update_scorecard(
         print(f"[scorecard] Recovered {seeded} first-sighting call(s) from the "
               f"recommendation ledger.")
     logged = scorecard.record_day(log, run_date, scorecard_calls(results, watchlists))
+    n_found = scorecard.record_found(log, run_date, found or [])
+    if n_found:
+        print(f"[scorecard] Logged {n_found} screen addition(s) to grade: "
+              + ", ".join(f"{e['t']} ({e.get('pond') or '?'})" for e in found))
     attach_turned_buy(log, results, watchlists, run_date)
 
     if yahoo_limits.refusals():
@@ -9688,15 +9712,15 @@ def _sc_horizon(sc: dict) -> str:
                 scorecard.HORIZONS[0][0])
 
 
-def _sc_alpha_cell(g: Optional[dict], span: str) -> str:
+def _sc_alpha_cell(g: Optional[dict], span: str, noun: str = "calls") -> str:
     """A table cell: mean return vs the S&P 500, with the share that beat it
-    and the number of calls underneath."""
+    and the number of calls (or `noun`) underneath."""
     if not g or not g.get("n"):
         return ("<td class='num' data-sort=''>"
                 "<span style='color:var(--fg-faint);'>—</span></td>")
     a = g["alpha"]
     cls = "pos-up" if a > 0 else "pos-down" if a < 0 else ""
-    tip = (f"{g['n']} calls. Mean return {g['ret']:+.1f}% over {span}, "
+    tip = (f"{g['n']} {noun}. Mean return {g['ret']:+.1f}% over {span}, "
            f"{a:+.1f} points against the S&P 500; {g['beat']:.0%} beat it.")
     return (f"<td class='num' data-sort='{a:.2f}' title='{_miss_esc(tip)}'>"
             f"<span class='{cls}'>{a:+.1f}%</span>"
@@ -9922,6 +9946,25 @@ def _sc_factor_table(sc: dict) -> str:
             + "</tr></thead><tbody>" + rows + "</tbody></table></div>")
 
 
+def _sc_found_table(sc: dict) -> str:
+    """How the screen's additions did from the day each was added: all of
+    them, by channel once there are several, and by where they were found."""
+    rows = ""
+    for i, (key, label, by_h) in enumerate((sc.get("found") or {}).get("rows")
+                                           or []):
+        name = (f"<em>{_miss_esc(label)}</em>" if key == "all"
+                else f"<strong>{_miss_esc(label)}</strong>")
+        rows += (f"<tr><td data-sort='{i}'>{name}</td>"
+                 + "".join(_sc_alpha_cell(by_h[h], scorecard.HORIZON_NAMES[h],
+                                          "additions")
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    if not rows:
+        return ""
+    return ("<div class='table-wrap'><table><thead><tr><th>Added by the screen</th>"
+            + _sc_horizon_ths() + "</tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
 def _render_scorecard_section(sc: Optional[dict]) -> str:
     """The Report Scorecard section: every logged call graded against the S&P
     500 afterwards — by verdict, by score, by base and by input — plus the
@@ -9993,6 +10036,17 @@ def _render_scorecard_section(sc: Optional[dict]) -> str:
                  "names scoring higher on it did better. An input whose sign "
                  "disagrees with the part it plays is working against the "
                  "verdict.</p>\n" + factors)
+    found = sc.get("found") or {}
+    found_table = _sc_found_table(sc)
+    if found.get("n") and found_table:
+        html += h3.format("Where the screen's picks came from")
+        html += (f"<p style='{p_style}'>Every name the daily scan added to the "
+                 f"Screening watchlist ({_sc_plural(found['n'], 'addition')} "
+                 f"since {_fmt_short_date(found['since'])}), graded from the "
+                 "close on the day it was added. The rows split them by where "
+                 "they were found: the S&amp;P 500/400 the scan used to cover, "
+                 "other US companies, and companies based abroad.</p>\n"
+                 + found_table)
     html += (f"<p style='{p_style}font-size:11px;'>Method: one call per ticker per "
              "day (the day's last run). Entry and exit are official daily closes, "
              "split-adjusted, without dividends, like the S&amp;P 500 index. Daily "
@@ -13013,9 +13067,10 @@ def main():
                          "e.g. 'AAPL,MSFT,GOOGL'). Skips Robinhood/holdings entirely "
                          "— no auth needed. Useful for quick stock lookups.")
     ap.add_argument("--screen", action="store_true",
-                    help="Run S&P 500/400 screening and add the screening "
-                         "section. The scan runs at most once per market day "
-                         "and is cached in .cache/. Each run spends at most "
+                    help="Screen every profitable US-listed stock over $1B "
+                         "(ADRs included) and add the screening section. The "
+                         "scan runs at most once per market day and is cached "
+                         "in .cache/. Each run spends at most "
                          "SCREEN_REQUEST_BUDGET Yahoo requests on it (default "
                          "1500), so a day's scan completes over the first few "
                          "runs and the rest reuse it.")
@@ -13410,7 +13465,7 @@ def main():
             if analyzed_items:
                 watchlists_analyzed[wl_name] = analyzed_items
 
-    # ---------- Optional: screen the S&P 500/400 universe ----------
+    # ---------- Optional: screen the US market ----------
     # Runs after the holdings and watchlists are analyzed, so they always get
     # the runner's Yahoo allowance first. A runner that refuses partway through
     # the scan stays blocked for minutes, and on 2026-10-06 the holdings
@@ -13418,15 +13473,22 @@ def main():
     # scan adds to the Screening watchlist are analyzed straight away, so they
     # still show in this run's report.
     screening_results = None
+    # The names the scan added to the Screening watchlist this run, for the
+    # scorecard to grade by where they were found.
+    screen_found: list[dict] = []
     if args.screen:
         try:
             import screener as scr
             print("\n" + "=" * 60)
-            print("S&P 500/400 screen (scans once per market day)")
+            print("US market screen (scans once per market day)")
             print("=" * 60)
             screening_results = scr.screen_universe(
                 score_screen_shortlist, limit=args.screen_limit,
                 force=args.rescan, verbose=True)
+        except Exception as e:
+            print(f"[screen] Error: {e}")
+    if screening_results:
+        try:
             passed = screening_results["passed"]
             pending = screening_results.get("pending") or 0
             print(f"[screen] Passed: {len(passed)}  "
@@ -13441,9 +13503,10 @@ def main():
             if syncing and screening_results["universe_size"] < MIN_SCREEN_UNIVERSE:
                 syncing = False
                 print(f"[screen] Only {screening_results['universe_size']} "
-                      f"tickers in the universe — the Wikipedia fetch fell back "
-                      f"to its mega-cap sample. Not touching the "
-                      f"'{SCREEN_WATCHLIST}' watchlist on a partial scan.")
+                      f"tickers in the universe — Yahoo's screener and the "
+                      f"S&P list both failed, leaving the mega-cap sample. Not "
+                      f"touching the '{SCREEN_WATCHLIST}' watchlist on a "
+                      f"partial scan.")
             if syncing:
                 import robinhood_source as rhs
                 adds, skipped = select_screen_additions(
@@ -13470,6 +13533,11 @@ def main():
                               f"Robinhood — create it in the app and the scan "
                               f"will fill it.")
                     landed = res["to_add"] if args.sync_dry_run else res["added"]
+                    if not args.sync_dry_run:
+                        by_ticker = {r.ticker: r for r in passed}
+                        screen_found = [{"t": t, "ch": "quality",
+                                         "pond": scr.pond(by_ticker[t])}
+                                        for t in landed if t in by_ticker]
                     if landed and screening_results.get("refused"):
                         print(f"[screen] Yahoo is refusing this runner; "
                               f"{', '.join(landed)} will be analyzed next run.")
@@ -13584,7 +13652,8 @@ def main():
     try:
         report_scorecard = update_scorecard(
             results, watchlists_analyzed or None, _prior_history,
-            run_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat())
+            run_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+            found=screen_found)
     except Exception as e:
         print(f"[scorecard] Skipped: {e}")
 

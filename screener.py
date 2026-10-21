@@ -1,7 +1,16 @@
 """
 screener.py
 -----------
-Screens the S&P 500 + S&P 400 universe against the 9-filter quality framework.
+Screens the US market against the 9-filter quality framework.
+
+The universe is every company listed on a US exchange (ADRs included) worth at
+least $1B, trading at least $5M a day and profitable over the last twelve
+months, pulled from Yahoo's own screener (fetch_us_universe). It used to be
+the S&P 500 + 400, but a company joins those only after a year of trading,
+four profitable quarters and a committee vote, so the scan found names late:
+on 2026-10-21, 140 of the 200 best one-year performers worth $2B+ weren't on
+that list. The S&P list is still fetched, to tag each name's membership and
+as the fallback universe when Yahoo's screener fails.
 
 Filter set (analyze_portfolio.apply_quality_filters is the definition):
     1. Revenue growth >= 10%/yr     (3-year CAGR, else 1-year YoY)
@@ -58,7 +67,138 @@ import yahoo_limits as yl
 
 
 # ============================================================
-# Universe fetch — S&P 500 + S&P 400
+# Universe — the US market, from Yahoo's screener
+# ============================================================
+# yf.screen filters on Yahoo's side and returns up to 250 names a request, so
+# the whole market costs about nine requests where reading each name would
+# cost thousands. The screener's numbers are trailing twelve months, so the
+# query only sets the floors; the prefilter and the scorer judge the names.
+#
+# Nasdaq's three tiers, the NYSE and NYSE American. Over-the-counter listings,
+# where many foreign ADRs trade thinly and Yahoo's data is patchy, are left out.
+_US_EXCHANGES = ("NMS", "NGM", "NCM", "NYQ", "ASE")
+_SCREENER_PAGE = 250
+# A runaway pager stops here: ~2,000 names fill nine pages.
+_SCREENER_MAX_PAGES = 40
+# Fewer names than this from Yahoo's screener means the query or the endpoint
+# broke, and the scan falls back to the S&P 500 + 400.
+MIN_US_UNIVERSE = 500
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+def min_market_cap() -> float:
+    """The smallest company the scan looks at (SCREEN_MIN_MARKET_CAP)."""
+    return _env_float("SCREEN_MIN_MARKET_CAP", 1e9)
+
+
+def min_dollar_volume() -> float:
+    """The least average daily dollar volume (3 months) a name needs
+    (SCREEN_MIN_DOLLAR_VOLUME). It drops listings too thin to trade, which
+    is mostly ADRs whose real market is at home."""
+    return _env_float("SCREEN_MIN_DOLLAR_VOLUME", 5e6)
+
+
+def _fmt_dollars(x: float) -> str:
+    for size, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if x >= size:
+            return f"${x / size:g}{unit}"
+    return f"${x:,.0f}"
+
+
+def universe_label(source: str) -> str:
+    """The Screening section's name for the universe a scan covered."""
+    if source == "sp":
+        return "S&P 500 + 400"
+    return f"US-listed, {_fmt_dollars(min_market_cap())}+"
+
+
+def universe_note(source: str) -> str:
+    """What the universe holds, for the Screening section's summary line."""
+    if source == "sp":
+        return ("S&P 500 + 400 stocks (Yahoo's screener was unavailable for "
+                "today's scan)")
+    return (f"profitable US-listed stocks worth {_fmt_dollars(min_market_cap())}+"
+            f" and trading {_fmt_dollars(min_dollar_volume())}+ a day, ADRs "
+            f"included,")
+
+
+def _universe_key() -> str:
+    """Recorded with the day's scan, so changing a floor restarts it."""
+    return (f"us:{min_market_cap():.0f}:{min_dollar_volume():.0f}:profitable")
+
+
+def fetch_us_universe(verbose: bool = True, screen=None) -> list[str]:
+    """Every US-listed company (ADRs included) worth at least min_market_cap(),
+    profitable over the last twelve months, and trading at least
+    min_dollar_volume() a day on average. About nine requests.
+
+    Profitable mirrors the S&P's own entry rule, which the old universe had
+    built in: no loss-making company passes the nine filters, and on
+    2026-10-21 the bar kept all 75 names the previous scan had shown. Errors,
+    a refusal among them, propagate. `screen` stands in for yf.screen in tests.
+    """
+    from yfinance import EquityQuery as Q
+
+    screen = screen or yf.screen
+    query = Q("and", [
+        Q("eq", ["region", "us"]),
+        Q("is-in", ["exchange", *_US_EXCHANGES]),
+        Q("gte", ["intradaymarketcap", min_market_cap()]),
+        Q("gt", ["netincomeis.lasttwelvemonths", 0]),
+    ])
+    quotes: list[dict] = []
+    total = None
+    for _ in range(_SCREENER_MAX_PAGES):
+        # Sorted by ticker so the pages don't shift while prices move.
+        page = screen(query, offset=len(quotes), size=_SCREENER_PAGE,
+                      sortField="ticker", sortAsc=True) or {}
+        got = page.get("quotes") or []
+        total = page.get("total") or 0
+        quotes += got
+        if not got or len(quotes) >= total:
+            break
+    floor = min_dollar_volume()
+    liquid = {q["symbol"] for q in quotes if q.get("symbol")
+              and (q.get("averageDailyVolume3Month") or 0)
+              * (q.get("regularMarketPrice") or 0) >= floor}
+    if verbose:
+        print(f"[universe] Yahoo screener: {len(quotes)} profitable US-listed "
+              f"names over {_fmt_dollars(min_market_cap())} (of {total} it "
+              f"counted); {len(liquid)} trade {_fmt_dollars(floor)}+ a day.")
+    return sorted(liquid)
+
+
+def fetch_universe(verbose: bool = True) -> tuple[list[str], str]:
+    """(tickers, source) for a new day's scan: Yahoo's US screener ("us"), or
+    the S&P 500 + 400 ("sp") when the screener fails or comes back short. A
+    refusal is raised instead: the S&P fallback would be refused too, and the
+    next run, on a fresh IP, can still scan the real universe."""
+    try:
+        tickers = fetch_us_universe(verbose=verbose)
+    except Exception as e:
+        if yl.is_rate_limited(e):
+            raise
+        if verbose:
+            print(f"[universe] Yahoo screener failed ({type(e).__name__}: {e}); "
+                  f"falling back to the S&P 500 + 400.")
+        tickers = []
+    else:
+        if len(tickers) < MIN_US_UNIVERSE and verbose:
+            print(f"[universe] Yahoo screener returned only {len(tickers)} "
+                  f"names; falling back to the S&P 500 + 400.")
+    if len(tickers) >= MIN_US_UNIVERSE:
+        return tickers, "us"
+    return fetch_sp500_sp400(verbose=verbose), "sp"
+
+
+# ============================================================
+# S&P 500 + S&P 400 — membership tags and the fallback universe
 # ============================================================
 
 _WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -292,6 +432,8 @@ class ScreenResult:
     name: str = ""
     sector: Optional[str] = None
     industry: Optional[str] = None
+    country: Optional[str] = None           # headquarters (assetProfile)
+    in_sp: Optional[bool] = None            # S&P 500/400 member; None: unknown
     price: Optional[float] = None
     market_cap: Optional[float] = None
     week52_high: Optional[float] = None
@@ -329,6 +471,24 @@ class ScreenResult:
     error: Optional[str] = None
 
 
+# Where a screened name was found, for the Screening table and for grading the
+# screen's additions by where they came from (scorecard.py):
+#   "sp"   — in the S&P 500 or 400, the old universe
+#   "us"   — another US company, which only the wider universe reaches
+#   "intl" — based outside the US; most trade here as ADRs
+POND_LABELS = {"sp": "S&P 500/400", "us": "Other US", "intl": "Outside the US"}
+
+
+def pond(r: ScreenResult) -> Optional[str]:
+    """r's POND_LABELS key. None for a US company on a day the S&P list
+    couldn't be fetched, when membership is unknown."""
+    if r.in_sp:
+        return "sp"
+    if r.country and r.country != "United States":
+        return "intl"
+    return None if r.in_sp is None else "us"
+
+
 def _prefilter_passes(r: ScreenResult) -> dict[str, bool]:
     """The nine filters as far as trailing numbers can judge them.
 
@@ -364,6 +524,7 @@ def prefilter_one(ticker: str) -> ScreenResult:
     r.name = info.get("shortName") or info.get("longName") or ticker
     r.sector = info.get("sector")
     r.industry = info.get("industry")
+    r.country = info.get("country")
     r.price = _safe(info, "regularMarketPrice") or _safe(info, "currentPrice")
     r.market_cap = _safe(info, "marketCap")
     r.week52_high = _safe(info, "fiftyTwoWeekHigh")
@@ -477,13 +638,15 @@ def split_passers_and_near_misses(
 # ============================================================
 # Once-a-day universe scan, spread over runs
 # ============================================================
-# The scan is the slowest thing the analyzer can do: ~900 prefilter requests
-# plus ~7 per shortlisted name, ~4,400 Yahoo requests in all. It is cached per
-# market day in .cache/ (gitignored; carried across CI runs by the Actions
-# cache) together with what is still to do. Each run spends at most the
-# request budget on it and leaves the rest to the next run, so a day's scan
-# completes over the first few runs: the 7:00 ET run and the first ones after
-# the open.
+# The scan is the slowest thing the analyzer can do. Measured on 2026-10-21:
+# 9 screener requests for 1,887 names, a prefilter request for each, and ~7
+# for each of the 1,128 within PREFILTER_MAX_FAILED misses, ~9,800 Yahoo
+# requests in all (the S&P 500 + 400 took ~4,400). It is cached per market
+# day in .cache/ (gitignored; carried across CI runs by the Actions cache)
+# together with what is still to do. Each run spends at most the request
+# budget on it and leaves the rest to the next run, so a day's scan completes
+# over the first ~7 runs: the 7:00 ET run and the first hour after the open.
+# The likeliest passers are scored first, so additions land early.
 
 _SCREEN_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "screen.json"
 _ET = ZoneInfo("America/New_York")
@@ -514,7 +677,8 @@ def _load_screen_state(verbose: bool = True) -> Optional[dict]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     if (not isinstance(cached, dict) or cached.get("date") != _market_today()
-            or cached.get("scoring") != _CACHE_SCORING):
+            or cached.get("scoring") != _CACHE_SCORING
+            or cached.get("universe") != _universe_key()):
         return None
     shown = cached.get("shown")
     if shown is None:      # written before scans were spread over runs
@@ -523,6 +687,8 @@ def _load_screen_state(verbose: bool = True) -> Optional[dict]:
         state = {
             "scanned_at": cached.get("scanned_at"),
             "universe_size": cached.get("universe_size", 0),
+            "source": cached.get("source") or "us",
+            "sp_members": list(cached.get("sp_members") or []),
             "unscreened": list(cached.get("unscreened") or []),
             "to_prefilter": list(cached.get("to_prefilter") or []),
             "to_score": [ScreenResult(**d) for d in cached.get("to_score") or []],
@@ -547,8 +713,11 @@ def _save_screen_state(state: dict, verbose: bool = True) -> None:
         _SCREEN_CACHE_PATH.write_text(json.dumps({
             "date": _market_today(),
             "scoring": _CACHE_SCORING,
+            "universe": _universe_key(),
             "scanned_at": state["scanned_at"],
             "universe_size": state["universe_size"],
+            "source": state["source"],
+            "sp_members": state["sp_members"],
             "unscreened": state["unscreened"],
             "to_prefilter": state["to_prefilter"],
             "to_score": [asdict(r) for r in state["to_score"]],
@@ -565,6 +734,8 @@ def _scan_output(state: dict, from_cache: bool, refused: bool = False) -> dict:
         "passed": passed,
         "near_miss": near,
         "universe_size": state["universe_size"],
+        "universe_label": universe_label(state["source"]),
+        "universe_note": universe_note(state["source"]),
         "unscreened": sorted(state["unscreened"]),
         "pending": len(state["to_prefilter"]) + len(state["to_score"]),
         "scanned_at": state["scanned_at"],
@@ -577,6 +748,37 @@ def _scan_output(state: dict, from_cache: bool, refused: bool = False) -> dict:
 # shortlist in place and returns the results it didn't get to.
 Scorer = Callable[..., list]
 
+# The S&P list is "real" above this many names; below it, fetch_sp500_sp400
+# fell back to its mega-cap sample and membership can't be told.
+_MIN_SP_LIST = 100
+
+
+def _new_state(limit: Optional[int], verbose: bool) -> Optional[dict]:
+    """A new day's scan: the universe and the S&P membership list. None when
+    Yahoo refused the universe fetch."""
+    try:
+        universe, source = fetch_universe(verbose=verbose)
+    except Exception as e:
+        if not yl.is_rate_limited(e):
+            raise
+        if verbose:
+            print("[screen] Yahoo refused the universe fetch; the next run "
+                  "starts today's scan.")
+        return None
+    sp = universe if source == "sp" else fetch_sp500_sp400(verbose=verbose)
+    if limit:
+        universe = universe[:limit]
+        if verbose:
+            print(f"[screen] Limiting to first {limit} tickers (test run; "
+                  f"not cached).")
+    return {
+        "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
+        "universe_size": len(universe), "source": source,
+        "sp_members": sorted(sp) if len(sp) > _MIN_SP_LIST else [],
+        "unscreened": [], "to_prefilter": list(universe),
+        "to_score": [], "shown": [],
+    }
+
 
 def screen_universe(
     score: Scorer,
@@ -584,9 +786,10 @@ def screen_universe(
     max_workers: Optional[int] = None,
     force: bool = False,
     verbose: bool = True,
-) -> dict:
-    """Scan the S&P 500 + 400 universe once per market day, over as many runs
-    as the request budget needs.
+) -> Optional[dict]:
+    """Scan the US universe (fetch_universe) once per market day, over as many
+    runs as the request budget needs. None when Yahoo refused the universe
+    fetch itself, so there is nothing to show yet.
 
     `score` gets the shortlist and fills in, on each result it finishes, the
     nine filters (passes / num_passed / num_failed), the sub-scores, the
@@ -594,39 +797,35 @@ def screen_universe(
     didn't get to (budget spent, or Yahoo refused), which wait for the next
     run. Its Yahoo work should go through the budget it is handed.
 
-    Returns {"passed", "near_miss", "universe_size", "unscreened", "pending",
-    "scanned_at", "from_cache", "refused"}. `pending` counts the names still to
-    prefilter or score; `unscreened` lists the names Yahoo had no data for;
-    `refused` says Yahoo turned this run away, so more Yahoo work now would
-    fail too. `limit` caps
-    the universe for a fast test, lifts the request budget, and neither reads
-    nor writes the day's cache, so a test run can't stand in for the real scan.
+    Returns {"passed", "near_miss", "universe_size", "universe_label",
+    "universe_note", "unscreened", "pending", "scanned_at", "from_cache",
+    "refused"}.
+    `pending` counts the names still to prefilter or score; `unscreened` lists
+    the names Yahoo had no data for; `refused` says Yahoo turned this run
+    away, so more Yahoo work now would fail too. `limit` caps the universe for
+    a fast test, lifts the request budget, and neither reads nor writes the
+    day's cache, so a test run can't stand in for the real scan.
     """
     state = None if (force or limit) else _load_screen_state(verbose=verbose)
     if state and not state["to_prefilter"] and not state["to_score"]:
         return _scan_output(state, from_cache=True)
 
     yl.install()
-    if state is None:
-        universe = fetch_sp500_sp400(verbose=verbose)
-        if limit:
-            universe = universe[:limit]
-            if verbose:
-                print(f"[screen] Limiting to first {limit} tickers (test run; "
-                      f"not cached).")
-        state = {
-            "scanned_at": _dt.datetime.now(_ET).isoformat(timespec="seconds"),
-            "universe_size": len(universe),
-            "unscreened": [], "to_prefilter": list(universe),
-            "to_score": [], "shown": [],
-        }
+    # The budget starts before the universe fetch, which spends from it too.
     budget = yl.YahooBudget(None if limit else _request_budget())
+    if state is None:
+        state = _new_state(limit, verbose)
+        if state is None:
+            return None
+    sp = set(state["sp_members"])
     workers = _workers(max_workers)
 
     if state["to_prefilter"]:
         start = time.time()
         fetched, left = prefilter_universe(state["to_prefilter"], budget=budget,
                                            max_workers=workers, verbose=verbose)
+        for r in fetched:
+            r.in_sp = (r.ticker in sp) if sp else None
         state["unscreened"] += [r.ticker for r in fetched if r.error]
         # Fewest misses first: the names likeliest to pass are scored first.
         state["to_score"] = sorted(

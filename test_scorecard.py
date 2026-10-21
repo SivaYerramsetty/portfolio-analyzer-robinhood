@@ -220,6 +220,81 @@ def test_prune_and_io() -> None:
         check(sc.load_log(path), sc.empty_log(), "a corrupt file loads empty")
 
 
+def _found_log() -> dict:
+    """Three screen additions on one day, graded against a flat benchmark:
+    an S&P member up 10%, another US company up 4% and a company based abroad
+    down 2% over the month. One more, added later, has no closes yet."""
+    days = weekdays("2026-08-03", 60)
+    log = sc.empty_log()
+    log["closes"][sc.BENCHMARK] = {d: 4000.0 for d in days}
+    for t, end in (("SPX", 110.0), ("USCO", 104.0), ("ADR", 98.0)):
+        log["closes"][t] = {d: (100.0 if d < "2026-09-02" else end) for d in days}
+    sc.record_found(log, "2026-08-03", [
+        {"t": "SPX", "ch": "quality", "pond": "sp"},
+        {"t": "USCO", "ch": "quality", "pond": "us"},
+        {"t": "ADR", "ch": "quality", "pond": "intl"}])
+    sc.record_found(log, "2026-10-20", [{"t": "LATE", "ch": "quality",
+                                         "pond": "us"}])
+    return log
+
+
+def test_found() -> None:
+    section("record_found and found_scorecard: the screen's additions, graded")
+    log = sc.empty_log()
+    n = sc.record_found(log, "2026-10-06", [
+        {"t": "AAA", "ch": "quality", "pond": "us"}, {"t": None},
+        {"t": "BBB", "ch": "quality", "pond": None}])
+    again = sc.record_found(log, "2026-10-06", [{"t": "AAA", "ch": "quality"}])
+    check((n, again, [e["t"] for e in log["found"]]), (2, 0, ["AAA", "BBB"]),
+          "each name is logged once a day; an entry without a ticker is skipped")
+    check(log["found"][0], {"t": "AAA", "d": "2026-10-06", "ch": "quality",
+                            "pond": "us"}, "with its day, channel and pond")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "verdict_log.json")
+        Path(path).write_text(json.dumps({"days": {}, "closes": {}}))
+        check(sc.load_log(path)["found"], [], "a log from before loads with none")
+
+    check(sc.closes_wanted(log, "2026-10-08"),
+          {"AAA": "2026-09-29", "BBB": "2026-09-29", sc.BENCHMARK: "2026-09-29"},
+          "an addition needs closes even with no call logged for it")
+    log["found"].insert(0, {"t": "OLD", "d": "2025-01-02", "ch": "quality",
+                            "pond": "sp"})
+    log["closes"] = {"OLD": {"2025-01-02": 1.0}, "AAA": {"2026-10-06": 2.0}}
+    sc.prune_log(log, date(2026, 10, 8))
+    check(([e["t"] for e in log["found"]], sorted(log["closes"])),
+          (["AAA", "BBB"], ["AAA"]),
+          "additions past retention go, with their closes; recent ones stay")
+
+    card = sc.found_scorecard(_found_log())
+    rows = {key: by_h for key, _, by_h in card["rows"]}
+    check([label for _, label, _ in card["rows"]],
+          ["All screen additions", "In the S&P 500/400", "Other US companies",
+           "Based outside the US"],
+          "all of them, then by pond; one channel needs no rows of its own")
+    check((card["n"], card["since"], card["matured"]["1M"]),
+          (4, "2026-08-03", 3), "it counts every addition, and what matured")
+    check(rows["all"]["1M"], {"n": 3, "ret": 4.0, "alpha": 4.0, "beat": 0.667},
+          "graded from the close on the day each was added")
+    check((rows["pond:sp"]["1M"]["alpha"], rows["pond:us"]["1M"]["n"],
+           rows["pond:intl"]["1M"]["alpha"]), (10.0, 1, -2.0),
+          "each pond on its own; the unpriced addition counts in none yet")
+
+    two = _found_log()
+    sc.record_found(two, "2026-10-21", [{"t": "NEWCH", "ch": "revisions",
+                                         "pond": "us"}])
+    check([key for key, _, _ in sc.found_scorecard(two)["rows"]][:2],
+          ["all", "ch:quality"], "a second channel brings rows by channel")
+
+    labels = {"composite": "Composite"}
+    built = sc.build_scorecard(_found_log(), ("composite",), "composite", labels)
+    check(built["found"]["rows"][0][2]["1M"]["n"], 3,
+          "build_scorecard carries it")
+    check("Screen additions at 1W, from the day each was added: All screen "
+          "additions alpha" in sc.digest(built, "composite", labels), True,
+          "and the AI brief reads it")
+
+
 # --------------------------------------------------------------- closes ----
 
 def test_last_session() -> None:
@@ -558,6 +633,18 @@ def test_update_scorecard() -> None:
         check(asked, [], "nothing is fetched once Yahoo has refused this run")
         check("fetching closes next run" in out2.getvalue(), True, "and it says so")
 
+        with contextlib.redirect_stdout(io.StringIO()) as out3:
+            ap.update_scorecard([held], None, ledger, run_date="2026-10-07",
+                                now_et=now + timedelta(days=1), path=path,
+                                fetch=fetch,
+                                found=[{"t": "TSM", "ch": "quality",
+                                        "pond": "intl"}])
+        check(json.loads(Path(path).read_text())["found"],
+              [{"t": "TSM", "d": "2026-10-07", "ch": "quality", "pond": "intl"}],
+              "the screen's additions are logged with the day")
+        check("Logged 1 screen addition(s) to grade: TSM (intl)"
+              in out3.getvalue(), True, "and the run log names them")
+
 
 def _labels_log(rows: dict[str, dict[str, str]], *,
                 seeded: tuple = ()) -> dict:
@@ -743,6 +830,21 @@ def test_render_section() -> None:
           "its rows stay out of the filter bar (no data-verdict)")
     check(html.count("<tr><td data-sort='Composite'>Composite <span"), 1,
           "the saved default is starred in the base table")
+    check("Where the screen's picks came from" in html, False,
+          "no screen additions, no table for them")
+
+    found = _found_log()
+    found["days"] = log["days"]
+    bench = {**log["closes"][sc.BENCHMARK], **found["closes"][sc.BENCHMARK]}
+    found["closes"] = {**log["closes"], **found["closes"], sc.BENCHMARK: bench}
+    html = ap._render_scorecard_section(
+        sc.build_scorecard(found, ap.BASE_SCORE_MODES, "composite", labels))
+    check(("Where the screen's picks came from" in html,
+           f"(4 additions since {ap._fmt_short_date('2026-08-03')})" in html,
+           "<strong>Based outside the US</strong>" in html,
+           "3 additions. Mean return +4.0% over 1 month" in html),
+          (True, True, True, True), "with additions: graded by where they were found")
+    check(_tag_errors(html), [], "and its tags balance")
 
     with _mode_env():
         holding = _scored("AAA", 80, [1.0] * 9)
@@ -763,7 +865,7 @@ def test_render_section() -> None:
 
 def main() -> int:
     for t in (test_compact_factors, test_record_day, test_seed_from_ledger,
-              test_prune_and_io, test_last_session, test_closes_wanted,
+              test_prune_and_io, test_found, test_last_session, test_closes_wanted,
               test_merge_closes, test_refresh_closes, test_evaluate_calls,
               test_statistics, test_build_scorecard, test_suggestions,
               test_digest, test_scorecard_calls, test_update_scorecard,
