@@ -24,6 +24,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -541,6 +542,7 @@ def test_update_scorecard() -> None:
               "the ledger's first sighting and today's calls are on disk")
         check(sorted(asked), ["HHH", "OLD", sc.BENCHMARK], "closes fetched")
         check(card["meta"]["matured"]["1W"], 1, "the recovered call is graded")
+        check(held._turned_buy, {}, "and today's names are checked for a turn")
         text = out.getvalue()
         check(("Recovered 1 first-sighting call" in text,
                "Logged 1 call(s) for 2026-10-06" in text,
@@ -555,6 +557,158 @@ def test_update_scorecard() -> None:
                                 fetch=fetch)
         check(asked, [], "nothing is fetched once Yahoo has refused this run")
         check("fetching closes next run" in out2.getvalue(), True, "and it says so")
+
+
+def _labels_log(rows: dict[str, dict[str, str]], *,
+                seeded: tuple = ()) -> dict:
+    """A log from {day: {ticker: label}}, each label under composite only,
+    or {day: {ticker: {mode: label}}}. Tickers in `seeded` are flagged as
+    recovered first sightings."""
+    log = sc.empty_log()
+    for d, calls in rows.items():
+        for t, label in calls.items():
+            by_mode = label if isinstance(label, dict) else {"composite": label}
+            entry = {"p": 100.0, "h": 0, "f": {},
+                     "v": {m: [lab, 70.0] for m, lab in by_mode.items()}}
+            if t in seeded:
+                entry["s"] = 1
+            log["days"].setdefault(d, {})[t] = entry
+    return log
+
+
+def test_turned_buy_grade() -> None:
+    section("turned_buy_grade: buy-grade now, something else at an earlier close")
+    today = "2026-10-21"                       # a Wednesday; the window opens Oct 15
+    week = ("2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16",
+            "2026-10-19", "2026-10-20")
+    rows = {d: {} for d in ("2026-10-08", *week)}
+    rows["2026-10-08"]["FAR"] = "HOLD"
+    for d in week:
+        rows[d]["ALWAYS"] = "ADD"
+        rows[d]["EDGE_IN"] = "HOLD" if d < "2026-10-15" else "ADD"
+        rows[d]["EDGE_OUT"] = "HOLD" if d < "2026-10-14" else "ADD"
+    rows["2026-10-20"]["TODAY"] = "HOLD"
+    rows["2026-10-16"]["WEEK"] = "WATCH"
+    rows["2026-10-19"]["WEEK"] = rows["2026-10-20"]["WEEK"] = "BUY"
+    rows["2026-10-19"]["FRESH"] = rows["2026-10-20"]["FRESH"] = "BUY"
+    rows["2026-10-16"]["GAPPY"] = "HOLD"
+    rows["2026-10-16"]["SEED"] = "WATCH"
+    rows["2026-10-15"]["BOUGHT"] = "WATCH"
+    for d in ("2026-10-16", "2026-10-19", "2026-10-20"):
+        rows[d]["BOUGHT"] = "BUY"
+    rows["2026-10-20"]["MODES"] = {"composite": "HOLD", "quality": "ADD"}
+    rows["2026-10-19"]["PARTIAL"] = {"composite": "ADD", "quality": "HOLD"}
+    rows["2026-10-20"]["PARTIAL"] = {"composite": "ADD"}
+    rows[today] = {"TODAY": "ADD"}             # this run's own call, already logged
+    log = _labels_log(rows, seeded=("SEED",))
+
+    now = {t: {"composite": "ADD"} for t in
+           ("TODAY", "ALWAYS", "EDGE_IN", "EDGE_OUT", "GAPPY", "FAR")}
+    now.update({"WEEK": {"composite": "BUY"}, "FRESH": {"composite": "BUY"},
+                "SEED": {"composite": "BUY"}, "BOUGHT": {"composite": "ADD"},
+                "HELD": {"composite": "HOLD"},
+                "MODES": {"composite": "ADD", "quality": "ADD", "blend": "TRIM"},
+                "PARTIAL": {"composite": "ADD", "quality": "ADD"}})
+    got = sc.turned_buy_grade(log, today, now)
+
+    check(got.get("TODAY"), {"composite": {"from": "HOLD", "since": today,
+                                           "was_on": "2026-10-20", "age_d": 0}},
+          "HOLD at yesterday's close, ADD now: turned today")
+    check(got.get("WEEK"), {"composite": {"from": "WATCH", "since": "2026-10-19",
+                                          "was_on": "2026-10-16", "age_d": 2}},
+          "turned Monday and still BUY: dated to Monday, over the weekend")
+    check(got.get("EDGE_IN", {}).get("composite", {}).get("age_d"), 6,
+          "a run that began on the window's first day still counts")
+    check(("ALWAYS" in got, "EDGE_OUT" in got), (False, False),
+          "a run older than the window doesn't")
+    check(("FRESH" in got, "SEED" in got), (False, False),
+          "nor does a name buy-grade on every call we have; a recovered first "
+          "sighting isn't a call to change from")
+    check(got.get("GAPPY", {}).get("composite", {}).get("was_on"), "2026-10-16",
+          "days without a call are skipped back to the last one")
+    check("FAR" in got, False,
+          "but a last other call more than a week before the run says nothing")
+    check(got.get("BOUGHT", {}).get("composite", {}).get("from"), "WATCH",
+          "BUY to ADD after buying is one buy-grade run, from the WATCH before it")
+    check("HELD" in got, False, "a name that isn't buy-grade now gets nothing")
+    check(got.get("MODES"), {"composite": {"from": "HOLD", "since": today,
+                                           "was_on": "2026-10-20", "age_d": 0}},
+          "each mode against its own history: only composite changed")
+    check(got.get("PARTIAL", {}).get("quality", {}).get("was_on"), "2026-10-19",
+          "a day logged without a mode is skipped for that mode")
+    check("composite" in got.get("PARTIAL", {}), False,
+          "while the mode it has is judged as usual")
+    check(sc.turned_buy_grade(sc.empty_log(), today, now), {},
+          "an empty log flags nothing")
+
+
+def test_attach_turned_buy() -> None:
+    section("attach_turned_buy: the verdict chip, the filter and the header count")
+    from test_base_score_mode import _render_report, _row_attrs
+    all_pass = [1.0] * 9
+    with _mode_env():
+        held = _scored("AAA", 85, all_pass, upside_pct=20.0)
+        other = _scored("BBB", 85, all_pass, upside_pct=20.0)
+        # Twelve equal positions: under 10% each, so no size penalty.
+        book = [held, other, *(_scored(f"F{i}", 65, all_pass) for i in range(10))]
+        watched = _scored("WWW", 85, all_pass, shares=0, value=0.0,
+                          upside_pct=20.0)
+        # As in main(): the size overlay lands before the scorecard runs.
+        ap.finalize_holding_verdicts(book)
+    modes = ap.BASE_SCORE_MODES
+    check(({held.verdicts[m].label for m in modes},
+           {watched.verdicts[m].label for m in modes}), ({"ADD"}, {"BUY"}),
+          "the fixture is ADD / BUY under every mode")
+    rows = {"2026-10-16": {"WWW": {m: "WATCH" for m in modes},
+                           "AAA": {m: "ADD" for m in modes},
+                           "BBB": {m: "ADD" for m in modes}},
+            "2026-10-19": {"WWW": {m: "BUY" for m in modes}},
+            "2026-10-20": {"WWW": {m: "BUY" for m in modes},
+                           "AAA": {m: "ADD" if m.startswith("quality") else "HOLD"
+                                   for m in modes},
+                           "BBB": {m: "ADD" for m in modes}}}
+    out = io.StringIO()
+    with _mode_env(), contextlib.redirect_stdout(out):
+        turned = ap.attach_turned_buy(_labels_log(rows), book,
+                                      {"Tech": [watched]}, "2026-10-21")
+    check((sorted(turned), sorted(held._turned_buy), other._turned_buy),
+          (["AAA", "WWW"],
+           sorted(m for m in modes if not m.startswith("quality")), {}),
+          "AAA turned under every base but Quality; BBB never changed")
+    check("Turned BUY/ADD this past week (Composite): AAA (was HOLD, since "
+          "2026-10-21), WWW (was WATCH, since 2026-10-19)" in out.getvalue(), True,
+          "the run log names them under the run's mode")
+
+    with _mode_env():
+        page = _render_report(book, {"Tech": [watched]})
+    check(("<span class='vturn-chip fresh'>↑ was HOLD</span>" in page,
+           "<span class='vturn-chip'>↑ was WATCH</span>" in page),
+          (True, True), "a chip on each: solid the day it turned, outlined after")
+    check(("Turned ADD today; it was HOLD at the Tue, Oct 20 close." in page,
+           "Turned BUY on Mon, Oct 19; it was WATCH at the Fri, Oct 16 close."
+           in page), (True, True), "the card and the tap tip say what and when")
+    a, b, w = (_row_attrs(page, t) for t in ("AAA", "BBB", "WWW"))
+    check((a["turned-buy"], a["turned-buy-composite"], a["turned-buy-quality"],
+           w["turned-buy-blend-cal"], b["turned-buy"]),
+          ("today", "today", "", "week", ""),
+          "the rows carry it per mode for the filter")
+    adds = re.search(r"</strong>Add candidates(.*?)</a>", page).group(1)
+    check(("↑ 1 new today" in adds, "bmode-composite" in adds,
+           "bmode-quality" in adds), (True, True, False),
+          "Add candidates counts the new ones, in every view but Quality's")
+    buys = re.search(r"</strong>Watchlist BUY signals(.*?)</a>", page).group(1)
+    check(("↑ 1 new this week" in buys, "applyHeaderFilter('turned-buy')" in buys),
+          (True, True), "Watchlist BUY signals too, and the count is a filter")
+    script = re.search(r"/\* ---------- Filter bar:.*?\n\}\)\(\);", page, re.S).group(0)
+    check(("attr:'turned-buy'" in script, "key:'turned-buy'" in script,
+           "'turned-buy'];" in page), (True, True, True),
+          "a Turned BUY / ADD card, its quick screen, and the base switch copies it")
+    check(_tag_errors(page), [], "the page's tags balance")
+
+    with _mode_env():
+        quiet = _render_report(book[1:], None)
+    check(("vturn" in quiet.split("</style>", 1)[1], "stat-turned'" in quiet),
+          (False, False), "no change, no chip and no count")
 
 
 def test_render_section() -> None:
@@ -609,6 +763,7 @@ def main() -> int:
               test_merge_closes, test_refresh_closes, test_evaluate_calls,
               test_statistics, test_build_scorecard, test_suggestions,
               test_digest, test_scorecard_calls, test_update_scorecard,
+              test_turned_buy_grade, test_attach_turned_buy,
               test_render_section):
         before = len(_results)
         t()

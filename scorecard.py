@@ -306,6 +306,64 @@ def prune_log(log: dict, today: date) -> None:
         del fetched[t]
 
 
+# ---------------------------------------------------------- turned buy ----
+
+# A name whose buy-grade run began this many calendar days ago or less (today
+# counts as day 1) is flagged as having turned buy-grade: a week of sessions.
+TURNED_BUY_WINDOW_D = 7
+# The call before the run must be this recent to say what it changed from.
+# Further back, the name went unanalyzed too long to call it a change.
+TURNED_BUY_GAP_D = 7
+
+
+def turned_buy_grade(log: dict, today: str,
+                     labels: dict[str, dict[str, Optional[str]]],
+                     window_d: int = TURNED_BUY_WINDOW_D,
+                     gap_d: int = TURNED_BUY_GAP_D) -> dict[str, dict[str, dict]]:
+    """Which names are buy-grade now after something else, and since when.
+
+    `labels` is {ticker: {mode: this run's label}}. Each earlier day's call
+    is its last of the day, so a verdict that dips below the bar and back
+    within one session isn't a change. Walking back from today, a buy-grade
+    day extends the run, a day without a call for the name is skipped, and
+    the first other label ends the walk. Seeded calls are left out: they are
+    one-off first sightings, often from long before the log began.
+
+    Returns {ticker: {mode: {"from": label, "since": first buy-grade day,
+    "was_on": the day of that last other call, "age_d": calendar days since
+    `since`, 0 for today}}}, holding only the modes where the run began within
+    `window_d` days. A name that has been buy-grade on every call we have
+    isn't a change, so it gets nothing."""
+    cutoff = _shift(today, -(window_d - 1))
+    earliest = _shift(cutoff, -gap_d)
+    days = log.get("days") or {}
+    past = sorted((d for d in days if earliest <= d < today), reverse=True)
+    out: dict[str, dict[str, dict]] = {}
+    for ticker, by_mode in labels.items():
+        for mode, label in (by_mode or {}).items():
+            if label not in BUY_GRADE:
+                continue
+            since = today
+            for d in past:
+                if since < cutoff or d < _shift(since, -gap_d):
+                    break
+                call = days[d].get(ticker)
+                if not call or call.get("s"):
+                    continue
+                pair = (call.get("v") or {}).get(mode)
+                if not pair or not pair[0]:
+                    continue
+                if pair[0] in BUY_GRADE:
+                    since = d
+                    continue
+                out.setdefault(ticker, {})[mode] = {
+                    "from": pair[0], "since": since, "was_on": d,
+                    "age_d": (date.fromisoformat(today)
+                              - date.fromisoformat(since)).days}
+                break
+    return out
+
+
 # --------------------------------------------------------------- closes ----
 
 def last_session(now_et: datetime) -> str:

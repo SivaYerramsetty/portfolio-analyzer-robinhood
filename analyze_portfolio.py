@@ -5890,13 +5890,44 @@ def _verdict_td(r) -> str:
     """The verdict <td>: one cell per base-score mode, and a sort value per
     mode that the base switch copies into data-sort."""
     days = getattr(r, "days_to_earnings", None)
-    cell = _mode_variants(lambda m: _verdict_cell(verdict_in(r, m), days))
+    cell = _mode_variants(lambda m: _verdict_cell(verdict_in(r, m), days,
+                                                  _turned_in(r, m)))
     per_mode = "".join(f" data-sort-{m}='{_verdict_sort_value(verdict_in(r, m))}'"
                        for m in BASE_SCORE_MODES) if r.verdicts else ""
     return f"<td data-sort='{_verdict_sort_value(r.verdict)}'{per_mode}>{cell}</td>"
 
 
-def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
+def _turned_in(r, mode: str) -> Optional[dict]:
+    """r's turned-BUY/ADD record under `mode` (attach_turned_buy), or None
+    when its verdict there isn't buy-grade."""
+    turned = (getattr(r, "_turned_buy", None) or {}).get(mode)
+    v = verdict_in(r, mode)
+    return turned if turned and v and v.label in BUY_GRADE_VERDICTS else None
+
+
+def _turned_buy_value(turned: Optional[dict]) -> str:
+    """The Turned BUY / ADD filter value: 'today', 'week' (earlier in the past
+    week) or ''."""
+    if not turned:
+        return ""
+    return "today" if turned.get("age_d") == 0 else "week"
+
+
+def _turned_buy_text(label: str, turned: dict) -> str:
+    """'Turned ADD today; it was HOLD at the Tue, Oct 20 close.'"""
+    def day(iso: str) -> str:
+        try:
+            d = datetime.strptime(iso, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return iso or "?"
+        return d.strftime("%a, %b ") + str(d.day)
+    when = "today" if turned.get("age_d") == 0 else f"on {day(turned.get('since'))}"
+    return (f"Turned {label} {when}; it was {turned.get('from')} at the "
+            f"{day(turned.get('was_on'))} close.")
+
+
+def _verdict_cell(verdict, days_to_earnings: Optional[int] = None,
+                  turned: Optional[dict] = None) -> str:
     """Render the verdict pill + 0-100 score with a styled hover-card breakdown.
 
     Layout: a colored verdict pill (label) and the numeric score sit side by
@@ -5906,7 +5937,9 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
     strength bar. The card also surfaces data-coverage confidence, the verdict
     under the other base-score modes, and, when known, the next-earnings date.
     At-a-glance markers sit beside the score: an amber dot for thin-data (Low)
-    confidence and a calendar glyph when earnings are within a week.
+    confidence and a calendar glyph when earnings are within a week. A verdict
+    that `turned` BUY/ADD in the past week (attach_turned_buy) gets a green
+    "↑ was HOLD" chip, solid on the day it turned, and a line in the card.
 
     v2 verdict reasons are structured as
         headline | <base line> | +X · factor | -Y · factor | = verdict score N
@@ -5925,11 +5958,20 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
         return (str(s).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
+    turn_chip = turn_html = turn_tip = ""
+    if turned and label in BUY_GRADE_VERDICTS:
+        fresh = _turned_buy_value(turned) == "today"
+        turn_tip = _turned_buy_text(label, turned)
+        turn_chip = (f"<span class='vturn-chip{' fresh' if fresh else ''}'>"
+                     f"↑ was {_esc(turned.get('from'))}</span>")
+        turn_html = f"<div class='vturn'>↑ {_esc(turn_tip)}</div>"
+
     # --- Fallback: no numeric score or unstructured reason (ETF/thematic) ---
     if score is None or " | " not in reason:
-        title = _esc(reason.replace(" | ", "\n"))
+        title = _esc(reason.replace(" | ", "\n")
+                     + (f"\n{turn_tip}" if turn_tip else ""))
         return (f"<span class='verdict' style='background:{color};cursor:help;' "
-                f"title='{title}'>{label}</span>")
+                f"title='{title}'>{label}</span>{turn_chip}")
 
     sc = _score_strength_color(score)
     parts = [p.strip() for p in reason.split(" | ")]
@@ -6014,7 +6056,7 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
         f"<div class='vcard-head'>"
         f"<span class='vcard-headline'>{_esc(headline)}</span>"
         f"<span class='vcard-score' style='color:{sc};'>{score:.0f}</span></div>"
-        f"{bar}{conf_html}{base_html}"
+        f"{bar}{turn_html}{conf_html}{base_html}"
         f"<div class='vrows'>{''.join(factor_rows)}</div>"
         + (f"<div class='vnotes'>{''.join(note_rows)}</div>" if note_rows else "")
         + f"{alt_html}{earn_html}"
@@ -6023,13 +6065,14 @@ def _verdict_cell(verdict, days_to_earnings: Optional[int] = None) -> str:
     # No native title= (it duplicated, and lagged behind, the styled card on
     # desktop). The full breakdown still reaches touch devices via data-tip,
     # which the mobile tap-to-reveal sheet reads.
-    mobile_tip = _esc(reason.replace(" | ", "\n")
+    mobile_tip = _esc((f"↑ {turn_tip}\n" if turn_tip else "")
+                      + reason.replace(" | ", "\n")
                       + ("\n" + " · ".join(alt_bits) if alt_bits else ""))
     return (
         f"<span class='vcell' data-tip='{mobile_tip}'>"
         f"<span class='verdict' style='background:{color};'>{label}</span>"
         f"<span class='vscore' style='color:{sc};'>{score:.0f}</span>"
-        f"{cell_marker}{card}</span>"
+        f"{cell_marker}{turn_chip}{card}</span>"
     )
 
 
@@ -6103,10 +6146,10 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
     """Open a <tr> with data attributes used by the filter bar.
 
     Rows with per-mode verdicts also carry each mode's verdict, score, rank
-    movement, tax flag, data confidence and base agreement
-    (data-<attr>-<mode>), which the base switch copies into the plain
-    attributes. `orders` ({mode: index}) is the row's place in its table's
-    default order under each mode. `list_key` is the row's List-facet value:
+    movement, tax flag, data confidence, base agreement and whether it turned
+    BUY/ADD this past week (data-<attr>-<mode>), which the base switch copies
+    into the plain attributes. `orders` ({mode: index}) is the row's place in
+    its table's default order under each mode. `list_key` is the row's List-facet value:
     HOLDINGS_LIST_KEY, or its watchlist's from _watchlist_filter_keys."""
     verdict = (r.verdict.label if r.verdict else "") or ""
     # Verdict numeric score (0-100), separate from the label
@@ -6173,7 +6216,8 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
                          f"data-rank-move-{m}='{m_move}' data-rank-delta-{m}='{m_delta}' "
                          f"data-has-tax-{m}='{m_tax}' "
                          f"data-confidence-{m}='{_confidence_attr(v)}' "
-                         f"data-bases-{m}='{_base_agreement(r, m)}' ")
+                         f"data-bases-{m}='{_base_agreement(r, m)}' "
+                         f"data-turned-buy-{m}='{_turned_buy_value(_turned_in(r, m))}' ")
     for m, index in (orders or {}).items():
         per_mode += f"data-order-{m}='{index}' "
     # Days until next earnings (forward-only) — drives the 'earnings-soon' filter
@@ -6214,6 +6258,7 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
         f"data-rank-move='{rank_move}' data-rank-delta='{rank_delta}' "
         f"data-confidence='{_confidence_attr(r.verdict)}' "
         f"data-bases='{_base_agreement(r, base_score_mode())}' "
+        f"data-turned-buy='{_turned_buy_value(_turned_in(r, base_score_mode()))}' "
         f"data-drop-band='{drop_band}' data-off-high='{off_high}' "
         f"data-vol='{vol}' data-risk-share='{risk_share}' "
         f"data-list='{list_key}' "
@@ -9517,6 +9562,34 @@ def scorecard_calls(
     return calls
 
 
+def attach_turned_buy(
+    log: dict,
+    results: list[PositionAnalysis],
+    watchlists: Optional[dict[str, list[PositionAnalysis]]],
+    run_date: str,
+) -> dict[str, dict[str, dict]]:
+    """Mark every name whose verdict turned BUY/ADD within the past week, per
+    base-score mode, from the verdict log's earlier days
+    (scorecard.turned_buy_grade): `r._turned_buy` = {mode: {"from", "since",
+    "was_on", "age_d"}}, empty for the rest. Holdings win, as in the log. Logs the
+    run's mode and returns the full map."""
+    rows = [*(r for items in (watchlists or {}).values() for r in items),
+            *results]
+    labels = {r.ticker: {m: v.label for m, v in r.verdicts.items()}
+              for r in rows if not r.error and r.verdicts}
+    turned = scorecard.turned_buy_grade(log, run_date, labels)
+    for r in rows:
+        r._turned_buy = turned.get(r.ticker) or {}
+    mode = base_score_mode()
+    names = sorted((t, by_mode[mode]) for t, by_mode in turned.items()
+                   if mode in by_mode)
+    if names:
+        print(f"[scorecard] Turned BUY/ADD this past week ({BASE_SCORE_LABELS[mode]}): "
+              + ", ".join(f"{t} (was {f['from']}, since {f['since']})"
+                          for t, f in names))
+    return turned
+
+
 def _fetch_daily_closes(ticker: str, start: str) -> tuple[Optional[dict], bool]:
     """Daily closes from `start` (ISO date) to now, as {date: close}, and
     whether Yahoo refused. Split-adjusted, not dividend-adjusted, matching the
@@ -9562,6 +9635,7 @@ def update_scorecard(
         print(f"[scorecard] Recovered {seeded} first-sighting call(s) from the "
               f"recommendation ledger.")
     logged = scorecard.record_day(log, run_date, scorecard_calls(results, watchlists))
+    attach_turned_buy(log, results, watchlists, run_date)
 
     if yahoo_limits.refusals():
         print("[scorecard] Yahoo refused this runner earlier; fetching closes "
@@ -10106,8 +10180,28 @@ def generate_html_report(
             return str(n)
         return _mode_variants(render)
 
+    # Under a count of buy-grade names: how many turned buy-grade this past
+    # week. Clicking it filters to every name that did (attach_turned_buy).
+    def turned_caption(rows, labels) -> str:
+        def render(mode):
+            ages = [t["age_d"] for r in rows
+                    if (v := verdict_in(r, mode)) and v.label in labels
+                    and (t := _turned_in(r, mode))]
+            if not ages:
+                return ""
+            n, today = len(ages), ages.count(0)
+            text = (f"{n} new today" if today == n
+                    else f"{n} new this week" if not today
+                    else f"{n} new · {today} today")
+            return ("<span class='stat-turned' title='Turned BUY / ADD in the "
+                    "past week. Click to show only those.' "
+                    "onclick=\"event.preventDefault();event.stopPropagation();"
+                    f"applyHeaderFilter('turned-buy');\">↑ {text}</span>")
+        return _mode_variants(render)
+
     action_count_html = count_labels(results, ("SELL", "TRIM"))
     add_count_html = count_labels(results, ("ADD",))
+    add_turned_html = turned_caption(results, ("ADD",))
 
     _now_est = datetime.now(ZoneInfo("America/New_York"))
     now = _now_est.strftime("%B %d, %Y · %I:%M %p %Z")
@@ -10151,7 +10245,7 @@ def generate_html_report(
             f'onclick="applyHeaderFilter(\'verdict-buy\');return false;">'
             f'<strong>{count_labels(watchlist_unique, ("BUY",))} / '
             f'{len(watchlist_unique)}</strong>'
-            f'Watchlist BUY signals</a>'
+            f'Watchlist BUY signals{turned_caption(watchlist_unique, ("BUY",))}</a>'
         )
 
     has_holdings = bool(results)
@@ -10371,7 +10465,7 @@ def generate_html_report(
     <a class="stat clickable" href="#compounders" onclick="scrollToSection('compounders');return false;"><strong>{len(compounders)}</strong>Compounder positions</a>
     <a class="stat clickable" href="#thematic" onclick="scrollToSection('thematic');return false;"><strong>{len(thematics)}</strong>Thematic / ETF positions</a>
     <a class="stat clickable" href="#" onclick="applyHeaderFilter('action');return false;"><strong>{action_count_html}</strong>Sell / Trim flags</a>
-    <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{add_count_html}</strong>Add candidates</a>"""
+    <a class="stat clickable" href="#" onclick="applyHeaderFilter('verdict-add');return false;"><strong>{add_count_html}</strong>Add candidates{add_turned_html}</a>"""
 
     # The filter bar's List facet: each row's value, and the bar's
     # [[value, label], …] for every list in report order.
@@ -10639,6 +10733,13 @@ def generate_html_report(
                       color: var(--fg-muted); transition: color 0.15s; }}
   a.stat.clickable:hover {{ color: var(--fg-strong); }}
   a.stat.clickable:hover strong {{ text-decoration: underline; }}
+  /* "↑ 2 new today" under a buy count: its own filter, so it underlines
+     alone and the figure above doesn't. */
+  .stat-turned {{ display: block; margin-top: 2px; font-size: 10px;
+                  font-weight: 600; letter-spacing: 0; text-transform: none;
+                  color: var(--fg-chip-green); }}
+  .stat-turned:hover {{ text-decoration: underline; }}
+  a.stat.clickable:has(.stat-turned:hover) strong {{ text-decoration: none; }}
   /* Today's news highlights: the tile shows the lead story; hovering opens a
      panel hung from it with every story from today (see the newsWrap
      script). A transparent strip bridges the gap so the pointer can cross
@@ -10818,6 +10919,17 @@ def generate_html_report(
   .vmark {{ font-size: 10px; cursor: help; line-height: 1; }}
   .vmark-conf {{ color: #e67e22; }}
   .vmark-earn {{ font-size: 11px; filter: grayscale(0.1); }}
+  /* Turned BUY/ADD in the past week: solid on the day it turned, outlined
+     on the days after, so today's changes stand out. */
+  .vturn-chip {{ font-size: 9px; font-weight: 700; letter-spacing: 0.2px;
+                 padding: 1px 5px; border-radius: 6px; white-space: nowrap;
+                 color: var(--fg-chip-green);
+                 border: 1px solid var(--fg-chip-green); }}
+  .vturn-chip.fresh {{ background: var(--bg-chip-green); border-color: transparent; }}
+  .verdict + .vturn-chip {{ margin-left: 6px; }}
+  .vturn {{ font-size: 11px; font-weight: 600; padding: 4px 8px;
+            border-radius: 6px; margin-bottom: 8px; line-height: 1.35;
+            background: var(--bg-chip-green); color: var(--fg-chip-green); }}
   .ticker {{ font-weight: 700; font-family: "SF Mono", SFMono-Regular,
              Consolas, "Liberation Mono", monospace;
              color: var(--fg-strong); letter-spacing: -0.2px; }}
@@ -11542,7 +11654,7 @@ Verdicts are framework outputs, not investment advice.
     return base + (cal === 'cal' ? CAL_SUFFIX : '');
   }
   var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax',
-                  'confidence', 'bases'];
+                  'confidence', 'bases', 'turned-buy'];
   var root = document.documentElement;
   var sw = document.getElementById('baseScoreSwitch');
 
@@ -11788,6 +11900,10 @@ Verdicts are framework outputs, not investment advice.
     { id: 'verdict', title: 'Verdict & signals', cards: [
       { type:'facet', attr:'verdict', label:'Verdict',
         order:['ADD','BUY','HOLD','WAIT','WATCH','TRIM','SELL','PASS'] },
+      { type:'facet', attr:'turned-buy', label:'Turned BUY / ADD', short:'Turned buy', skip:[''], flag:true,
+        order:['today','week'], labels:{today:'↑ Today',week:'↑ Earlier this week'},
+        comboLabels:{today:'Turned buy today',week:'Turned buy this week'},
+        tip:'Verdicts that are BUY or ADD now but were something else (HOLD, WATCH, TRIM…) at an earlier close. Today: it was something else at the last close. Earlier this week: it turned in the past seven days and has stayed buy-grade since.' },
       { type:'facet', attr:'bases', label:'Across bases', short:'Bases', skip:[''],
         order:['agree','split'], labels:{agree:'Same on every base',split:'Differs by base'},
         tip:'Whether Composite, Quality and Blend give the same verdict under the current Scoring. Differs means the Base switch changes it.' },
@@ -11872,6 +11988,7 @@ Verdicts are framework outputs, not investment advice.
     { key:'tax-loss',      label:'Loss harvest',          ranges:{'gain-pct':[null,-5]} },
     { key:'drop-unusual',  label:'📉 Unusual drop',  facets:{'drop-band':['unusual','rare']} },
     { key:'risk-heavy',    label:'⚖️ Risk share ≥10%', ranges:{'risk-share':[10,null]} },
+    { key:'turned-buy',    label:'↑ Turned BUY / ADD', facets:{'turned-buy':['today','week']} },
   ];
   var USAGE_KEY  = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
   var SAVED_KEY  = 'fltSavedViews';   // [{ sig, name, t }] — combos you named; pinned first
