@@ -18,8 +18,8 @@ next run — which, in CI, starts on a fresh IP.
 
 Two pieces:
 
-  * Counters. install() wraps yfinance's request method to count every
-    request and every 429. The refusal count is what makes a refusal visible
+  * Counters. install() wraps yfinance's request methods (GET, and POST,
+    which the screener sends) to count every request and every 429. The refusal count is what makes a refusal visible
     at all: yfinance swallows the error in several places — a refused
     financial-statement fetch comes back as an empty table, indistinguishable
     from a company that has none.
@@ -61,12 +61,18 @@ def install() -> bool:
 
 
 def _count_requests(cls, error: type) -> None:
-    """Wrap cls.get so each call is counted, and each `error` it raises is
-    counted as a refusal and re-raised."""
-    original = cls.get
+    """Wrap cls.get and cls.post (yf.screen posts its query) so each call is
+    counted, and each `error` it raises is counted as a refusal and
+    re-raised."""
+    for name in ("get", "post"):
+        original = getattr(cls, name, None)
+        if original is not None:
+            setattr(cls, name, _counted(original, error))
 
+
+def _counted(original: Callable, error: type) -> Callable:
     @functools.wraps(original)
-    def get(self, *args, **kwargs):
+    def request(self, *args, **kwargs):
         note_request()
         try:
             return original(self, *args, **kwargs)
@@ -74,7 +80,7 @@ def _count_requests(cls, error: type) -> None:
             note_refusal()
             raise
 
-    cls.get = get
+    return request
 
 
 def note_request() -> None:

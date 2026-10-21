@@ -15,6 +15,10 @@ verdict_log.json:
               analyzed, so a day's call is that day's last (near-close) call.
   * closes  — daily closes for every ticker with a call still maturing, plus
               the S&P 500. Fetched once per session, after the close.
+  * found   — every name the universe scan added to the Screening watchlist:
+              the day, the channels that nominated it and where it was found
+              (in the S&P 500/400, another US company, or based abroad). Graded
+              from the day it was added, so each source has a track record.
 
 From those it measures each call's return, and its excess over the S&P 500
 (alpha), 1 week, 1 month and 3 months later. It rolls them up into the
@@ -105,6 +109,15 @@ TIERS = (("buy", "Buy-grade", BUY_GRADE),
 # Fresh-money vocabulary first, then the holdings one, strongest first.
 LABEL_ORDER = ("BUY", "WATCH", "WAIT", "PASS", "ADD", "HOLD", "TRIM", "SELL")
 
+# How the screen's additions are grouped (record_found). Channels are the
+# screen's ways of finding a name (screener.CHANNELS); ponds say where it was
+# found, which grades the move from the S&P 500/400 to the whole US market.
+FOUND_CHANNELS = (("quality", "Nine-filter screen"),
+                  ("fcf", "Cash-flow screen"))
+FOUND_PONDS = (("sp", "In the S&P 500/400"),
+               ("us", "Other US companies"),
+               ("intl", "Based outside the US"))
+
 # Verdict-score buckets, highest first: (lower bound, label). 75 and 78 are
 # the watchlist BUY and holdings ADD bars, so 70-75 is "just under the bar".
 SCORE_BUCKETS = ((80, "80+"), (75, "75–80"), (70, "70–75"), (60, "60–70"),
@@ -176,7 +189,8 @@ SECTOR_MOMENTUM_VALUE = {"Hot": 1, "Neutral": 0, "Cool": -1}
 # ------------------------------------------------------------------ log ----
 
 def empty_log() -> dict:
-    return {"version": LOG_VERSION, "days": {}, "closes": {}, "fetched": {}}
+    return {"version": LOG_VERSION, "days": {}, "closes": {}, "fetched": {},
+            "found": []}
 
 
 def load_log(path: str = LOG_FILE) -> dict:
@@ -188,6 +202,8 @@ def load_log(path: str = LOG_FILE) -> dict:
             for key in ("closes", "fetched"):
                 if not isinstance(data.get(key), dict):
                     data[key] = {}
+            if not isinstance(data.get("found"), list):
+                data["found"] = []
             return data
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
@@ -239,6 +255,30 @@ def record_day(log: dict, day: str, calls: dict) -> int:
     return len(calls)
 
 
+def _channels(e: dict) -> list[str]:
+    """An addition's channels. Logged as a list; a single name before the
+    second channel."""
+    ch = e.get("ch")
+    return [ch] if isinstance(ch, str) else list(ch or [])
+
+
+def record_found(log: dict, day: str, entries: list[dict]) -> int:
+    """Log the names the screen added to the Screening watchlist today:
+    entries of {"t": ticker, "ch": [channels], "pond": pond or None}. A name
+    already logged for the day isn't logged twice. Returns how many it wrote."""
+    found = log.setdefault("found", [])
+    seen = {(e.get("t"), e.get("d")) for e in found}
+    added = 0
+    for e in entries:
+        if not e.get("t") or (e["t"], day) in seen:
+            continue
+        found.append({"t": e["t"], "d": day, "ch": _channels(e),
+                      "pond": e.get("pond")})
+        seen.add((e["t"], day))
+        added += 1
+    return added
+
+
 def seed_from_ledger(log: dict, ledger: Optional[dict], today: str) -> int:
     """Once, recover the calls the recs ledger already holds: each ticker's
     first sighting, with the verdict, score and factors it was first seen at.
@@ -288,11 +328,15 @@ def prune_log(log: dict, today: date) -> None:
     days = log.get("days") or {}
     for d in [d for d in days if d < cutoff]:
         del days[d]
-    if not days:
+    found = log["found"] = [e for e in log.get("found") or []
+                            if e.get("d", "") >= cutoff]
+    if not days and not found:
         log["closes"], log["fetched"] = {}, {}
         return
-    keep_from = (date.fromisoformat(min(days)) - timedelta(days=14)).isoformat()
-    tickers = {t for calls in days.values() for t in calls} | {BENCHMARK}
+    first = min([*days, *(e["d"] for e in found)])
+    keep_from = (date.fromisoformat(first) - timedelta(days=14)).isoformat()
+    tickers = ({t for calls in days.values() for t in calls}
+               | {e["t"] for e in found} | {BENCHMARK})
     closes = log.get("closes") or {}
     for t in list(closes):
         if t not in tickers:
@@ -382,22 +426,27 @@ def last_session(now_et: datetime) -> str:
 
 def closes_wanted(log: dict, session: str) -> dict[str, str]:
     """{ticker: fetch-from date} for every series that needs closes it doesn't
-    have yet. A ticker needs closes from just before its earliest call to its
-    latest call's last exit (or the session, if sooner). The benchmark needs
+    have yet. A ticker needs closes from just before its earliest call (or
+    screen addition) to its latest one's last exit (or the session, if
+    sooner). The benchmark needs
     the whole span. A series fetched this session isn't asked for again, and
     one that a fetch STALE_SERIES_D or more after its last close (or its first
     call, if it has none) still couldn't extend is given up on: a delisted or
     renamed ticker. Keying that on the fetch, not the calendar, means an
     outage that leaves every series weeks behind doesn't read as delisting."""
     days = log.get("days") or {}
-    if not days:
+    found = log.get("found") or []
+    if not days and not found:
         return {}
     span: dict[str, list[str]] = {}
-    for d, calls in days.items():
-        for t in calls:
-            lo_hi = span.setdefault(t, [d, d])
-            lo_hi[0], lo_hi[1] = min(lo_hi[0], d), max(lo_hi[1], d)
-    span[BENCHMARK] = [min(days), session]
+    # A screen addition is graded from the day it was added, whether or not
+    # that day's analysis made it into the log.
+    dated = [(d, t) for d, calls in days.items() for t in calls]
+    dated += [(e["d"], e["t"]) for e in found]
+    for d, t in dated:
+        lo_hi = span.setdefault(t, [d, d])
+        lo_hi[0], lo_hi[1] = min(lo_hi[0], d), max(lo_hi[1], d)
+    span[BENCHMARK] = [min(d for d, _ in dated), session]
     closes, fetched = log.get("closes") or {}, log.get("fetched") or {}
     wanted: dict[str, str] = {}
     for t, (first, last) in span.items():
@@ -526,36 +575,104 @@ def evaluate_calls(log: dict, horizons=HORIZONS) -> list[dict]:
     entry + h days, within HORIZON_GRACE_D. Alpha: return minus the S&P 500's
     over the same two dates."""
     closes = log.get("closes") or {}
-    bench = _Series(closes.get(BENCHMARK))
-    cache: dict[str, _Series] = {}
+    forward = _Forward(closes)
     out: list[dict] = []
     for day in sorted(log.get("days") or {}):
         for ticker, call in log["days"][day].items():
-            s = cache.get(ticker)
-            if s is None:
-                s = cache[ticker] = _Series(closes.get(ticker))
-            entry_d = s.on_or_after(day, 4)
-            if entry_d is None:
+            got = forward(ticker, day, horizons)
+            if got is None:
                 continue
-            entry = s.closes[entry_d]
-            b_entry_d = bench.on_or_before(entry_d)
-            rets, alphas = {}, {}
-            for name, h in horizons:
-                exit_d = s.on_or_after(_shift(entry_d, h), HORIZON_GRACE_D)
-                if exit_d is None or not entry:
-                    continue
-                ret = (s.closes[exit_d] / entry - 1) * 100
-                rets[name] = round(ret, 3)
-                b_exit_d = bench.on_or_before(exit_d)
-                if b_entry_d and b_exit_d and bench.closes[b_entry_d]:
-                    b_ret = (bench.closes[b_exit_d]
-                             / bench.closes[b_entry_d] - 1) * 100
-                    alphas[name] = round(ret - b_ret, 3)
+            rets, alphas = got
             out.append({"date": day, "ticker": ticker,
                         "held": bool(call.get("h")), "seed": bool(call.get("s")),
                         "v": call.get("v") or {}, "f": call.get("f") or {},
                         "ret": rets, "alpha": alphas})
     return out
+
+
+class _Forward:
+    """Forward returns and alphas from a day's close, over the log's closes."""
+
+    def __init__(self, closes: dict):
+        self.closes = closes
+        self.bench = _Series(closes.get(BENCHMARK))
+        self.cache: dict[str, _Series] = {}
+
+    def __call__(self, ticker: str, day: str, horizons
+                 ) -> Optional[tuple[dict, dict]]:
+        """({horizon: return %}, {horizon: alpha %}) from the close of `day`
+        (the first close within 4 days after, for a non-trading day), or None
+        without one."""
+        s = self.cache.get(ticker)
+        if s is None:
+            s = self.cache[ticker] = _Series(self.closes.get(ticker))
+        entry_d = s.on_or_after(day, 4)
+        if entry_d is None:
+            return None
+        entry = s.closes[entry_d]
+        bench = self.bench
+        b_entry_d = bench.on_or_before(entry_d)
+        rets, alphas = {}, {}
+        for name, h in horizons:
+            exit_d = s.on_or_after(_shift(entry_d, h), HORIZON_GRACE_D)
+            if exit_d is None or not entry:
+                continue
+            ret = (s.closes[exit_d] / entry - 1) * 100
+            rets[name] = round(ret, 3)
+            b_exit_d = bench.on_or_before(exit_d)
+            if b_entry_d and b_exit_d and bench.closes[b_entry_d]:
+                b_ret = (bench.closes[b_exit_d]
+                         / bench.closes[b_entry_d] - 1) * 100
+                alphas[name] = round(ret - b_ret, 3)
+        return rets, alphas
+
+
+def evaluate_found(log: dict, horizons=HORIZONS) -> list[dict]:
+    """Every screen addition with a close on its day, with its forward return
+    and alpha at each matured horizon, like evaluate_calls."""
+    forward = _Forward(log.get("closes") or {})
+    out: list[dict] = []
+    for e in log.get("found") or []:
+        got = forward(e["t"], e["d"], horizons)
+        if got is not None:
+            out.append({**e, "ret": got[0], "alpha": got[1]})
+    return out
+
+
+def _found_group(rows: list[dict], h: str) -> dict:
+    """n, mean return, mean alpha and the share that beat the S&P, at h."""
+    pairs = [(r["ret"][h], r["alpha"][h]) for r in rows if h in r["alpha"]]
+    if not pairs:
+        return {"n": 0, "ret": None, "alpha": None, "beat": None}
+    n = len(pairs)
+    return {"n": n, "ret": round(sum(p[0] for p in pairs) / n, 2),
+            "alpha": round(sum(p[1] for p in pairs) / n, 2),
+            "beat": round(sum(1 for p in pairs if p[1] > 0) / n, 3)}
+
+
+def found_scorecard(log: dict, horizons=HORIZONS) -> dict:
+    """How the screen's additions did since the day each was added: all of
+    them, by channel (once there is more than one; a name both channels
+    nominated counts in each) and by pond. Rows are (key, label, {horizon:
+    group}); a group nothing was found in is left out."""
+    found = log.get("found") or []
+    rows = evaluate_found(log, horizons)
+    groups = [("all", "All screen additions", lambda e: True)]
+    if len({c for e in found for c in _channels(e)}) > 1:
+        groups += [(f"ch:{key}", label, lambda e, k=key: k in _channels(e))
+                   for key, label in FOUND_CHANNELS]
+    groups += [(f"pond:{key}", label, lambda e, k=key: e.get("pond") == k)
+               for key, label in FOUND_PONDS]
+    return {
+        "n": len(found),
+        "since": min((e["d"] for e in found), default=None),
+        "matured": {h: sum(1 for r in rows if h in r["alpha"])
+                    for h, _ in horizons},
+        # A group shows once anything was found in it, priced or not.
+        "rows": [(key, label, {h: _found_group([r for r in rows if keep(r)], h)
+                               for h, _ in horizons})
+                 for key, label, keep in groups if any(keep(e) for e in found)],
+    }
 
 
 # ------------------------------------------------------------ statistics ----
@@ -830,7 +947,8 @@ def build_scorecard(log: dict, modes: tuple, default_mode: str,
         factors[key] = {h: cols.ic(x, everyone, h, d) for h, d in horizons}
 
     sc = {"meta": meta, "modes": per_mode, "compare": compare,
-          "compare_n": compare_n, "factors": factors}
+          "compare_n": compare_n, "factors": factors,
+          "found": found_scorecard(log, horizons)}
     sc["suggestions"] = {m: suggest(sc, m, modes, labels, horizons)
                          for m in modes}
     return sc
@@ -1050,6 +1168,16 @@ def digest(sc: dict, mode: str, labels: dict, horizons=HORIZONS) -> str:
             facs.append(f"{label} {f['ic']:+.2f}")
     if facs:
         lines.append(f"Input rank ICs at {h}: " + ", ".join(facs) + ".")
+    found = sc.get("found") or {}
+    parts = []
+    for _, label, by_h in found.get("rows") or []:
+        g = by_h.get(h) or {}
+        if g.get("n"):
+            parts.append(f"{label} alpha {g['alpha']:+.1f}% (n={g['n']}, "
+                         f"beat S&P {g['beat']:.0%})")
+    if parts:
+        lines.append(f"Screen additions at {h}, from the day each was added: "
+                     + "; ".join(parts) + ".")
     for tone, text in sc["suggestions"].get(mode) or []:
         lines.append(f"Rule-based finding ({tone}): {text}")
     return "\n".join(lines)

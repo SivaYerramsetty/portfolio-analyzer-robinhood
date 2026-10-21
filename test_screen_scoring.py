@@ -1,8 +1,8 @@
 """
 test_screen_scoring.py
 ----------------------
-Tests for the S&P 500/400 screen: the one-request prefilter (screener.py), the
-stage-2 scorer that gives the Screening table the report's own Composite
+Tests for the US market screen: the universe from Yahoo's screener and its S&P
+500/400 fallback, the one-request prefilter (screener.py), the stage-2 scorer that gives the Screening table the report's own Composite
 (analyze_portfolio.score_screen_shortlist), and the Yahoo rate-limit handling
 both stages run through (yahoo_limits.py).
 
@@ -94,6 +94,11 @@ def test_rate_limit_detection() -> None:
                 raise YFRateLimitError()
             return "ok"
 
+        def post(self, fail):
+            if fail:
+                raise YFRateLimitError()
+            return "posted"
+
     yl._count_requests(Fake, YFRateLimitError)
     sent, refused = yl.requests(), yl.refusals()
     check(Fake().get(False), "ok", "a wrapped request passes its answer through")
@@ -104,9 +109,13 @@ def test_rate_limit_detection() -> None:
         raised = True
     check((raised, yl.requests() - sent, yl.refusals() - refused), (True, 2, 1),
           "every request is counted; a refused one also as a refusal, and raised")
-    check(yl.install(), True, "install() wraps yfinance's request method")
+    sent = yl.requests()
+    check((Fake().post(False), yl.requests() - sent), ("posted", 1),
+          "a POST is counted too")
+    check(yl.install(), True, "install() wraps yfinance's request methods")
     from yfinance.data import YfData
-    check(hasattr(YfData.get, "__wrapped__"), True, "and leaves it wrapped")
+    check((hasattr(YfData.get, "__wrapped__"), hasattr(YfData.post, "__wrapped__")),
+          (True, True), "GET and POST both: yf.screen posts its query")
 
 
 def test_budget() -> None:
@@ -219,6 +228,17 @@ def test_prefilter_one() -> None:
     check(r.prefilter_failed, 1, "only the 5% EPS growth counts against it")
     check((r.passes, r.num_failed, r.score_composite), ({}, 9, None),
           "the filters and scores are left for stage 2")
+    check((r.fcf_yield, r.net_margin), (0.04, None),
+          "FCF yield is free cash flow over market cap, from the same request")
+
+    foreign = dict(QS["quoteSummary"]["result"][0])
+    foreign["financialData"] = dict(foreign["financialData"],
+                                    financialCurrency="CNY")
+    with patched(sc.yf, Ticker=lambda t: FakeTicker(
+            payload={"quoteSummary": {"result": [foreign]}})):
+        r = sc.prefilter_one("ADR")
+    check((r.financial_currency, r.fcf_yield), ("CNY", None),
+          "a yuan reporter's yield waits for an exchange rate")
 
     thin = dict(QS["quoteSummary"]["result"][0])
     thin["financialData"] = {"currentPrice": 100.0, "debtToEquity": 50.0,
@@ -237,6 +257,73 @@ def test_prefilter_one() -> None:
             _quote=SimpleNamespace(_fetch=boom))):
         r = sc.prefilter_one("RL")
     check(yl.is_rate_limited(r.error), True, "a refusal is recorded as one")
+
+
+def test_fcf_eligible() -> None:
+    section("the cash-flow channel: FCF yield, D/E under 1, profitable")
+    base = dict(ticker="X", fcf_yield=0.10, de_ratio=0.4, net_margin=0.12)
+    r = lambda **kw: sc.ScreenResult(**{**base, **kw})
+    with patched(sc.os, environ={}):
+        check(sc.fcf_min_yield(), 0.08, "the bar defaults to an 8% yield")
+        check(sc.fcf_eligible(r()), True, "10% yield, D/E 0.4, profitable")
+        for label, kw in (("a yield under the bar", {"fcf_yield": 0.07}),
+                          ("a yield too high to be real", {"fcf_yield": 0.6}),
+                          ("no yield", {"fcf_yield": None}),
+                          ("D/E of 1 or more", {"de_ratio": 1.0}),
+                          ("negative equity", {"de_ratio": -0.3}),
+                          ("no D/E", {"de_ratio": None}),
+                          ("a loss", {"net_margin": -0.01}),
+                          ("an error", {"error": "no info"})):
+            check(sc.fcf_eligible(r(**kw)), False, f"not with {label}")
+        check(sc.fcf_eligible(r(net_margin=None)), True,
+              "a missing margin isn't held against it")
+        key = sc._universe_key()
+    with patched(sc.os, environ={"SCREEN_MIN_FCF_YIELD": "0.12"}):
+        check((sc.fcf_eligible(r()), sc._universe_key() != key), (False, True),
+              "the bar can be set from the environment, and restarts the scan")
+
+
+def test_fcf_yield_currency() -> None:
+    section("FCF yield: a foreign reporter's cash flow is put into dollars")
+    usd = sc.ScreenResult(ticker="USD", fcf=1e9, market_cap=1e10,
+                          financial_currency="USD", fcf_yield=0.1)
+    cny = sc.ScreenResult(ticker="CNY", fcf=7e9, market_cap=1e10,
+                          financial_currency="CNY")
+    ars = sc.ScreenResult(ticker="ARS", fcf=1e12, market_cap=1e10,
+                          financial_currency="ARS")
+    zzz = sc.ScreenResult(ticker="ZZZ", fcf=1e9, market_cap=1e10,
+                          financial_currency="ZZZ")
+    asked = []
+
+    def rate(cur):
+        asked.append(cur)
+        yl.note_request()
+        return {"CNY": 0.14, "ARS": 0.00065}.get(cur)
+
+    spent = quiet_budget(1)
+    yl.note_request()                          # the prefilter used the budget
+    rates = {"ARS": 0.00065}
+    with patched(sc, _usd_rate=rate):
+        retry = sc._set_fcf_yields([usd, cny, ars, zzz], rates, spent)
+    check((round(cny.fcf_yield, 3), round(ars.fcf_yield, 3), zzz.fcf_yield,
+           usd.fcf_yield), (0.098, 0.065, None, 0.1),
+          "yuan and pesos become dollars; a currency with no rate gets no yield")
+    check((sorted(asked), retry), (["CNY", "ZZZ"], []),
+          "a rate already known isn't fetched again, even with the budget spent")
+    check(rates["CNY"], 0.14, "and the day's rates are kept for later runs")
+
+    from yfinance.exceptions import YFRateLimitError
+
+    def refused(cur):
+        raise YFRateLimitError()
+
+    late = sc.ScreenResult(ticker="LATE", fcf=7e9, market_cap=1e10,
+                           financial_currency="EUR")
+    budget = quiet_budget()
+    with patched(sc, _usd_rate=refused):
+        retry = sc._set_fcf_yields([late], {}, budget)
+    check(([r.ticker for r in retry], budget.stopped), (["LATE"], True),
+          "a refusal stops the run and hands the name back to prefilter again")
 
 
 def test_prefilter_universe() -> None:
@@ -292,21 +379,27 @@ def test_scorer_matches_the_holding() -> None:
         "FAR": dict(PASSING, earningsCAGR3y=0.05, quickRatio=0.8,
                     debtToEquity=150),
     }
+    infos["CASH"] = infos["FAR"]
     rows = [sc.ScreenResult(ticker=t, name=t) for t in ("PASS", "NEAR", "FAR")]
+    rows.append(sc.ScreenResult(ticker="CASH", name="CASH", fcf_yield=0.1,
+                                de_ratio=0.5))
     with patched(ap, _screen_scoring_inputs=_inputs(infos),
                  _set_insider_scores=fake_insider,
-                 _flush_fund_cache=lambda: None):
+                 _flush_fund_cache=lambda: None), patched(sc.os, environ={}):
         left = ap.score_screen_shortlist(rows, budget=quiet_budget(),
                                          verbose=False)
-    passing, near, far = rows
+    passing, near, far, cash = rows
     check(left, [], "with room in the budget every name is scored")
     check((passing.num_passed, near.num_failed, far.num_failed), (9, 2, 3),
           "the nine filters are analyze_portfolio's")
     check(sorted(k for k, v in near.passes.items() if not v),
           ["eps_growth", "quick"], "failures are listed by their short names")
-    check(sorted(insider_reads), ["NEAR", "PASS"],
-          "the insider read is made only for names the table shows")
-    check(far.score_composite, None, "a name the table won't show isn't scored")
+    check(sorted(insider_reads), ["CASH", "NEAR", "PASS"],
+          "the insider read is made only for names a channel could add, or "
+          "near misses")
+    check(far.score_composite, None, "a name no channel can use isn't scored")
+    check((cash.num_failed, cash.score_composite is not None), (3, True),
+          "a cash-flow candidate gets its Composite whatever it fails")
 
     # The same inputs through the holdings path: compute_composite_score.
     pa = ap.PositionAnalysis(ticker="PASS", name="PASS", shares=10,
@@ -404,7 +497,8 @@ def test_screen_universe() -> None:
     universe = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
     with tempfile.TemporaryDirectory() as d, \
             patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
-                    fetch_sp500_sp400=lambda verbose: list(universe),
+                    fetch_universe=lambda verbose: (list(universe), "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
                     prefilter_one=fake_prefilter,
                     _request_budget=lambda: 8):
         first = sc.screen_universe(score, max_workers=1, verbose=False)
@@ -433,8 +527,9 @@ def test_screen_universe() -> None:
               (True, False, ["FFF", "AAA"]), "a finished scan is read back")
 
         cached = json.loads((Path(d) / "screen.json").read_text())
-        old_format = {k: cached[k] for k in ("date", "scoring", "scanned_at",
-                                             "universe_size", "unscreened")}
+        old_format = {k: cached[k] for k in ("date", "scoring", "universe",
+                                             "scanned_at", "universe_size",
+                                             "unscreened")}
         old_format["passed"] = cached["shown"][:1]
         old_format["near_miss"] = []
         (Path(d) / "screen.json").write_text(json.dumps(old_format))
@@ -447,6 +542,12 @@ def test_screen_universe() -> None:
         (Path(d) / "screen.json").write_text(json.dumps(cached))
         check(sc._load_screen_state(verbose=False), None,
               "a cache scored any other way is not today's scan")
+
+        cached["scoring"] = sc._CACHE_SCORING
+        del cached["universe"]                # an S&P 500/400 scan
+        (Path(d) / "screen.json").write_text(json.dumps(cached))
+        check(sc._load_screen_state(verbose=False), None,
+              "nor is a scan of another universe")
 
 
 def test_screen_universe_refusal() -> None:
@@ -463,7 +564,8 @@ def test_screen_universe_refusal() -> None:
     score = _fake_scorer({t: (0, 60.0) for t in ("AAA", "RL", "ZZZ")}, scored)
     with tempfile.TemporaryDirectory() as d, \
             patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
-                    fetch_sp500_sp400=lambda verbose: ["AAA", "RL", "ZZZ"],
+                    fetch_universe=lambda verbose: (["AAA", "RL", "ZZZ"], "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
                     prefilter_one=fake_prefilter,
                     _request_budget=lambda: 1000):
         first = sc.screen_universe(score, max_workers=1, verbose=False)
@@ -474,6 +576,192 @@ def test_screen_universe_refusal() -> None:
         check((sorted(scored), second["pending"], len(second["passed"]),
                second["refused"]), (["AAA", "RL", "ZZZ"], 0, 3, False),
               "run 2 prefilters the rest and scores all three")
+
+
+def _quote(sym: str, volume: float, price: float = 10.0) -> dict:
+    return {"symbol": sym, "averageDailyVolume3Month": volume,
+            "regularMarketPrice": price}
+
+
+def test_fetch_us_universe() -> None:
+    section("fetch_us_universe: the whole US market, a page at a time")
+    quotes = [_quote(f"T{i:03d}", 1e6) for i in range(260)]
+    quotes[3] = _quote("THIN", 1e5)            # $1M a day: under the floor
+    quotes[4] = _quote("NOPRICE", 1e6, price=0)
+    calls = []
+
+    def screen(query, offset, size, sortField, sortAsc):
+        calls.append((offset, size, sortField, sortAsc))
+        calls.append(query.to_dict())
+        return {"quotes": quotes[offset:offset + size], "total": len(quotes)}
+
+    with patched(sc.os, environ={}):
+        got = sc.fetch_us_universe(verbose=False, screen=screen)
+    pages = [c for c in calls if isinstance(c, tuple)]
+    check(pages, [(0, 250, "ticker", True), (250, 250, "ticker", True)],
+          "pages of 250, sorted by ticker so they don't shift mid-pull")
+    query = json.dumps(calls[1])
+    check(all(x in query for x in ('"region"', '"us"', '"NYQ"', '"NMS"',
+                                   '"intradaymarketcap"', '1000000000',
+                                   '"netincomeis.lasttwelvemonths"')),
+          True, "the query asks for US-listed, $1B+, profitable names")
+    check("OTC" in query or "PNK" in query, False, "and leaves OTC out")
+    check((len(got), "THIN" in got, "NOPRICE" in got, got == sorted(got)),
+          (258, False, False, True),
+          "a name trading under $5M a day is dropped; the rest come sorted")
+
+    with patched(sc.os, environ={"SCREEN_MIN_DOLLAR_VOLUME": "20e6",
+                                 "SCREEN_MIN_MARKET_CAP": "2e9"}):
+        check((sc.min_dollar_volume(), sc.min_market_cap()), (20e6, 2e9),
+              "both floors can be set from the environment")
+        floors = sc._universe_key()
+    check(floors != sc._universe_key(), True,
+          "and a changed floor makes a different day's-scan key")
+
+
+def test_fetch_universe_fallback() -> None:
+    section("fetch_universe: the S&P 500/400 when the screener fails")
+    big = [f"T{i:04d}" for i in range(sc.MIN_US_UNIVERSE)]
+    sp = ["AAPL", "MSFT"]
+
+    def fails(verbose):
+        raise ValueError("schema changed")
+
+    def refused(verbose):
+        from yfinance.exceptions import YFRateLimitError
+        raise YFRateLimitError()
+
+    for label, fetch, want in (
+            ("the screener answers: its universe", lambda verbose: big,
+             (big, "us")),
+            ("an error: the S&P list", fails, (sp, "sp")),
+            ("too few names: the S&P list", lambda verbose: big[:10], (sp, "sp"))):
+        with patched(sc, fetch_us_universe=fetch,
+                     fetch_sp500_sp400=lambda verbose: list(sp)):
+            check(sc.fetch_universe(verbose=False), want, label)
+    with patched(sc, fetch_us_universe=refused,
+                 fetch_sp500_sp400=lambda verbose: list(sp)):
+        try:
+            sc.fetch_universe(verbose=False)
+            raised = False
+        except Exception as e:
+            raised = yl.is_rate_limited(e)
+    check(raised, True, "a refusal is raised, not papered over with the S&P list")
+
+
+def test_screen_universe_fcf() -> None:
+    section("screen_universe: cash-flow candidates are scored whatever they miss")
+    pre = {"PASS": (0, None), "CASH": (6, 0.10), "BOTH": (0, 0.09),
+           "NONE": (6, 0.01)}
+    verdicts = {"PASS": (0, 70.0), "CASH": (5, 64.0), "BOTH": (0, 80.0),
+                "NONE": (6, 30.0)}
+
+    def fake_prefilter(t):
+        misses, yld = pre[t]
+        return sc.ScreenResult(ticker=t, name=t, prefilter_failed=misses,
+                               fcf_yield=yld, de_ratio=0.5)
+
+    scored: list = []
+    with tempfile.TemporaryDirectory() as d, patched(sc.os, environ={}), \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (sorted(pre), "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 1000):
+        out = sc.screen_universe(_fake_scorer(verdicts, scored),
+                                 max_workers=1, verbose=False)
+        check(sorted(scored), ["BOTH", "CASH", "PASS"],
+              "a cash-flow candidate six misses out is scored; others aren't")
+        check(([r.ticker for r in out["passed"]], [r.ticker for r in out["fcf"]]),
+              (["BOTH", "PASS"], ["BOTH", "CASH"]),
+              "it comes back as a cash-flow candidate, best Composite first")
+        check({ch: [r.ticker for r in rows]
+               for ch, rows in sc.channel_candidates(out).items()},
+              {"quality": ["BOTH", "PASS"], "fcf": ["BOTH", "CASH"]},
+              "channel_candidates hands both lists on")
+        again = sc.screen_universe(_fake_scorer(verdicts, scored),
+                                   max_workers=1, verbose=False)
+        check([r.ticker for r in again["fcf"]], ["BOTH", "CASH"],
+              "and the day's cache keeps it")
+
+    def foreign_prefilter(t):
+        return sc.ScreenResult(ticker=t, name=t, prefilter_failed=6, fcf=7e9,
+                               market_cap=5e10, financial_currency="CNY",
+                               de_ratio=0.5)
+
+    from yfinance.exceptions import YFRateLimitError
+    refuse = [True]
+
+    def rate(cur):
+        if refuse[0]:
+            refuse[0] = False
+            raise YFRateLimitError()
+        return 0.7                             # 7e9 x 0.7 / 5e10 = 9.8%
+
+    scored = []
+    with tempfile.TemporaryDirectory() as d, patched(sc.os, environ={}), \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (["ADR"], "us"),
+                    fetch_sp500_sp400=lambda verbose: [],
+                    prefilter_one=foreign_prefilter, _usd_rate=rate,
+                    _request_budget=lambda: 1000):
+        first = sc.screen_universe(_fake_scorer({"ADR": (6, 66.0)}, scored),
+                                   max_workers=1, verbose=False)
+        check((first["pending"], scored), (1, []),
+              "a refused exchange rate leaves the name to prefilter again")
+        second = sc.screen_universe(_fake_scorer({"ADR": (6, 66.0)}, scored),
+                                    max_workers=1, verbose=False)
+        check(([r.ticker for r in second["fcf"]], second["pending"]),
+              (["ADR"], 0), "next run it gets its rate and its place")
+
+
+def test_screen_universe_tags() -> None:
+    section("screen_universe: where each name was found, and a refused start")
+    countries = {"SPX": "United States", "USCO": "United States",
+                 "ADR": "Taiwan", "NOWHERE": None}
+
+    def fake_prefilter(t):
+        return sc.ScreenResult(ticker=t, name=t, country=countries[t],
+                               prefilter_failed=0)
+
+    scored: list = []
+    score = _fake_scorer({t: (0, 70.0) for t in countries}, scored)
+    with tempfile.TemporaryDirectory() as d, \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (sorted(countries), "us"),
+                    fetch_sp500_sp400=lambda verbose: ["SPX"] + [
+                        f"S{i}" for i in range(sc._MIN_SP_LIST)],
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 1000):
+        out = sc.screen_universe(score, max_workers=1, verbose=False)
+        ponds = {r.ticker: sc.pond(r) for r in out["passed"]}
+        check(ponds, {"SPX": "sp", "USCO": "us", "ADR": "intl", "NOWHERE": "us"},
+              "S&P members, other US companies and companies based abroad")
+        again = sc.screen_universe(score, max_workers=1, verbose=False)
+        check({r.ticker: sc.pond(r) for r in again["passed"]}, ponds,
+              "the tags survive the day's cache")
+
+    with tempfile.TemporaryDirectory() as d, \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=lambda verbose: (sorted(countries), "us"),
+                    fetch_sp500_sp400=lambda verbose: ["SPX"],
+                    prefilter_one=fake_prefilter,
+                    _request_budget=lambda: 1000):
+        out = sc.screen_universe(score, max_workers=1, verbose=False)
+        check({r.ticker: sc.pond(r) for r in out["passed"]},
+              {"SPX": None, "USCO": None, "ADR": "intl", "NOWHERE": None},
+              "without a real S&P list, membership is unknown, not 'other US'")
+
+    def refused(verbose):
+        from yfinance.exceptions import YFRateLimitError
+        raise YFRateLimitError()
+
+    with tempfile.TemporaryDirectory() as d, \
+            patched(sc, _SCREEN_CACHE_PATH=Path(d) / "screen.json",
+                    fetch_universe=refused):
+        out = sc.screen_universe(score, max_workers=1, verbose=False)
+        check((out, (Path(d) / "screen.json").exists()), (None, False),
+              "a refused universe fetch shows nothing and caches nothing")
 
 
 def test_add_screened_names() -> None:
@@ -531,39 +819,20 @@ def test_split() -> None:
 
 # ------------------------------------------------------------ 5. rendering ----
 
-def test_render_live_scores() -> None:
-    section("Screening table: this run's numbers for names it analyzed")
-    rows = [sc.ScreenResult(ticker=t, name=t, num_passed=9, num_failed=0,
-                            score_composite=c, score_quality=c)
-            for t, c in (("HELD", 60.0), ("SCAN", 65.0))]
-    sr = {"passed": rows, "near_miss": [], "universe_size": 900,
-          "unscreened": ["X", "Y"], "scanned_at": "2026-10-05T07:01:55-04:00"}
-    held = ap.PositionAnalysis(ticker="HELD", name="Held", shares=5,
-                               statement_market_value=0,
-                               statement_pct_portfolio=0)
-    held.composite_score, held.score_quality = 72.4, 81.0
-    html = ap._render_screening_section(sr, {"HELD": held})
-    check("Screened 898 of 900 tickers against the 9-filter quality framework "
-          "(2 could not be fetched from Yahoo)." in html,
-          True, "the header counts what was actually screened")
-    check("from the day's scan at 7:01 AM ET" in html, True,
-          "and says when the scan ran")
-    check(html.index(">HELD<") < html.index(">SCAN<"), True,
-          "a live score re-sorts the table")
-    check("Composite Score: 72" in html, True, "the held name shows its run score")
-    check(rows[0].score_composite, 60.0, "the scan's own rows are left untouched")
-
-    errored = ap.PositionAnalysis(ticker="SCAN", name="S", shares=0,
-                                  statement_market_value=0,
-                                  statement_pct_portfolio=0, error="boom")
-    html = ap._render_screening_section(sr, {"SCAN": errored})
-    check("Composite Score: 65" in html, True,
-          "an analysis that errored doesn't replace the scan's score")
-
-    html = ap._render_screening_section(dict(sr, pending=415), {})
-    check("Screening 900 tickers against the 9-filter quality framework; 415 "
-          "are still to go, and the next runs fill them in. So far" in html,
-          True, "a scan still in progress says so")
+def test_report_has_no_scan_tables() -> None:
+    section("The report: the names the scan added, not the scan")
+    import inspect
+    import test_base_score_mode as tb
+    with tb._mode_env():
+        added = tb._scored("ZWS", 80, [1.0] * 9)
+    page = tb._render_report([], {ap.SCREEN_WATCHLIST: [added]})
+    check(("ZWS" in page, "📊 Screening" in page, "Near misses" in page),
+          (True, False, False),
+          "an added name shows on the Screening watchlist; no pass or "
+          "near-miss tables")
+    check("screening_results" in inspect.signature(
+        ap.generate_html_report).parameters, False,
+          "and generate_html_report no longer takes the scan")
 
 
 # -------------------------------------------------------------------- main ----
@@ -572,9 +841,14 @@ def main() -> int:
     for t in (test_rate_limit_detection, test_budget, test_run_gated,
               test_quote_summary, test_prefilter_one, test_prefilter_universe,
               test_scorer_matches_the_holding, test_scorer_refusals,
-              test_growth_cache_guard, test_screen_universe,
-              test_screen_universe_refusal, test_add_screened_names, test_split,
-              test_render_live_scores):
+              test_growth_cache_guard, test_fcf_eligible,
+              test_fcf_yield_currency,
+              test_fetch_us_universe,
+              test_fetch_universe_fallback, test_screen_universe,
+              test_screen_universe_refusal, test_screen_universe_fcf,
+              test_screen_universe_tags,
+              test_add_screened_names, test_split,
+              test_report_has_no_scan_tables):
         before = len(_results)
         t()
         passed = sum(1 for ok, _ in _results[before:] if ok)

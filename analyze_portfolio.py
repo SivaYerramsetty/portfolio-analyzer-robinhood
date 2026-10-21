@@ -44,8 +44,9 @@ COMMAND REFERENCE — every way to run this script
     python analyze_portfolio.py --source robinhood --include-watchlists \
         --save-positions positions.csv --out report.html --email
 
-    # Self-maintaining watchlist: scan the S&P 500/400 once a market day, append
-    # the best passers to the "Screening" list, analyze them in the same run,
+    # Self-maintaining watchlist: scan the US market once a market day, append
+    # each channel's best names (the nine filters, the cash-flow screen) to the
+    # "Screening" list, analyze them in the same run,
     # and prune them again when their verdict decays. Nothing to add by hand.
     python analyze_portfolio.py --source robinhood --include-watchlists \
         --screen --sync-screening-watchlist --prune-watchlists --out report.html
@@ -115,14 +116,16 @@ COMMAND REFERENCE — every way to run this script
     --save-positions FILE  With --source robinhood: dump positions snapshot CSV.
     --out FILE             Output HTML path (default: portfolio_report.html).
     --email                Also send the report via SMTP (uses env vars).
-    --screen               Run S&P 500/400 screen; adds Screening section.
+    --screen               Screen US-listed stocks over $1B for the Screening list.
                            Scans at most once per market day (cached in .cache/).
     --screen-limit N       Cap screened universe for testing.
     --rescan               Ignore today's cached scan and screen again.
-    --sync-screening-watchlist  Append the scan's best passers to the
-                           "Screening" watchlist and analyze them this run.
+    --sync-screening-watchlist  Append the scan's best names (nine-filter
+                           and cash-flow channels) to the "Screening"
+                           watchlist and analyze them this run.
                            Append-only; --prune-watchlists removes them later.
-    --screen-add-limit N   Most names one scan may add (default 25).
+    --screen-add-limit N   Most names one scan may add, split between the
+                           two channels (default 25).
     --add-to-watchlist NAME  Append --tickers to a Robinhood watchlist (no report).
     --sync-dry-run         Preview --add-to-watchlist / --sync without writing.
     --debug-insider TICKER Diagnose insider data sources for one stock.
@@ -165,7 +168,6 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo   # Python 3.9+; add near top of file if not already there
 import math as _math
 import argparse
-import copy
 import csv
 import io
 import json
@@ -3268,8 +3270,8 @@ def compute_composite_score(pa, info: dict) -> None:
     """
     Populate pa.score_{quality,growth,value,analyst} and pa.composite_score:
     quality 30%, growth 20%, value 20%, analyst 15%, insider 15%. This is the
-    report's one Composite — the Screening table scores its names through it
-    too (score_screen_shortlist).
+    report's one Composite — the universe scan scores its names through it
+    too (score_screen_shortlist), so the names it adds rank the same way.
 
     Each sub-score is 0-100. Missing data sub-scores are dropped from the
     weighted average rather than treated as 0 — fairer to limited-coverage
@@ -5186,37 +5188,44 @@ SCREEN_WATCHLIST = "Screening"
 # scan — the two rules would fight and churn the list daily. The scan passes
 # over anything the ledger scored below the prune threshold this recently.
 SCREEN_READD_COOLDOWN_DAYS = 30
-# A real scan covers ~900 names. Anything far below that means the universe
-# fetch fell back to its hardcoded mega-cap sample (screener.fetch_sp500_sp400),
-# and "passed the screen" would then mean "is one of 30 huge companies" — not a
-# basis for writing to a live watchlist.
+# A real scan covers ~1,900 names (~900 on the S&P fallback). Anything far
+# below that means both universe fetches failed and the S&P one fell back to
+# its hardcoded mega-cap sample (screener.fetch_sp500_sp400), and "passed the
+# screen" would then mean "is one of 30 huge companies" — not a basis for
+# writing to a live watchlist.
 MIN_SCREEN_UNIVERSE = 100
 
 
 def select_screen_additions(
-    passed: list,
+    channels: dict[str, list],
     held_tickers: set[str],
     history: Optional[dict] = None,
     limit: int = 25,
     threshold: float = 60.0,
     today: Optional[date] = None,
-) -> tuple[list[str], dict[str, str]]:
-    """Pick the scan's passers worth adding to the Screening watchlist.
+) -> tuple[list[str], dict[str, str], dict[str, list[str]]]:
+    """Pick the scan's names worth adding to the Screening watchlist.
 
-    Returns (tickers, skipped) — tickers highest-composite first and capped at
-    `limit`, and {ticker: why} for the ones passed over. Every added name costs
-    a full analysis on each later run, so the cap is what keeps a scan that
-    happens to pass 80 names from doubling the runtime of every run that day.
+    channels: {channel: candidates}, each best Composite first
+    (screener.channel_candidates). The channels split `limit` evenly, the
+    first taking any odd slot; a name both nominate counts once, against the
+    channel that reached it first, and a share a channel can't fill goes to
+    the best names left in either.
+
+    Returns (tickers, skipped, tags): the picks, capped at `limit`; {ticker:
+    why} for the ones passed over; and {ticker: [channels]} naming every
+    channel that nominated each pick, which the scorecard grades them by.
+    Every added name costs a full analysis on each later run, so the cap is
+    what keeps a scan that happens to pass 80 names from doubling the runtime
+    of every run that day.
     """
     today = today or datetime.now(ZoneInfo("America/New_York")).date()
     entries = (history or {}).get("tickers") or {}
-    picks: list[str] = []
     skipped: dict[str, str] = {}
-    for r in passed:                      # already sorted by composite desc
-        t = r.ticker
+
+    def blocked(t: str) -> Optional[str]:
         if t in held_tickers:
-            skipped[t] = "already held"
-            continue
+            return "already held"
         entry = entries.get(t) or {}
         score, seen = entry.get("last_verdict_score"), entry.get("last_date")
         if score is not None and score < threshold and seen:
@@ -5225,14 +5234,42 @@ def select_screen_additions(
             except (ValueError, TypeError):
                 age = None
             if age is not None and age <= SCREEN_READD_COOLDOWN_DAYS:
-                skipped[t] = (f"scored {score:.0f} {age}d ago, under the "
-                              f"{threshold:g} prune bar")
+                return (f"scored {score:.0f} {age}d ago, under the "
+                        f"{threshold:g} prune bar")
+        return None
+
+    open_: dict[str, list] = {}
+    tags: dict[str, list[str]] = {}
+    for ch, rows in channels.items():
+        open_[ch] = []
+        for r in rows:
+            why = skipped.get(r.ticker) or blocked(r.ticker)
+            if why:
+                skipped[r.ticker] = why
                 continue
+            open_[ch].append(r)
+            tags.setdefault(r.ticker, []).append(ch)
+
+    picks: list[str] = []
+    share = {ch: limit // len(channels) + (i < limit % len(channels))
+             for i, ch in enumerate(channels)} if channels else {}
+    for ch, rows in open_.items():
+        taken = 0
+        for r in rows:
+            if taken >= share[ch]:
+                break
+            if r.ticker not in picks:
+                picks.append(r.ticker)
+                taken += 1
+    rest = sorted({r.ticker: r for rows in open_.values() for r in rows
+                   if r.ticker not in picks}.values(),
+                  key=lambda r: r.score_composite or -1, reverse=True)
+    for r in rest:
         if len(picks) >= limit:
-            skipped[t] = f"past the top {limit}"
-            continue
-        picks.append(t)
-    return picks, skipped
+            skipped[r.ticker] = f"past the top {limit}"
+        else:
+            picks.append(r.ticker)
+    return picks, skipped, {t: tags[t] for t in picks}
 
 
 def add_screened_names(watchlists_analyzed: dict, landed: list[dict], *,
@@ -5267,8 +5304,8 @@ def add_screened_names(watchlists_analyzed: dict, landed: list[dict], *,
     return added
 
 
-# The nine filters' short names, as the Screening table lists a near miss's
-# failures ("eps_growth, fcf"). A filter missing here is listed by its name.
+# The nine filters' short names: the keys of a screened name's `passes`. A
+# filter missing here is keyed by its name.
 _SCREEN_FILTER_KEYS = {
     "Revenue growth >=10%": "rev_growth", "EPS growth >=10%": "eps_growth",
     "P/E < 30": "pe", "PEG < 2": "peg", "ROE >= 15%": "roe",
@@ -5311,10 +5348,10 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
     Yahoo work spends `budget` (a yahoo_limits.YahooBudget). The results it
     didn't get to — the budget ran out, or Yahoo refused — come back untouched
     for the next run; a name Yahoo has no data for gets an `error`. The
-    insider read (SEC) is made only for the names the table shows: all nine
-    filters passed, or one or two missed.
+    Composite and the insider read (SEC) are made only for the names a
+    channel could add, or that miss one or two filters: the rest are dropped.
     """
-    from screener import NEAR_MISS_MAX_FAILED
+    from screener import NEAR_MISS_MAX_FAILED, fcf_eligible
 
     gathered: dict[str, tuple] = {}
     lock = threading.Lock()
@@ -5352,12 +5389,12 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
                     for f in filters}
         r.num_passed = sum(1 for f in filters if f.passed)
         r.num_failed = len(filters) - r.num_passed
-        if r.num_failed <= NEAR_MISS_MAX_FAILED:
+        if r.num_failed <= NEAR_MISS_MAX_FAILED or fcf_eligible(r):
             shown.append((r, pa, info))
     if verbose:
         print(f"[screen] Scored {len(gathered)} of {len(results)} queued "
               f"name(s) in {time.time() - start:.0f}s; {len(shown)} pass all "
-              f"nine filters or miss one or two"
+              f"nine filters, miss one or two, or are cash-flow candidates"
               + (f"; {len(left)} wait for the next run" if left else "") + ".")
 
     start = time.time()
@@ -6968,152 +7005,6 @@ def _rating_bar(breakdown: Optional[dict], rec_key: Optional[str],
         count = f" ({num_analysts})" if num_analysts else ""
         return f'<span style="font-size:12px;">{label}{count}</span>'
     return "—"
-
-
-def _screen_rows_with_live_scores(rows: list, analyzed: dict) -> list:
-    """The scan's rows, with this run's scores on every name the run analyzed.
-
-    The scan is from the first run of the day; a held or watchlisted name was
-    scored again minutes ago, by the same formulas but on current prices and
-    with its Robinhood ratings. Showing those numbers keeps the Screening table
-    from disagreeing with that name's own row. Best Composite first."""
-    out = []
-    for r in rows:
-        pa = analyzed.get(r.ticker)
-        if pa is not None and not pa.error and pa.composite_score is not None:
-            r = copy.copy(r)
-            r.score_quality, r.score_growth = pa.score_quality, pa.score_growth
-            r.score_value, r.score_analyst = pa.score_value, pa.score_analyst
-            r.score_insider = pa.score_insider
-            r.insider_activity = pa.insider_activity
-            r.score_composite = pa.composite_score
-        out.append(r)
-    out.sort(key=lambda r: (r.score_composite if r.score_composite is not None
-                            else -1), reverse=True)
-    return out
-
-
-def _render_screening_section(sr: dict, analyzed: Optional[dict] = None) -> str:
-    """
-    Render the S&P 500/400 screening output.
-    sr: {"passed": [ScreenResult], "near_miss": [ScreenResult],
-         "universe_size": int, "unscreened": [ticker], "scanned_at": iso}
-    analyzed: {ticker: PositionAnalysis} for every name this run analyzed —
-    those rows show this run's scores (see _screen_rows_with_live_scores).
-    """
-    analyzed = analyzed or {}
-    passed = _screen_rows_with_live_scores(sr.get("passed") or [], analyzed)
-    near_miss = _screen_rows_with_live_scores(sr.get("near_miss") or [], analyzed)
-    uni = sr.get("universe_size", 0)
-    unscreened = len(sr.get("unscreened") or [])
-    pending = sr.get("pending") or 0
-    scanned = ""
-    try:
-        at = datetime.fromisoformat(sr.get("scanned_at") or "")
-        scanned = f" at {at.strftime('%I:%M %p').lstrip('0')} ET"
-    except ValueError:
-        pass
-
-    html = "<h2 style='margin-top:48px;'>📊 Screening — S&amp;P 500 + 400</h2>\n"
-    framework = "against the 9-filter quality framework"
-    if pending:
-        screened = (f"Screening {uni} tickers {framework}; {pending} are still "
-                    f"to go, and the next runs fill them in. So far")
-    elif unscreened:
-        screened = (f"Screened {uni - unscreened} of {uni} tickers {framework} "
-                    f"({unscreened} could not be fetched from Yahoo).")
-    else:
-        screened = f"Screened {uni} tickers {framework}."
-    html += (
-        f'<p style="color:#7f8c8d;font-size:12px;margin-top:-6px;margin-bottom:8px;">'
-        f"{screened} "
-        f"<strong>{len(passed)}</strong> passed all 9; "
-        f"<strong>{len(near_miss)}</strong> failed only 1-2 (near misses, sorted by score). "
-        f"Scores are the report's Composite, from the day's scan{scanned}; a name "
-        f"this run analyzed (held or on a watchlist) shows this run's numbers.</p>\n"
-    )
-    html += (
-        '<p style="background:#f1f8e9;border-left:3px solid #689f38;padding:8px 12px;'
-        'font-size:11px;color:#33691e;margin-bottom:16px;border-radius:3px;">'
-        "<strong>Filters:</strong> Rev/EPS Growth ≥10%/yr · ROE ≥15% · Op Margin ≥15% · "
-        "D/E &lt;1.0 · Quick &gt;1.0 · FCF positive &amp; growing · P/E &lt;30 · PEG &lt;2.0 "
-        "<br><strong>RecAvg:</strong> 1 = Strong Buy, 5 = Strong Sell · "
-        "<strong>52w Pos:</strong> 0% = at 52-wk low, 100% = at 52-wk high · "
-        "<strong>Insider 90d:</strong> Decision verdict — Supports buy / No signal / Caution · "
-        "<strong>Score:</strong> Composite of Quality 30% · Growth 20% · Value 20% · Analyst 15% · Insider 15% · "
-        "<strong>#F:</strong> Number of filters failed (1 or 2 for near misses)</p>\n"
-    )
-
-    def _render_table(rows: list, is_near_miss: bool) -> str:
-        if not rows:
-            return ""
-        h = "<div class='table-wrap'><table>\n<thead><tr>"
-        h += "<th>Ticker</th><th>Name</th><th>Sector</th>"
-        h += "<th class='num'>Price</th><th class='num'>Target</th>"
-        h += "<th class='num'>Upside</th><th class='num'>52w Pos</th>"
-        h += "<th class='num'>RecAvg</th><th class='num'># Analysts</th>"
-        h += "<th class='num'>Quality</th><th class='num'>Growth</th>"
-        h += "<th class='num'>Value</th><th class='num'>Analyst</th>"
-        h += "<th title='Decision verdict from insider activity. &#10003; Supports buy = real open-market buying with personal cash (rare, strong positive). &mdash; No signal = typical compensation, 10b5-1 plans, or tax-withholds (most mega-caps; ignore). &#9888; Caution = discretionary selling large enough relative to market cap to warrant a closer look before buying.' style='cursor:help;'>Insider 90d <span style='color:#bdc3c7;font-size:10px;'>&#9432;</span></th>"
-        h += "<th class='num' title='Composite of Quality 30% + Growth 20% + Value 20% + Analyst 15% + Insider 15%. Hover any cell for sub-score breakdown.' style='cursor:help;'>Composite <span style='color:var(--fg-faint);font-weight:400;font-size:10px;text-transform:none;letter-spacing:0;'>&#9432;</span></th>"
-        if is_near_miss:
-            h += "<th class='num'>#F</th><th>Failed</th>"
-        h += "</tr></thead><tbody>\n"
-        for r in rows:
-            upside_class = ""
-            if r.upside_pct is not None:
-                upside_class = "pos-up" if r.upside_pct > 0 else "pos-down"
-            failed_list = ""
-            n_failed = 0
-            if is_near_miss:
-                fails = [k for k, v in (r.passes or {}).items() if v is False]
-                n_failed = len(fails)
-                failed_list = ", ".join(fails)
-            h += "<tr>"
-            h += _td(r.ticker, r.ticker, "ticker")
-            h += _td(r.name or r.ticker, r.name or r.ticker)
-            h += _td(r.sector or "—", r.sector or "zzz")
-            h += _td(_fmt_money(r.price), r.price or -1, "num")
-            h += _td(_fmt_money(r.target_mean), r.target_mean or -1, "num")
-            h += _td(_fmt_pct(r.upside_pct, 1, True),
-                     r.upside_pct if r.upside_pct is not None else -1e6,
-                     f"num {upside_class}")
-            h += _td(f"{r.week52_pos:.0f}%" if r.week52_pos is not None else "—",
-                     r.week52_pos if r.week52_pos is not None else -1, "num")
-            h += _td(f"{r.rec_avg:.2f}" if r.rec_avg is not None else "—",
-                     r.rec_avg if r.rec_avg is not None else 99, "num")
-            h += _td(str(r.num_analysts) if r.num_analysts else "—",
-                     r.num_analysts or 0, "num")
-            h += _td(f"{r.score_quality:.0f}" if r.score_quality is not None else "—",
-                     r.score_quality if r.score_quality is not None else -1, "num")
-            h += _td(f"{r.score_growth:.0f}" if r.score_growth is not None else "—",
-                     r.score_growth if r.score_growth is not None else -1, "num")
-            h += _td(f"{r.score_value:.0f}" if r.score_value is not None else "—",
-                     r.score_value if r.score_value is not None else -1, "num")
-            h += _td(f"{r.score_analyst:.0f}" if r.score_analyst is not None else "—",
-                     r.score_analyst if r.score_analyst is not None else -1, "num")
-            h += _td(_insider_cell(getattr(r, 'insider_activity', None)),
-                     getattr(r, 'score_insider', None) if getattr(r, 'score_insider', None) is not None else -1)
-            score_cell = _score_cell(
-                r.score_composite, r.score_quality, r.score_growth,
-                r.score_value, r.score_analyst,
-                getattr(r, 'score_insider', None),
-            )
-            h += _td(score_cell, r.score_composite if r.score_composite is not None else -1, "num")
-            if is_near_miss:
-                h += _td(str(n_failed), n_failed, "num")
-                h += _td(failed_list, failed_list)
-            h += "</tr>\n"
-        h += "</tbody></table></div>\n"
-        return h
-
-    if passed:
-        html += f"<h3 style='margin-top:18px;'>✓ Passed all 9 filters ({len(passed)})</h3>\n"
-        html += _render_table(passed, is_near_miss=False)
-    if near_miss:
-        html += f"<h3 style='margin-top:18px;'>≈ Near misses (failed 1-2) ({len(near_miss)})</h3>\n"
-        html += _render_table(near_miss, is_near_miss=True)
-    return html
 
 
 def _render_ytd_summary(ytd, cfg=None) -> str:
@@ -9625,8 +9516,10 @@ def update_scorecard(
     path: str = scorecard.LOG_FILE,
     fetch=None,
     budget: Optional[int] = None,
+    found: Optional[list[dict]] = None,
 ) -> dict:
-    """Log this run's calls, fetch the closes still missing, and grade every
+    """Log this run's calls and screen additions (`found`, see
+    scorecard.record_found), fetch the closes still missing, and grade every
     matured call. Returns the scorecard (scorecard.build_scorecard).
 
     The first run also recovers the ledger's first-sighting calls, so the
@@ -9640,6 +9533,10 @@ def update_scorecard(
         print(f"[scorecard] Recovered {seeded} first-sighting call(s) from the "
               f"recommendation ledger.")
     logged = scorecard.record_day(log, run_date, scorecard_calls(results, watchlists))
+    n_found = scorecard.record_found(log, run_date, found or [])
+    if n_found:
+        print(f"[scorecard] Logged {n_found} screen addition(s) to grade: "
+              + ", ".join(f"{e['t']} ({e.get('pond') or '?'})" for e in found))
     attach_turned_buy(log, results, watchlists, run_date)
 
     if yahoo_limits.refusals():
@@ -9688,15 +9585,15 @@ def _sc_horizon(sc: dict) -> str:
                 scorecard.HORIZONS[0][0])
 
 
-def _sc_alpha_cell(g: Optional[dict], span: str) -> str:
+def _sc_alpha_cell(g: Optional[dict], span: str, noun: str = "calls") -> str:
     """A table cell: mean return vs the S&P 500, with the share that beat it
-    and the number of calls underneath."""
+    and the number of calls (or `noun`) underneath."""
     if not g or not g.get("n"):
         return ("<td class='num' data-sort=''>"
                 "<span style='color:var(--fg-faint);'>—</span></td>")
     a = g["alpha"]
     cls = "pos-up" if a > 0 else "pos-down" if a < 0 else ""
-    tip = (f"{g['n']} calls. Mean return {g['ret']:+.1f}% over {span}, "
+    tip = (f"{g['n']} {noun}. Mean return {g['ret']:+.1f}% over {span}, "
            f"{a:+.1f} points against the S&P 500; {g['beat']:.0%} beat it.")
     return (f"<td class='num' data-sort='{a:.2f}' title='{_miss_esc(tip)}'>"
             f"<span class='{cls}'>{a:+.1f}%</span>"
@@ -9922,6 +9819,25 @@ def _sc_factor_table(sc: dict) -> str:
             + "</tr></thead><tbody>" + rows + "</tbody></table></div>")
 
 
+def _sc_found_table(sc: dict) -> str:
+    """How the screen's additions did from the day each was added: all of
+    them, by channel once there are several, and by where they were found."""
+    rows = ""
+    for i, (key, label, by_h) in enumerate((sc.get("found") or {}).get("rows")
+                                           or []):
+        name = (f"<em>{_miss_esc(label)}</em>" if key == "all"
+                else f"<strong>{_miss_esc(label)}</strong>")
+        rows += (f"<tr><td data-sort='{i}'>{name}</td>"
+                 + "".join(_sc_alpha_cell(by_h[h], scorecard.HORIZON_NAMES[h],
+                                          "additions")
+                           for h, _ in scorecard.HORIZONS) + "</tr>")
+    if not rows:
+        return ""
+    return ("<div class='table-wrap'><table><thead><tr><th>Added by the screen</th>"
+            + _sc_horizon_ths() + "</tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
 def _render_scorecard_section(sc: Optional[dict]) -> str:
     """The Report Scorecard section: every logged call graded against the S&P
     500 afterwards — by verdict, by score, by base and by input — plus the
@@ -9993,6 +9909,19 @@ def _render_scorecard_section(sc: Optional[dict]) -> str:
                  "names scoring higher on it did better. An input whose sign "
                  "disagrees with the part it plays is working against the "
                  "verdict.</p>\n" + factors)
+    found = sc.get("found") or {}
+    found_table = _sc_found_table(sc)
+    if found.get("n") and found_table:
+        html += h3.format("Where the screen's picks came from")
+        html += (f"<p style='{p_style}'>Every name the daily scan added to the "
+                 f"Screening watchlist ({_sc_plural(found['n'], 'addition')} "
+                 f"since {_fmt_short_date(found['since'])}), graded from the "
+                 "close on the day it was added. The rows split them by the "
+                 "screen that nominated them (the nine filters or the cash-flow "
+                 "screen; a name both nominated counts in each) and by where "
+                 "they were found: the S&amp;P 500/400 the scan used to cover, "
+                 "other US companies, and companies based abroad.</p>\n"
+                 + found_table)
     html += (f"<p style='{p_style}font-size:11px;'>Method: one call per ticker per "
              "day (the day's last run). Entry and exit are official daily closes, "
              "split-adjusted, without dividends, like the S&amp;P 500 index. Daily "
@@ -10113,7 +10042,6 @@ def _portfolio_insights(results: list[PositionAnalysis],
 def generate_html_report(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
-    screening_results: Optional[dict] = None,
     realized_ytd: Optional[dict] = None,
     missed_opportunities: Optional[list[dict]] = None,
     recs_tracked_count: int = 0,
@@ -11577,14 +11505,6 @@ def generate_html_report(
     if report_scorecard is not None:
         html += _render_scorecard_section(report_scorecard)
 
-    # ---------- Screening section (passed-the-screen universe) ----------
-    if screening_results:
-        analyzed = {r.ticker: r for r in results}
-        for items in (watchlists or {}).values():
-            for r in items:
-                analyzed.setdefault(r.ticker, r)
-        html += _render_screening_section(screening_results, analyzed)
-
     # ---------- ETFs & Thematic positions (moved before Tax section) ----------
     if thematics:
         html += "<h2 id='thematic'>ETFs &amp; Thematic Positions</h2>\n"
@@ -13013,9 +12933,14 @@ def main():
                          "e.g. 'AAPL,MSFT,GOOGL'). Skips Robinhood/holdings entirely "
                          "— no auth needed. Useful for quick stock lookups.")
     ap.add_argument("--screen", action="store_true",
-                    help="Run S&P 500/400 screening and add the screening "
-                         "section. The scan runs at most once per market day "
-                         "and is cached in .cache/. Each run spends at most "
+                    help="Screen every profitable US-listed stock over $1B "
+                         "(ADRs included); with --sync-screening-watchlist the "
+                         "best names of its two channels (the nine filters, "
+                         "the cash-flow screen) join the Screening watchlist. "
+                         "The report "
+                         "shows no scan tables, only the names added. The "
+                         "scan runs at most once per market day and is cached "
+                         "in .cache/. Each run spends at most "
                          "SCREEN_REQUEST_BUDGET Yahoo requests on it (default "
                          "1500), so a day's scan completes over the first few "
                          "runs and the rest reuse it.")
@@ -13028,15 +12953,18 @@ def main():
                          "the universe again.")
     ap.add_argument("--sync-screening-watchlist", action="store_true",
                     help=f"When --screen is used and --source is robinhood, "
-                         f"append the scan's best passers to the "
+                         f"append the best names of the scan's two channels "
+                         f"to the "
                          f"'{SCREEN_WATCHLIST}' watchlist in Robinhood "
                          f"(read-write) and analyze them in the same run. "
                          f"Append-only: removal is --prune-watchlists' job, "
                          f"and a name it pruned is not re-added for "
                          f"{SCREEN_READD_COOLDOWN_DAYS} days.")
     ap.add_argument("--screen-add-limit", type=int, default=25,
-                    help="Most names one scan may add to the watchlist, "
-                         "highest composite first (default 25). Every added "
+                    help="Most names one scan may add to the watchlist "
+                         "(default 25), split evenly between the nine-filter "
+                         "and cash-flow channels, highest Composite first "
+                         "within each. Every added "
                          "name is analyzed on every later run, so this is the "
                          "knob that bounds run time.")
     ap.add_argument("--sync-dry-run", action="store_true",
@@ -13410,7 +13338,7 @@ def main():
             if analyzed_items:
                 watchlists_analyzed[wl_name] = analyzed_items
 
-    # ---------- Optional: screen the S&P 500/400 universe ----------
+    # ---------- Optional: screen the US market ----------
     # Runs after the holdings and watchlists are analyzed, so they always get
     # the runner's Yahoo allowance first. A runner that refuses partway through
     # the scan stays blocked for minutes, and on 2026-10-06 the holdings
@@ -13418,36 +13346,46 @@ def main():
     # scan adds to the Screening watchlist are analyzed straight away, so they
     # still show in this run's report.
     screening_results = None
+    # The names the scan added to the Screening watchlist this run, for the
+    # scorecard to grade by where they were found.
+    screen_found: list[dict] = []
     if args.screen:
         try:
             import screener as scr
             print("\n" + "=" * 60)
-            print("S&P 500/400 screen (scans once per market day)")
+            print("US market screen (scans once per market day)")
             print("=" * 60)
             screening_results = scr.screen_universe(
                 score_screen_shortlist, limit=args.screen_limit,
                 force=args.rescan, verbose=True)
-            passed = screening_results["passed"]
+        except Exception as e:
+            print(f"[screen] Error: {e}")
+    if screening_results:
+        try:
+            channels = scr.channel_candidates(screening_results)
             pending = screening_results.get("pending") or 0
-            print(f"[screen] Passed: {len(passed)}  "
-                  f"Near-miss: {len(screening_results['near_miss'])}"
+            print(f"[screen] Passed: {len(channels['quality'])}  "
+                  f"Near-miss: {len(screening_results['near_miss'])}  "
+                  f"Cash-flow: {len(channels['fcf'])}"
                   + (f"  Still to screen: {pending}" if pending else ""))
+            by_ticker = {r.ticker: r for rows in channels.values() for r in rows}
 
-            # Append the best passers to the Screening watchlist, then put them
-            # straight into this run's universe. Pruning removes them again
-            # once their verdict decays, so the list maintains itself.
+            # Append each channel's best names to the Screening watchlist, then
+            # put them straight into this run's universe. Pruning removes them
+            # again once their verdict decays, so the list maintains itself.
             syncing = (args.sync_screening_watchlist
                        and args.source == "robinhood")
             if syncing and screening_results["universe_size"] < MIN_SCREEN_UNIVERSE:
                 syncing = False
                 print(f"[screen] Only {screening_results['universe_size']} "
-                      f"tickers in the universe — the Wikipedia fetch fell back "
-                      f"to its mega-cap sample. Not touching the "
-                      f"'{SCREEN_WATCHLIST}' watchlist on a partial scan.")
+                      f"tickers in the universe — Yahoo's screener and the "
+                      f"S&P list both failed, leaving the mega-cap sample. Not "
+                      f"touching the '{SCREEN_WATCHLIST}' watchlist on a "
+                      f"partial scan.")
             if syncing:
                 import robinhood_source as rhs
-                adds, skipped = select_screen_additions(
-                    passed,
+                adds, skipped, tags = select_screen_additions(
+                    channels,
                     held_tickers={r["ticker"] for r in rows},
                     history=_prior_history,
                     limit=args.screen_add_limit,
@@ -13455,6 +13393,10 @@ def main():
                 )
                 for t, why in skipped.items():
                     print(f"[screen] skip {t}: {why}")
+                for ch in scr.CHANNELS:
+                    picked = [t for t in adds if ch in tags[t]]
+                    print(f"[screen] {ch} channel picks ({len(picked)}): "
+                          f"{', '.join(picked) or 'none'}")
                 if not adds:
                     print("[screen] Nothing new to add to the "
                           f"'{SCREEN_WATCHLIST}' watchlist.")
@@ -13470,11 +13412,15 @@ def main():
                               f"Robinhood — create it in the app and the scan "
                               f"will fill it.")
                     landed = res["to_add"] if args.sync_dry_run else res["added"]
+                    if not args.sync_dry_run:
+                        screen_found = [{"t": t, "ch": tags[t],
+                                         "pond": scr.pond(by_ticker[t])}
+                                        for t in landed if t in tags]
                     if landed and screening_results.get("refused"):
                         print(f"[screen] Yahoo is refusing this runner; "
                               f"{', '.join(landed)} will be analyzed next run.")
                     elif landed:
-                        names = {r.ticker: (r.name or r.ticker) for r in passed}
+                        names = {t: (r.name or t) for t, r in by_ticker.items()}
                         print(f"[screen] Analyzing {len(landed)} newly screened "
                               f"name(s) in this run: {', '.join(landed)}")
                         add_screened_names(
@@ -13584,7 +13530,8 @@ def main():
     try:
         report_scorecard = update_scorecard(
             results, watchlists_analyzed or None, _prior_history,
-            run_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat())
+            run_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+            found=screen_found)
     except Exception as e:
         print(f"[scorecard] Skipped: {e}")
 
@@ -13712,7 +13659,6 @@ def main():
 
     html = generate_html_report(
         results, watchlists=watchlists_analyzed or None,
-        screening_results=screening_results,
         realized_ytd=realized_ytd,   # None unless --tax populated it
         missed_opportunities=missed_opportunities,
         recs_tracked_count=recs_tracked_count,

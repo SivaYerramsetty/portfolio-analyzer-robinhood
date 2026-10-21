@@ -18,7 +18,7 @@ on:
         type: boolean
         default: false
       rescan:
-        description: "Re-run the S&P 500/400 screen even if today's scan is already cached (the first run of each market day scans anyway)"
+        description: "Re-run the US market screen even if today's scan is already cached (the first run of each market day scans anyway)"
         type: boolean
         default: false
       base_score_mode:
@@ -109,8 +109,8 @@ jobs:
     # A stale session used to leave robin_stocks polling for a device
     # approval for ~25 min before Robinhood rate-limited it. The code now
     # fails fast instead, but cap the job as a backstop. The headroom over a
-    # normal ~10-min run is for the first run of each market day, which pays
-    # for the S&P 500/400 scan before the rest of the day reads its cache.
+    # normal ~10-min run is for the first runs of each market day, which pay
+    # for the US market scan before the rest of the day reads its cache.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -137,7 +137,7 @@ jobs:
           restore-keys: robinhood-session-
 
       # .cache holds instrument-URL -> ticker mappings (never change), SEC
-      # insider-scan results (12h TTL) and the day's S&P 500/400 screen —
+      # insider-scan results (12h TTL) and the day's US market screen —
       # carrying them across runs skips hundreds of rate-gated SEC requests and
       # keeps the universe scan to once per market day. run_id keying means each
       # run saves a fresh copy; restore-keys picks up the most recent previous one.
@@ -241,11 +241,14 @@ jobs:
           case "${{ inputs.base_score_mode }}" in
             composite|quality|blend) BASE_FLAG="--base-score ${{ inputs.base_score_mode }}" ;;
           esac
-          # --screen scans the S&P 500/400 once per market day (the result is
-          # cached in .cache/, which rides the Actions cache), appends the best
-          # passers to the "Screening" watchlist and analyzes them the same
-          # run. --prune-watchlists is the other half: it removes them again
-          # when the verdict decays, so the list needs no hand-curation.
+          # --screen scans every profitable US-listed stock over $1B (ADRs
+          # included) once per market day, spread over the first ~7 runs (the
+          # result is cached in .cache/, which rides the Actions cache),
+          # appends the best names of its two channels (the nine filters and
+          # the cash-flow screen) to the "Screening" watchlist and analyzes
+          # them the same run. --prune-watchlists is the other half: it
+          # removes them again when the verdict decays, so the list needs no
+          # hand-curation.
           RESCAN_FLAG=""
           if [ "${{ inputs.rescan }}" = "true" ]; then RESCAN_FLAG="--rescan"; fi
           python analyze_portfolio.py \
