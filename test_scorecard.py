@@ -135,6 +135,10 @@ def test_compact_factors() -> None:
                              news_score=0.4567)
     check(got, {"q": 58.8, "g": 9.6, "w52": 91.0, "sm": -1, "n": 0.46},
           "mapped, rounded, None and unmapped keys dropped")
+    check(sc.compact_factors({"share_count_pct": -2.13, "buyback_base": 88.04}),
+          {"sc": -2.1, "bb": 88.0},
+          "the Buyback base and its share-count half are graded too (in percent, "
+          "so the rounding keeps a 2% buyback)")
     check(sc.compact_factors(None), {}, "no factors, no keys")
 
 
@@ -740,12 +744,13 @@ def test_attach_turned_buy() -> None:
     from test_base_score_mode import _render_report, _row_attrs
     all_pass = [1.0] * 9
     with _mode_env():
-        held = _scored("AAA", 85, all_pass, upside_pct=20.0)
-        other = _scored("BBB", 85, all_pass, upside_pct=20.0)
+        # All three buy back shares too, so the Buyback base agrees.
+        held = _scored("AAA", 85, all_pass, upside_pct=20.0, share_count_change=-0.02)
+        other = _scored("BBB", 85, all_pass, upside_pct=20.0, share_count_change=-0.02)
         # Twelve equal positions: under 10% each, so no size penalty.
         book = [held, other, *(_scored(f"F{i}", 65, all_pass) for i in range(10))]
         watched = _scored("WWW", 85, all_pass, shares=0, value=0.0,
-                          upside_pct=20.0)
+                          upside_pct=20.0, share_count_change=-0.02)
         # As in main(): the size overlay lands before the scorecard runs.
         ap.finalize_holding_verdicts(book)
     modes = ap.BASE_SCORE_MODES
