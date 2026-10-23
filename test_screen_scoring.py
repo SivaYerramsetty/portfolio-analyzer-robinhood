@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -463,6 +464,37 @@ def test_growth_cache_guard() -> None:
               "only the name fetched cleanly is cached")
 
 
+def test_growth_cache_version() -> None:
+    section("_compute_growth_cached: an entry from an older version refreshes once")
+    fetched = []
+
+    def fake(tkr, info):
+        fetched.append(info["symbol"])
+        info["shareCountChange"] = -0.02
+
+    fresh = time.time() - 3600                          # well inside the TTL
+    cache = {
+        "OLD": {"ts": fresh, "metrics": {"revenueCAGR3y": 0.2}},   # no stamp
+        "NEW": {"ts": fresh, "v": ap._FUND_CACHE_VERSION,
+                "metrics": {"revenueCAGR3y": 0.2, "shareCountChange": -0.03}},
+    }
+    with tempfile.TemporaryDirectory() as d, \
+            patched(ap, _fund_cache=cache, _fund_cache_dirty=False,
+                    _FUNDAMENTALS_CACHE_PATH=Path(d) / "f.json",
+                    _compute_multi_year_growth=fake):
+        old, new = {"symbol": "OLD"}, {"symbol": "NEW"}
+        ap._compute_growth_cached(None, old, "OLD")
+        ap._compute_growth_cached(None, new, "NEW")
+        check(fetched, ["OLD"], "the unstamped entry is refetched; the current one is a hit")
+        check((old.get("shareCountChange"), new.get("shareCountChange")), (-0.02, -0.03),
+              "so both names get the new metric on this run")
+        check(ap._fund_cache["OLD"].get("v"), ap._FUND_CACHE_VERSION,
+              "and the refetched entry is stamped, so it isn't refetched again")
+        again = {"symbol": "OLD"}
+        ap._compute_growth_cached(None, again, "OLD")
+        check(fetched, ["OLD"], "the next run reads it from the cache")
+
+
 # ----------------------------------------------- 4. the scan and its cache ----
 
 def _fake_scorer(verdicts: dict, scored: list):
@@ -841,7 +873,8 @@ def main() -> int:
     for t in (test_rate_limit_detection, test_budget, test_run_gated,
               test_quote_summary, test_prefilter_one, test_prefilter_universe,
               test_scorer_matches_the_holding, test_scorer_refusals,
-              test_growth_cache_guard, test_fcf_eligible,
+              test_growth_cache_guard, test_growth_cache_version,
+              test_fcf_eligible,
               test_fcf_yield_currency,
               test_fetch_us_universe,
               test_fetch_universe_fallback, test_screen_universe,

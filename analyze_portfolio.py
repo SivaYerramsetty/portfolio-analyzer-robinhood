@@ -2574,6 +2574,12 @@ _GROWTH_METRIC_KEYS = (
     "fcfConsistency", "fcfConsistencyLookback",
     "shareCountChange",
 )
+# Stamped on every entry. Bump it when a metric joins _GROWTH_METRIC_KEYS:
+# entries written before then lack the metric and would serve that gap until
+# their TTL ran out (a day, or a whole weekend with no scheduled runs). An
+# entry with another stamp is refetched once, like an expired one — about
+# three statement requests a name. 2: shareCountChange, for the Buyback base.
+_FUND_CACHE_VERSION = 2
 _fund_cache_lock = threading.Lock()
 _fund_cache: Optional[dict] = None
 _fund_cache_dirty = False          # True once a miss adds/updates an entry
@@ -2635,7 +2641,8 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
     if ttl > 0:
         with _fund_cache_lock:
             entry = _load_fund_cache().get(ticker)
-        if entry and (time.time() - entry.get("ts", 0)) < ttl * 3600:
+        if (entry and entry.get("v") == _FUND_CACHE_VERSION
+                and (time.time() - entry.get("ts", 0)) < ttl * 3600):
             for k, v in (entry.get("metrics") or {}).items():
                 info[k] = v
             with _fund_cache_lock:
@@ -2652,6 +2659,7 @@ def _compute_growth_cached(tkr, info: dict, ticker: str) -> None:
             _fund_misses += 1
             if not refused:
                 _load_fund_cache()[ticker] = {"ts": time.time(),
+                                              "v": _FUND_CACHE_VERSION,
                                               "metrics": metrics}
                 _fund_cache_dirty = True
 
