@@ -2461,6 +2461,24 @@ def _compute_multi_year_growth(tkr, info: dict) -> None:
                 info["earningsCAGR3y"] = cagr
                 info["earningsGrowthLookback"] = f"{n_years}yr CAGR"
 
+        # ---- Share count change: latest year's diluted shares vs the prior year ----
+        # The Buyback base's second half. The two newest columns are taken as
+        # they stand (not via usable_series, which would close up a missing
+        # year and compare years two apart). Yahoo's annual counts are
+        # split-adjusted; a ratio outside BUYBACK_SHARE_RATIO_BOUNDS is left
+        # unset rather than scored.
+        for label in ("Diluted Average Shares", "DilutedAverageShares"):
+            if label in stmt.index:
+                try:   # fewer than two years, or a non-number: no reading
+                    now, prior = (float(v) for v in stmt.loc[label].values[:2])
+                except (TypeError, ValueError):
+                    break
+                lo, hi = BUYBACK_SHARE_RATIO_BOUNDS
+                if (now == now and prior == prior        # not NaN
+                        and now > 0 and prior > 0 and lo <= now / prior <= hi):
+                    info["shareCountChange"] = now / prior - 1.0
+                break
+
         # ---- Operating Margin: 3-year ARITHMETIC AVERAGE ----
         # Op margin = OperatingIncome / Revenue per year, averaged over N years.
         # Why average (not CAGR): margins are ratios, not compounded values —
@@ -2554,6 +2572,7 @@ _GROWTH_METRIC_KEYS = (
     "operatingMarginAvg3y", "operatingMarginLookback",
     "roeAvg3y", "roeLookback",
     "fcfConsistency", "fcfConsistencyLookback",
+    "shareCountChange",
 )
 _fund_cache_lock = threading.Lock()
 _fund_cache: Optional[dict] = None
@@ -3030,14 +3049,34 @@ TAX_FLAG_SCORE_THRESHOLD = 75
 #   quality   — the nine quality filters (soft-gated) at 70%, plus the same
 #               analyst and insider sub-scores the composite uses, at 15% each.
 #   blend     — the average of the composite and quality bases.
+#   buyback   — revenue growth >=10% AND a shrinking share count, as one gate,
+#               at 70%, plus the same analyst and insider sub-scores at 15%
+#               each. See compute_buyback_base.
 # Analyst and insider carry 15% each in every mode, so switching changes only
 # how the fundamentals are measured. Chosen by --base-score, else the
 # BASE_SCORE_MODE env var — a repository variable in CI, so scheduled runs
 # (which dispatch without inputs) follow the saved choice too.
-BASE_SCORE_BASES = ("composite", "quality", "blend")
+BASE_SCORE_BASES = ("composite", "quality", "blend", "buyback")
 BASE_SCORE_BASE_LABELS = {"composite": "Composite", "quality": "Quality",
-                          "blend": "Blend"}
+                          "blend": "Blend", "buyback": "Buyback"}
 QUALITY_BASE_WEIGHTS = {"filters": 0.70, "analyst": 0.15, "insider": 0.15}
+
+# ---- Buyback base ----
+# A 13-year point-in-time test (formation each June 2013-2025, ~1,000 US
+# profitable $1B+ names a year, SEC filings as filed) found one combination
+# that held up out of sample: revenue growth >=10% a year plus diluted shares
+# down 1%+ on the year. It beat the average name by ~3.8% a year in 11 of 13
+# years. Either half alone did about average and neither half did ~1% worse,
+# so the gate is an AND (the two credits multiply) and a miss scores a
+# neutral 50, not a sell: failing the rule is no evidence of a loser.
+BUYBACK_BASE_WEIGHTS = {"rule": 0.70, "analyst": 0.15, "insider": 0.15}
+# Share credit: full at a 1% shrink or more, none at 1% growth or more, linear
+# in between (a flat count earns half).
+BUYBACK_SHARES_FULL = -0.01
+BUYBACK_SHARES_NONE = 0.01
+# A year-on-year share-count ratio outside these bounds is read as a data
+# error (a split Yahoo did not adjust), not as a buyback or an issue.
+BUYBACK_SHARE_RATIO_BOUNDS = (0.67, 1.5)
 
 # ---- Calibration (switchable, orthogonal to the base) ----
 # A second axis on top of the base: which *calibration* of the sub-scores and
@@ -3423,6 +3462,64 @@ def compute_quality_base(pa) -> None:
             pa.quality_base_cal, pa.quality_coverage_cal = base, cov
 
 
+def _revenue_filter(filters: Optional[list]) -> Optional[FilterResult]:
+    """The nine filters' revenue-growth gate, which the Buyback base shares."""
+    return next((f for f in filters or () if f.name.startswith("Revenue growth")),
+                None)
+
+
+def buyback_share_credit(change: Optional[float]) -> Optional[float]:
+    """0-1 credit for a year-on-year share-count change (0.02 = 2% more
+    shares): 1 at BUYBACK_SHARES_FULL or below, 0 at BUYBACK_SHARES_NONE or
+    above, linear in between. None without a reading."""
+    if change is None:
+        return None
+    return _clip01((BUYBACK_SHARES_NONE - change)
+                   / (BUYBACK_SHARES_NONE - BUYBACK_SHARES_FULL))
+
+
+def compute_buyback_base(pa) -> None:
+    """Populate the `buyback` base-score mode's inputs on `pa`.
+
+    buyback_score is the rule: 50 + 50 x (revenue credit x share credit), so
+    a name that clears both halves scores 100 and one that misses either sits
+    at a neutral 50 (see BUYBACK_BASE_WEIGHTS for why a miss isn't a sell).
+    The revenue credit is the nine filters' revenue gate, near misses and
+    all; a half without data counts as a miss and costs its share of the
+    rule's coverage. buyback_base / buyback_coverage: the rule at 70% plus
+    the analyst and insider sub-scores at 15% each, re-normalized over what's
+    available, like the quality base. Needs compute_composite_score first."""
+    rev = _revenue_filter(pa.filters)
+    rev_credit = rev.credit if rev else None
+    share_credit = buyback_share_credit(pa.share_count_change)
+    halves = [c for c in (rev_credit, share_credit) if c is not None]
+    rule = (rev_credit or 0.0) * (share_credit or 0.0)
+    pa.buyback_score = round(50 + 50 * rule, 1)
+    rule_share = len(halves) / 2
+    for cal, insider_score_v in (("std", pa.score_insider),
+                                 ("cal", pa.score_insider_cal)):
+        parts = (
+            ("rule", pa.buyback_score, rule_share),
+            ("analyst", pa.score_analyst, 1.0),
+            ("insider", insider_score_v, 1.0),
+        )
+        if not halves and pa.score_analyst is None and insider_score_v is None:
+            continue    # nothing at all to go on: no base, like the quality one
+        weighted_sum = weight_total = coverage = 0.0
+        for key, val, data_share in parts:
+            if val is None:
+                continue
+            w = BUYBACK_BASE_WEIGHTS[key]
+            weighted_sum += val * w
+            weight_total += w
+            coverage += w * data_share
+        base, cov = round(weighted_sum / weight_total, 1), round(coverage, 3)
+        if cal == "std":
+            pa.buyback_base, pa.buyback_coverage = base, cov
+        else:
+            pa.buyback_base_cal, pa.buyback_coverage_cal = base, cov
+
+
 def apply_context_adjustments(pa) -> None:
     """
     Light, transparent verdict adjustment using sector momentum + 52-week range.
@@ -3574,6 +3671,9 @@ def compute_verdict_v2(
     filter_score: Optional[float] = None,
     score_analyst: Optional[float] = None,
     score_insider: Optional[float] = None,
+    buyback_base: Optional[float] = None,
+    buyback_coverage: Optional[float] = None,
+    share_count_change: Optional[float] = None,
     days_to_earnings: Optional[int] = None,
     prior_label: Optional[str] = None,
 ) -> Verdict:
@@ -3584,14 +3684,17 @@ def compute_verdict_v2(
     It starts from a fundamentals base chosen by `base_mode` (see
     BASE_SCORE_MODES): the Composite Score (quality, growth, valuation *level*,
     analyst quality, insider activity), the quality base (the nine filters plus
-    the same analyst and insider sub-scores), or the blend of the two. On top
+    the same analyst and insider sub-scores), the blend of the two, or the
+    buyback base (revenue growth and a shrinking share count as one gate,
+    plus the same analyst and insider sub-scores). On top
     of it we apply small modifiers ONLY for signals the base does NOT already
     contain: trend, sector momentum, 52-week position, upside-to-analyst-target,
     recent news, and portfolio concentration.
 
     `coverage` is the composite's data coverage; `quality_coverage` the quality
-    base's. The mode picks which one drives confidence. `filter_score`,
-    `score_analyst` and `score_insider` only label the quality base's parts in
+    base's, `buyback_coverage` the buyback base's. The mode picks which one
+    drives confidence. `filter_score`, `score_analyst`, `score_insider` and
+    `share_count_change` only label the quality and buyback bases' parts in
     the breakdown.
 
     No double-counting: quality, analyst and insider already live in every base
@@ -3624,6 +3727,8 @@ def compute_verdict_v2(
         quality_base=quality_base, quality_coverage=quality_coverage,
         filters=filters, filter_score=filter_score,
         score_analyst=score_analyst, score_insider=score_insider,
+        buyback_base=buyback_base, buyback_coverage=buyback_coverage,
+        share_count_change=share_count_change,
     )
     # Nothing to build the base from — fall back to mid-neutral.
     base = 50.0 if base_value is None else float(base_value)
@@ -3928,16 +4033,27 @@ def _verdict_base(
     filter_score: Optional[float],
     score_analyst: Optional[float],
     score_insider: Optional[float],
+    buyback_base: Optional[float] = None,
+    buyback_coverage: Optional[float] = None,
+    share_count_change: Optional[float] = None,
 ) -> tuple[Optional[float], Optional[float], str]:
     """Pick compute_verdict_v2's starting score for a base-score mode.
 
     Returns (base, coverage, breakdown line). base is None when the mode has
     nothing to build from; the line is the first row of the hover breakdown
     (the card parser takes the first non-±N segment as the base). Anything but
-    quality/blend is treated as composite. `calibrated` only labels the line —
-    the caller has already passed the matching calibration's values — so the
-    hover never shows two different numbers under the same name."""
+    quality/blend/buyback is treated as composite. `calibrated` only labels the
+    line — the caller has already passed the matching calibration's values —
+    so the hover never shows two different numbers under the same name."""
     tag = " (recalibrated)" if calibrated else ""
+    if mode == "buyback":
+        if buyback_base is None:
+            return None, buyback_coverage, "Buyback base unavailable, neutral baseline"
+        detail = _buyback_base_detail(filters, share_count_change, score_analyst,
+                                      score_insider, calibrated=calibrated)
+        return (buyback_base, buyback_coverage,
+                f"Buyback base{tag} {buyback_base:.0f} — {detail}")
+
     if mode == "quality":
         if quality_base is None:
             return None, quality_coverage, "Quality base unavailable, neutral baseline"
@@ -3986,7 +4102,15 @@ def _quality_base_detail(filters: Optional[list], filter_score: Optional[float],
         if no_data:
             note += f", {no_data} without data"
         parts = [f"filters {filter_score:.0f} ({note})"]
-    parts.append("analyst n/a" if score_analyst is None else f"analyst {score_analyst:.0f}")
+    return ", ".join(parts + _analyst_insider_parts(score_analyst, score_insider,
+                                                    calibrated))
+
+
+def _analyst_insider_parts(score_analyst: Optional[float],
+                           score_insider: Optional[float],
+                           calibrated: bool) -> list[str]:
+    """The analyst and insider parts every non-composite base line ends with."""
+    parts = ["analyst n/a" if score_analyst is None else f"analyst {score_analyst:.0f}"]
     if score_insider is not None:
         parts.append(f"insider {score_insider:.0f}")
     else:
@@ -3995,7 +4119,31 @@ def _quality_base_detail(filters: Optional[list], filter_score: Optional[float],
         # weight renormalized away rather than scoring a misleading number.
         parts.append("insider not scored (no signal)" if calibrated
                      else "insider n/a")
-    return ", ".join(parts)
+    return parts
+
+
+def _buyback_base_detail(filters: Optional[list],
+                         share_count_change: Optional[float],
+                         score_analyst: Optional[float],
+                         score_insider: Optional[float],
+                         calibrated: bool = False) -> str:
+    """The parts of a buyback base for its breakdown line, e.g.
+    'revenue +14%/yr (3yr CAGR), shares -2.1% on the year: rule met,
+    analyst 70, insider 48'."""
+    rev = _revenue_filter(filters)
+    if rev is None or rev.actual is None:
+        rev_part = "revenue growth n/a"
+    else:
+        rev_part = f"revenue {rev.actual:+.0f}%/yr" + (f" ({rev.note})" if rev.note else "")
+    share_part = ("share count n/a" if share_count_change is None
+                  else f"shares {share_count_change * 100:+.1f}% on the year")
+    rule = (rev.credit if rev and rev.credit is not None else 0.0) * (
+        buyback_share_credit(share_count_change) or 0.0)
+    outcome = ("rule met" if rule >= 1 else "rule partly met" if rule > 0
+               else "rule missed, so neutral")
+    return ", ".join([f"{rev_part}, {share_part}: {outcome}"]
+                     + _analyst_insider_parts(score_analyst, score_insider,
+                                              calibrated))
 
 
 def _insider_signal(pa) -> Optional[str]:
@@ -4023,11 +4171,15 @@ def _calibration_inputs(pa, calibration: str) -> dict:
                 "coverage": pa.composite_coverage_cal,
                 "quality_base": pa.quality_base_cal,
                 "quality_coverage": pa.quality_coverage_cal,
+                "buyback_base": pa.buyback_base_cal,
+                "buyback_coverage": pa.buyback_coverage_cal,
                 "score_insider": pa.score_insider_cal}
     return {"composite_score": pa.composite_score,
             "coverage": pa.composite_coverage,
             "quality_base": pa.quality_base,
             "quality_coverage": pa.quality_coverage,
+            "buyback_base": pa.buyback_base,
+            "buyback_coverage": pa.buyback_coverage,
             "score_insider": pa.score_insider}
 
 
@@ -4040,6 +4192,8 @@ def has_verdict_base(pa, mode: str) -> bool:
     if base == "blend":
         return (vals["composite_score"] is not None
                 or vals["quality_base"] is not None)
+    if base == "buyback":
+        return vals["buyback_base"] is not None
     return vals["composite_score"] is not None
 
 
@@ -4137,6 +4291,9 @@ def _verdict_v2_under(pa, mode: str, is_holding: bool,
         filter_score=pa.filter_score,
         score_analyst=pa.score_analyst,
         score_insider=vals["score_insider"],
+        buyback_base=vals["buyback_base"],
+        buyback_coverage=vals["buyback_coverage"],
+        share_count_change=pa.share_count_change,
         days_to_earnings=pa.days_to_earnings,
         prior_label=prior_verdict_label(pa.ticker, mode),
     )
@@ -4515,6 +4672,14 @@ class PositionAnalysis:
     filter_coverage: Optional[float] = None
     quality_base: Optional[float] = None
     quality_coverage: Optional[float] = None
+    # `buyback` base-score mode inputs (compute_buyback_base): the latest
+    # year's diluted share-count change (0.02 = 2% more shares), the rule as a
+    # 50-100 score, and the mode's base (rule 70%, analyst 15%, insider 15%) +
+    # its coverage.
+    share_count_change: Optional[float] = None
+    buyback_score: Optional[float] = None
+    buyback_base: Optional[float] = None
+    buyback_coverage: Optional[float] = None
     # Recalibrated twins of the two sub-scores the calibration changes, and of
     # every base built from them (see CALIBRATIONS). Held alongside the
     # standard values rather than replacing them so one run can score both and
@@ -4527,6 +4692,8 @@ class PositionAnalysis:
     composite_coverage_cal: Optional[float] = None
     quality_base_cal: Optional[float] = None
     quality_coverage_cal: Optional[float] = None
+    buyback_base_cal: Optional[float] = None
+    buyback_coverage_cal: Optional[float] = None
     # Next earnings report (event-risk timing): ISO date + days from today.
     # days_to_earnings is forward-only (None once a report is in the past).
     next_earnings_date: Optional[str] = None
@@ -4930,6 +5097,7 @@ def analyze_position(
 
         if pa.bucket == "compounder":
             pa.filters = apply_quality_filters(info)
+            pa.share_count_change = _safe_get(info, "shareCountChange")
             # Compute a preliminary verdict using the older logic. This is
             # used as a fallback if the v2 evidence-weighted logic can't run
             # (e.g. composite score unavailable for some reason).
@@ -4960,9 +5128,11 @@ def analyze_position(
 
         # Composite scoring (now includes insider as 5th sub-score)
         compute_composite_score(pa, info)
-        # Quality base-score mode (nine filters + the analyst/insider above)
+        # Quality and Buyback base-score modes (their gates + the
+        # analyst/insider above)
         if pa.bucket == "compounder":
             compute_quality_base(pa)
+            compute_buyback_base(pa)
 
         # ---- Evidence-weighted v2 verdict (replaces the preliminary one above) ----
         # Run for compounders (both held and watchlist). The v2 logic uses every
@@ -5454,6 +5624,11 @@ _BASE_SCORE_BLURBS = {
     "quality": "the nine quality filters (70%; near misses earn partial "
                "credit) plus the analyst (15%) and insider (15%) scores",
     "blend": "the average of the Composite and Quality bases",
+    "buyback": "one rule at 70%: revenue growth of 10%+ a year AND a shrinking "
+               "share count (diluted shares down 1%+ on the year), plus the "
+               "analyst (15%) and insider (15%) scores. A name that misses "
+               "either half sits at a neutral 50, not a sell. In a 13-year "
+               "test the rule beat the average stock by 3.8% a year",
 }
 
 _CALIBRATION_BLURBS = {
@@ -5656,7 +5831,11 @@ def _build_refresh_widget() -> tuple[str, str]:
     function sync() {
       var mode = viewed();
       btn.hidden = !BASE_LABELS[mode] || mode === sw.getAttribute("data-saved");
-      btn.textContent = "\\u2605 Make " + (BASE_LABELS[mode] || "") + " default";
+      // The pressed switch already names the mode, so the label stays short
+      // and the controls keep to one line in a ~1,180px window; the tooltip
+      // spells the mode out.
+      btn.title = "Make " + (BASE_LABELS[mode] || "") + " the default for "
+                + "scheduled runs";
     }
     function markSaved(mode) {
       sw.setAttribute("data-saved", mode);
@@ -6171,10 +6350,10 @@ def _confidence_attr(v: Optional[Verdict]) -> str:
 
 
 def _base_agreement(r, mode: str) -> str:
-    """The Across bases filter value under `mode`: 'agree' when Composite,
-    Quality and Blend give r the same verdict at that mode's calibration (the
-    Base switch wouldn't change it), 'split' when they don't, '' for rows
-    without per-mode verdicts (ETF/thematic)."""
+    """The Across bases filter value under `mode`: 'agree' when every base
+    (Composite, Quality, Blend, Buyback) gives r the same verdict at that
+    mode's calibration (the Base switch wouldn't change it), 'split' when they
+    don't, '' for rows without per-mode verdicts (ETF/thematic)."""
     _, cal = split_base_mode(mode)
     verdicts = [(getattr(r, "verdicts", None) or {}).get(join_base_mode(b, cal))
                 for b in BASE_SCORE_BASES]
@@ -7772,6 +7951,12 @@ def _rec_factors(r: PositionAnalysis) -> dict:
         "filter_coverage": _r(r.filter_coverage, 3),
         "quality_base": _r(r.quality_base, 1),
         "quality_coverage": _r(r.quality_coverage, 3),
+        # Buyback base-score mode inputs (the share-count change in percent,
+        # so the scorecard's one-decimal rounding keeps it)
+        "share_count_pct": (_r(r.share_count_change * 100, 2)
+                            if r.share_count_change is not None else None),
+        "buyback_base": _r(r.buyback_base, 1),
+        "buyback_base_cal": _r(r.buyback_base_cal, 1),
         "base_mode": (r.verdict.base_mode if r.verdict else None),
         "verdicts": ({m: [v.label, _r(v.score, 1)] for m, v in r.verdicts.items()}
                      or None),
@@ -10573,7 +10758,9 @@ def generate_html_report(
                   font-size: 12px; font-weight: 600; }}
   .base-switch-label {{ color: var(--fg-muted); margin-right: 4px; cursor: help;
                         white-space: nowrap; }}
-  .base-switch button {{ height: 26px; padding: 0 10px; border: 0;
+  /* 8px sides: with four bases, the controls row fits on one line in a
+     ~1,180px window even while "Make default" shows. */
+  .base-switch button {{ height: 26px; padding: 0 8px; border: 0;
                          border-radius: 13px; background: transparent;
                          color: var(--fg-body); font: inherit; cursor: pointer;
                          transition: background 0.2s; }}
@@ -10588,7 +10775,10 @@ def generate_html_report(
 {base_view_css}
   @media (max-width: 560px) {{
     .base-switch-label {{ display: none; }}
-    .base-switch {{ padding-left: 3px; }}
+    /* Capped at the row's width so the buttons wrap inside the pill instead
+       of pushing the page sideways (flex: none alone sizes it to its
+       content: ~460px with four bases). */
+    .base-switch {{ padding-left: 3px; max-width: 100%; }}
     .base-switch-sep {{ margin: 0 3px; }}
   }}
   .refresh-status {{ font-size: 12px; color: var(--fg-muted);

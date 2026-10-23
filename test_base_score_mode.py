@@ -87,11 +87,12 @@ def _credits(info: dict) -> dict:
 
 
 def _filters(credits: list, passed: int | None = None) -> list:
-    """FilterResults carrying the given credits; the first `passed` pass."""
+    """FilterResults carrying the given credits; the first `passed` pass. The
+    first is named as the revenue gate, which the Buyback base reads."""
     if passed is None:
         passed = sum(1 for c in credits if c == 1.0)
-    return [ap.FilterResult(name=f"f{i}", passed=i < passed, actual=1.0,
-                            threshold="x", credit=c)
+    return [ap.FilterResult(name="Revenue growth >=10%" if i == 0 else f"f{i}",
+                            passed=i < passed, actual=1.0, threshold="x", credit=c)
             for i, c in enumerate(credits)]
 
 
@@ -224,6 +225,102 @@ def test_quality_base() -> None:
           "no inputs at all means no quality base")
 
 
+# --------------------------------------------------------- 2b. buyback base ----
+
+def _rev_filter(credit, actual=14.0, note="3yr CAGR") -> ap.FilterResult:
+    """The nine filters' revenue gate, which the Buyback base reads."""
+    return ap.FilterResult(name="Revenue growth >=10%", passed=credit == 1.0,
+                           actual=actual, threshold=">= 10%", note=note,
+                           credit=credit)
+
+
+class _Statements:
+    """Just enough of a yfinance Ticker for _compute_multi_year_growth: an
+    income statement whose newest year comes first."""
+
+    def __init__(self, shares: list):
+        import pandas as pd
+        cols = pd.to_datetime([f"{2025 - i}-12-31" for i in range(len(shares))])
+        self.income_stmt = pd.DataFrame(
+            {c: [100.0, 10.0, s] for c, s in zip(cols, shares)},
+            index=["Total Revenue", "Net Income", "Diluted Average Shares"])
+        self.balance_sheet = pd.DataFrame()
+        self.cashflow = pd.DataFrame()
+
+
+def test_buyback_base() -> None:
+    section("compute_buyback_base: revenue growth AND a shrinking share count")
+    check([ap.buyback_share_credit(c) for c in (-0.05, -0.01, 0.0, 0.005, 0.01, 0.2, None)],
+          [1.0, 1.0, 0.5, 0.25, 0.0, 0.0, None],
+          "share credit: full at a 1% shrink, half when flat, none at 1% growth")
+
+    pa = _position(filters=[_rev_filter(1.0)], share_count_change=-0.02,
+                   score_analyst=70.0, score_insider=50.0, score_insider_cal=None)
+    ap.compute_buyback_base(pa)
+    check((pa.buyback_score, pa.buyback_base, pa.buyback_coverage), (100.0, 88.0, 1.0),
+          "both halves pass: the rule scores 100, 0.70*100 + 0.15*70 + 0.15*50")
+    check((pa.buyback_base_cal, pa.buyback_coverage_cal), (94.7, 0.85),
+          "a no-signal insider renormalizes away in the recalibrated twin")
+
+    def base_for(**kw):
+        p = _position(score_analyst=70.0, score_insider=50.0, **kw)
+        ap.compute_buyback_base(p)
+        return p.buyback_score, p.buyback_base, p.buyback_coverage
+    check(base_for(filters=[_rev_filter(1.0)], share_count_change=0.02),
+          (50.0, 53.0, 1.0), "revenue growth while issuing shares: a neutral 50, not a sell")
+    check(base_for(filters=[_rev_filter(0.0, actual=4.0)], share_count_change=-0.03),
+          (50.0, 53.0, 1.0), "buybacks without the growth are neutral too: the gate is an AND")
+    check(base_for(filters=[_rev_filter(1.0)], share_count_change=None),
+          (50.0, 53.0, 0.65), "a half without data counts as a miss and costs coverage")
+    p = _position(filters=[_rev_filter(0.5, actual=9.0)], share_count_change=0.0)
+    ap.compute_buyback_base(p)
+    check((p.buyback_score, p.buyback_base, p.buyback_coverage), (62.5, 62.5, 0.7),
+          "near misses multiply: half x half is a quarter of the rule's lift")
+    p = _position(filters=[])
+    ap.compute_buyback_base(p)
+    check((p.buyback_base, p.buyback_base_cal, ap.has_verdict_base(p, "buyback")),
+          (None, None, False), "nothing at all to go on means no buyback base")
+
+    pa = _position(filters=[_rev_filter(1.0)], share_count_change=-0.02,
+                   score_analyst=70.0, score_insider=50.0, trend="sideways")
+    ap.compute_buyback_base(pa)
+    verdicts = ap.verdicts_v2_for(pa, is_holding=False)
+    check(sorted(verdicts), ["buyback", "buyback-cal"],
+          "the buyback base needs no composite or quality base")
+    v = verdicts["buyback"]
+    check((v.label, v.score), ("BUY", 88.0),
+          "a name that meets the rule starts above the BUY bar")
+    check(v.reason.split(" | ")[1],
+          "Buyback base 88 — revenue +14%/yr (3yr CAGR), shares -2.0% on the "
+          "year: rule met, analyst 70, insider 50",
+          "the breakdown names both halves and the outcome")
+    miss = _position(filters=[_rev_filter(None, actual=None, note="")],
+                     share_count_change=0.031, score_analyst=60.0)
+    ap.compute_buyback_base(miss)
+    line = ap.verdicts_v2_for(miss, is_holding=True)["buyback-cal"].reason
+    check("revenue growth n/a, shares +3.1% on the year: rule missed, so neutral, "
+          "analyst 60, insider not scored (no signal)" in line, True,
+          "a miss says why, in the recalibrated wording")
+
+    for shares, want, label in (
+            ([98.0, 100.0, 101.0], -0.02, "the newest year against the one before"),
+            ([200.0, 100.0], None, "a doubling is an unadjusted split, not an issue"),
+            ([float("nan"), 100.0, 100.0], None, "a missing newest year gives no reading"),
+            ([100.0], None, "one year gives no reading")):
+        info = {"symbol": "TEST"}
+        ap._compute_multi_year_growth(_Statements(shares), info)
+        got = info.get("shareCountChange")
+        check(None if got is None else round(got, 4), want, f"share count change: {label}")
+    check("shareCountChange" in ap._GROWTH_METRIC_KEYS, True,
+          "the share-count change rides the fundamentals cache")
+
+    with _mode_env():
+        html = ap._base_switch_html(interactive=False)
+    check(re.findall(r'data-base="(\w+)"', html),
+          ["composite", "quality", "blend", "buyback"], "the switch offers the Buyback base")
+    check("shrinking share count" in html, True, "and its tooltip says what it is")
+
+
 # ------------------------------------------------ 3. the verdict, per mode ----
 
 def _verdict(mode: str, **kw):
@@ -318,19 +415,23 @@ def test_verdicts_per_mode() -> None:
                    score_insider=50.0, score_insider_cal=None,
                    trend="sideways", upside_pct=12.0)
     ap.compute_quality_base(pa)
+    ap.compute_buyback_base(pa)
     check(pa.quality_base, 88.0, "0.70*100 + 0.15*70 + 0.15*50")
     check(pa.quality_base_cal, 94.7,
           "and with no insider score to carry, its 15% renormalizes away")
     verdicts = ap.verdicts_v2_for(pa, is_holding=True)
     check({m: (v.label, v.score) for m, v in verdicts.items()},
           {"composite": ("HOLD", 63.0), "quality": ("ADD", 91.0),
-           "blend": ("HOLD", 77.0), "composite-cal": ("HOLD", 75.6),
-           "quality-cal": ("ADD", 98.3), "blend-cal": ("ADD", 86.9)},
-          "every base x calibration: +3 for moderate upside, +3.6 on the ramp")
+           "blend": ("HOLD", 77.0), "buyback": ("HOLD", 55.0),
+           "composite-cal": ("HOLD", 75.6), "quality-cal": ("ADD", 98.3),
+           "blend-cal": ("ADD", 86.9), "buyback-cal": ("HOLD", 56.1)},
+          "every base x calibration: +3 for moderate upside, +3.6 on the ramp "
+          "(damped under Buyback, which has no share count here)")
     check(verdicts["composite"].alternates,
           {"quality": ("ADD", 91.0), "blend": ("HOLD", 77.0),
-           "composite-cal": ("HOLD", 75.6), "quality-cal": ("ADD", 98.3),
-           "blend-cal": ("ADD", 86.9)},
+           "buyback": ("HOLD", 55.0), "composite-cal": ("HOLD", 75.6),
+           "quality-cal": ("ADD", 98.3), "blend-cal": ("ADD", 86.9),
+           "buyback-cal": ("HOLD", 56.1)},
           "alternates carry every other mode's label and score")
 
     with _mode_env(saved="quality"):
@@ -504,8 +605,10 @@ def test_compare_base_modes() -> None:
     pa = _with_verdicts
 
     def both(std: dict) -> dict:
-        """The three std modes, mirrored onto their calibrated twins — so the
-        recalibrated rows are quiet and the assertions stay about the bases."""
+        """The std modes, with Buyback copying Composite, mirrored onto their
+        calibrated twins — so the Buyback and recalibrated rows are quiet and
+        the assertions stay about the other bases."""
+        std = {**std, "buyback": std["composite"]}
         return {**std, **{m + ap.CALIBRATION_SUFFIX: v for m, v in std.items()}}
 
     holdings = [
@@ -538,7 +641,9 @@ def test_compare_base_modes() -> None:
     check(lines[lines.index(next(ln for ln in lines if ln.startswith("  Quality would"))) + 1],
           "    and would also prune DDD; keep CCC",
           "a different prune set is spelled out by ticker")
-    check(lines[-1], "  Blend+cal would change no verdicts.",
+    check("Buyback would change no verdicts." in text, True,
+          "a base that lands on the same labels says so")
+    check(lines[-1], "  Buyback+cal would change no verdicts.",
           "a quiet mode says so, with no prune line when the set is the same")
 
     with _mode_env(saved="composite", override="quality"):
@@ -567,14 +672,17 @@ def test_mode_variants() -> None:
             else ap.split_base_mode(m)[0], tag="div")
     check(same, "<b>7</b>", "identical renderings come back unwrapped")
     check(diff,
-          "<span class='bmode bmode-composite bmode-blend bmode-composite-cal "
-          "bmode-blend-cal' style='display:none'>A</span>"
+          "<span class='bmode bmode-composite bmode-blend bmode-buyback "
+          "bmode-composite-cal bmode-blend-cal bmode-buyback-cal' "
+          "style='display:none'>A</span>"
           "<span class='bmode bmode-quality bmode-quality-cal'>B</span>",
           "modes sharing a rendering share a copy; copies the run doesn't use start hidden")
     check(empty,
           "<div class='bmode bmode-composite bmode-composite-cal' "
           "style='display:none'>composite</div>"
-          "<div class='bmode bmode-quality bmode-quality-cal'>quality</div>",
+          "<div class='bmode bmode-quality bmode-quality-cal'>quality</div>"
+          "<div class='bmode bmode-buyback bmode-buyback-cal' "
+          "style='display:none'>buyback</div>",
           "an empty rendering gets no copy at all")
     css = ap._base_view_css()
     check(all(f"html[data-base-view='{m}'] .bmode:not(.bmode-{m})" in css
@@ -621,18 +729,20 @@ def test_report_markup() -> None:
           "the tap-to-reveal text on phones carries them too")
 
     pa = _with_verdicts("AAA", {"composite": ("TRIM", 44.0), "quality": ("ADD", 86.0),
-                                "blend": ("HOLD", 65.0)})
+                                "blend": ("HOLD", 65.0), "buyback": ("HOLD", 52.0)})
     pa.tax = object()
     pa._rank_moves = {"composite": {"delta": 2, "new": False}, "quality": None,
-                      "blend": {"delta": None, "new": True}}
+                      "blend": {"delta": None, "new": True}, "buyback": None}
     pa._rank_move = pa._rank_moves["composite"]
     with _mode_env():
         td = ap._verdict_td(pa)
-        tr = ap._tr_open(pa, {"composite": 3, "quality": 0, "blend": 1})
+        tr = ap._tr_open(pa, {"composite": 3, "quality": 0, "blend": 1, "buyback": 2})
         badge = ap._rank_move_badge(pa)
-    check(re.findall(r"data-sort(?:-\w+)?='([\d.]+)'", td), ["44.0", "44.0", "86.0", "65.0"],
+    check(re.findall(r"data-sort(?:-\w+)?='([\d.]+)'", td),
+          ["44.0", "44.0", "86.0", "65.0", "52.0"],
           "the verdict cell sorts by the run's score, with every mode's alongside")
-    check(td.count("class='verdict'"), 3, "and holds one verdict per mode")
+    check(td.count("class='verdict'"), 3,
+          "and holds one chip per distinct verdict (Blend and Buyback share HOLD)")
     got = dict(re.findall(r"data-([\w-]+-(?:composite|quality|blend))='([^']*)'", tr))
     check((got["verdict-composite"], got["verdict-quality"], got["verdict-score-blend"]),
           ("TRIM", "ADD", "65.0"), "the row carries every mode's verdict and score")
@@ -673,7 +783,7 @@ def _scored(ticker: str, composite: float, credits: list, *, value: float = 1000
     """A compounder with every mode's verdict, as analyze_position leaves it.
 
     The calibrated composite defaults to the standard one, so a fixture that
-    doesn't care about the calibration still renders all six modes; pass
+    doesn't care about the calibration still renders every mode; pass
     composite_cal to make them diverge."""
     pa = _position(ticker=ticker, shares=shares, statement_market_value=value,
                    live_market_value=value, current_price=value / max(shares, 1),
@@ -685,6 +795,7 @@ def _scored(ticker: str, composite: float, credits: list, *, value: float = 1000
                    score_insider=insider, score_insider_cal=insider_cal,
                    trend="sideways", **kw)
     ap.compute_quality_base(pa)
+    ap.compute_buyback_base(pa)
     ap.set_v2_verdicts(pa, is_holding=shares > 0)
     return pa
 
@@ -761,9 +872,10 @@ def test_full_report() -> None:
     with _mode_env():
         # Nine equal holdings (11% each: a -2 size nudge, no ADD ceiling).
         holdings = [
-            _scored("AAA", 80, all_pass),     # ADD under every base
-            _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD
-            _scored("CCC", 70, all_fail),     # HOLD / SELL / TRIM
+            # ADD under every base; buybacks too, so Buyback agrees
+            _scored("AAA", 80, all_pass, share_count_change=-0.02),
+            _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD / HOLD
+            _scored("CCC", 70, all_fail),     # HOLD / SELL / TRIM / HOLD
             *(_scored(t, 65, all_pass) for t in ("DDD", "EEE", "FFF", "GGG")),
             _scored("HHH", 60, [1.0] * 6 + [0.5, None, None]),
         ]
@@ -790,7 +902,7 @@ def test_full_report() -> None:
             effective_rate_lt=0.15, effective_rate_st=0.24,
             strategies=["Trim in stages."])
         watch = {"Tech": [_scored("WWW", 50, all_pass, shares=0, value=0.0,
-                                  upside_pct=5.0),
+                                  upside_pct=5.0, share_count_change=-0.02),
                           _scored("XXX", 75, all_fail, shares=0, value=0.0,
                                   upside_pct=5.0)]}
         html = _render_report(results, watch)
@@ -805,11 +917,16 @@ def test_full_report() -> None:
         return {**std, **{m + ap.CALIBRATION_SUFFIX: v for m, v in std.items()}}
 
     check(labels,
-          {"AAA": mirrored({"composite": "ADD", "quality": "ADD", "blend": "ADD"}),
-           "BBB": mirrored({"composite": "TRIM", "quality": "ADD", "blend": "HOLD"}),
-           "CCC": mirrored({"composite": "HOLD", "quality": "SELL", "blend": "TRIM"}),
-           "WWW": mirrored({"composite": "WAIT", "quality": "BUY", "blend": "WATCH"}),
-           "XXX": mirrored({"composite": "BUY", "quality": "PASS", "blend": "WAIT"})},
+          {"AAA": mirrored({"composite": "ADD", "quality": "ADD", "blend": "ADD",
+                            "buyback": "ADD"}),
+           "BBB": mirrored({"composite": "TRIM", "quality": "ADD", "blend": "HOLD",
+                            "buyback": "HOLD"}),
+           "CCC": mirrored({"composite": "HOLD", "quality": "SELL", "blend": "TRIM",
+                            "buyback": "HOLD"}),
+           "WWW": mirrored({"composite": "WAIT", "quality": "BUY", "blend": "WATCH",
+                            "buyback": "BUY"}),
+           "XXX": mirrored({"composite": "BUY", "quality": "PASS", "blend": "WAIT",
+                            "buyback": "WAIT"})},
           "the fixture's verdicts differ by mode (after the size overlay)")
     check('<html data-base-view="composite">' in html, True,
           "the page opens on the run's mode")
@@ -829,24 +946,28 @@ def test_full_report() -> None:
                        r"padding:14px 16px;margin-bottom:14px;'><div[^>]*>"
                        r"<span class='ticker'[^>]*>(\w+)</span>", html)
     check(sorted((t, c) for c, t in cards),
-          [("BBB", _both_cals("blend")), ("BBB", _both_cals("composite")),
-           ("CCC", _both_cals("blend")), ("CCC", _both_cals("composite")),
-           ("CCC", _both_cals("quality"))],
+          [("BBB", _both_cals("blend")), ("BBB", _both_cals("buyback")),
+           ("BBB", _both_cals("composite")),
+           ("CCC", _both_cals("blend")), ("CCC", _both_cals("buyback")),
+           ("CCC", _both_cals("composite")), ("CCC", _both_cals("quality"))],
           "tax cards show only in the modes that flag them, one per verdict pill")
     check("No positions are flagged under" in html, False,
           "every mode flags something here, so no empty-section note")
 
     sell_trim = re.search(r"<strong>(.*?)</strong>Sell / Trim flags", html).group(1)
-    check(sell_trim, "1",
-          "a count that's the same in every mode renders once (BBB, CCC, CCC)")
+    check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", sell_trim),
+          [(_both_cals("composite", "quality", "blend"), "1"),
+           (_both_cals("buyback"), "0")],
+          "modes with the same count share one copy (BBB, CCC, CCC); "
+          "Buyback, which sells nothing here, gets its own")
     adds = re.search(r"<strong>(.*?)</strong>Add candidates", html).group(1)
     check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", adds),
-          [(_both_cals("composite", "blend"), "1"),
+          [(_both_cals("composite", "blend", "buyback"), "1"),
            (_both_cals("quality"), "7")],
           "one that differs renders per mode")
     buys = re.search(r"<strong>(.*?)</strong>Watchlist BUY signals", html).group(1)
     check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", buys),
-          [(_both_cals("composite", "quality"), "1"),
+          [(_both_cals("composite", "quality", "buyback"), "1"),
            (_both_cals("blend"), "0")],
           "watchlist BUY count per mode")
     check(all(f'id="healthMeter-{m}"' in html for m in ap.BASE_SCORE_MODES), True,
@@ -859,8 +980,8 @@ def test_full_report() -> None:
           (True, False), "the header has a browser-reload button, no Auto toggle")
     qr = re.search(r'<div class="qr-list">(.*?)</div></div></div>',
                    qr_html, re.S).group(1)
-    check(qr.count("class='bmode"), 3,
-          "QUICK_RECS=1 brings the chip back, one list per mode")
+    check(qr.count("class='bmode"), 4,
+          "QUICK_RECS=1 brings the chip back, one list per distinct set")
     check(_tag_errors(qr_html), [], "and the page still balances with it")
 
     check(_tag_errors(html), [],
@@ -923,8 +1044,9 @@ def test_filter_bar_options() -> None:
     all_pass, all_fail = [1.0] * 9, [0.0] * 9
     with _mode_env():
         holdings = [
-            _scored("AAA", 80, all_pass),     # ADD under every base
-            _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD
+            # ADD under every base, Buyback included (it shrinks its share count)
+            _scored("AAA", 80, all_pass, share_count_change=-0.02),
+            _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD / HOLD
             *(_scored(t, 65, all_pass) for t in ("DDD", "EEE", "FFF", "GGG")),
         ]
         thin = _scored("CCC", 70, all_pass)
@@ -1096,9 +1218,11 @@ def test_missed_opps_per_mode() -> None:
           "a miss row carries every base and calibration's verdict")
     check(missed["AAA"]["miss_type_by_mode"],
           {"composite": "model", "quality": "execution", "blend": "execution",
-           "composite-cal": "execution", "quality-cal": "execution",
-           "blend-cal": "execution"},
-          "and is a model gap only under the bases that never rated it a buy")
+           "buyback": "model", "composite-cal": "execution",
+           "quality-cal": "execution", "blend-cal": "execution",
+           "buyback-cal": "model"},
+          "and is a model gap only under the bases that never rated it a buy "
+          "(Buyback wasn't logged then, so it reads the snapshot's HOLD)")
     check((missed["AAA"]["miss_type"], missed["AAA"]["still_actionable"]),
           ("model", False), "the headline values are the run's mode")
     check(missed["OLD"]["first_verdicts"], {},
@@ -1108,14 +1232,14 @@ def test_missed_opps_per_mode() -> None:
           "and classifies the same under every base")
     check(avoided["DWN"]["dodge_type_by_mode"],
           {"composite": "caution", "quality": "lucky", "blend": "caution",
-           "composite-cal": "lucky", "quality-cal": "lucky",
-           "blend-cal": "lucky"},
+           "buyback": "caution", "composite-cal": "lucky", "quality-cal": "lucky",
+           "blend-cal": "lucky", "buyback-cal": "caution"},
           "a dodge is only lucky under a base that rated the name a buy")
     check({m: (d["model_gap"], d["execution_gap"], d["still_actionable"])
            for m, d in insights["by_mode"].items()},
-          {"composite": (2, 0, []),
+          {**{m: (2, 0, []) for m in ("composite", "buyback", "buyback-cal")},
            **{m: (1, 1, ["AAA"]) for m in ap.BASE_SCORE_MODES
-              if m != "composite"}},
+              if m not in ("composite", "buyback", "buyback-cal")}},
           "the summary strip's gap split and live list per base")
 
     with _mode_env(saved="quality"):
@@ -1129,8 +1253,9 @@ def test_missed_opps_per_mode() -> None:
 def test_missed_opps_markup() -> None:
     section("missed opportunities: the cells follow the base switch")
     by_mode = {"composite": ("HOLD", 64.0), "quality": ("ADD", 94.0),
-               "blend": ("ADD", 87.7), "composite-cal": ("ADD", 82.0),
-               "quality-cal": ("ADD", 99.0), "blend-cal": ("ADD", 90.5)}
+               "blend": ("ADD", 87.7), "buyback": ("HOLD", 58.0),
+               "composite-cal": ("ADD", 82.0), "quality-cal": ("ADD", 99.0),
+               "blend-cal": ("ADD", 90.5), "buyback-cal": ("HOLD", 60.0)}
     with _mode_env(saved="composite"):
         td = ap._miss_verdict_td(by_mode, "HOLD", 64.0)
         plain = ap._miss_verdict_td({}, "TRIM", 41.0)
@@ -1141,10 +1266,11 @@ def test_missed_opps_markup() -> None:
           "and holds one chip per base x calibration")
     check(re.sub(r"</?span>", "", re.findall(
               r"<span class='miss-alt'>((?:<span>.*?</span>|[^<])*)</span>", td)[0]),
-          "Quality base: ADD 94 · Blend base: ADD 88 · "
+          "Quality base: ADD 94 · Blend base: ADD 88 · Buyback base: HOLD 58 · "
           "Composite (Recalibrated) base: ADD 82 · "
           "Quality (Recalibrated) base: ADD 99 · "
-          "Blend (Recalibrated) base: ADD 90",
+          "Blend (Recalibrated) base: ADD 90 · "
+          "Buyback (Recalibrated) base: HOLD 60",
           "the viewed base's chip names what every other mode called it")
     check(("Composite base: HOLD 64" in td, "Quality base: ADD 94 · Blend" in plain),
           (True, False), "each copy names the others; a ledger-only row none")
@@ -1169,8 +1295,9 @@ def test_missed_opps_markup() -> None:
     check(re.search(r"<td data-sort='model'((?: data-sort-[\w-]+='\w+')+)>",
                     row).group(1),
           " data-sort-composite='model' data-sort-quality='execution'"
-          " data-sort-blend='execution' data-sort-composite-cal='execution'"
-          " data-sort-quality-cal='execution' data-sort-blend-cal='execution'",
+          " data-sort-blend='execution' data-sort-buyback='model'"
+          " data-sort-composite-cal='execution' data-sort-quality-cal='execution'"
+          " data-sort-blend-cal='execution' data-sort-buyback-cal='model'",
           "and the column's sort value switches with the base and calibration")
     dwn = re.search(r"<tr data-search='dwn[^']*'>(.*?)</tr>", html, re.S).group(1)
     check((dwn.count("Correct caution"), dwn.count("Lucky dodge")), (1, 1),
@@ -1851,7 +1978,7 @@ def test_external_flow_scoping() -> None:
 
 def main() -> int:
     for t in (test_soft_credits, test_missing_versus_loss, test_filter_score,
-              test_quality_base, test_verdict_modes, test_composite_regression,
+              test_quality_base, test_buyback_base, test_verdict_modes, test_composite_regression,
               test_verdicts_per_mode, test_mode_resolution,
               test_rank_badges_per_mode, test_ledger_ranks_per_mode,
               test_compare_base_modes, test_mode_variants, test_report_markup,

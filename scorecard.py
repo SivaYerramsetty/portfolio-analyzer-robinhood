@@ -146,11 +146,13 @@ FACTORS = (
     ("n", "News sentiment", "a modifier, ±6", +1),
     ("c", "Composite", "the Composite base", +1),
     ("qb", "Quality base", "the Quality base", +1),
+    ("sc", "Share count change", "half of the Buyback base's rule", -1),
+    ("bb", "Buyback base", "the Buyback base", +1),
     ("vol", "Volatility", "shown, not scored", 0),
     ("ddp", "Drop vs its normal", "shown, not scored", 0),
 )
-# Only these get weight suggestions; c and qb are whole bases, and vc is a
-# variant the mode comparison already covers.
+# Only these get weight suggestions; c, qb and bb are whole bases, sc is half
+# of one, and vc is a variant the mode comparison already covers.
 WEIGHTED_FACTORS = ("q", "g", "v", "a", "i", "ma", "w52", "up", "sm", "n")
 # Price-risk reads the report shows but doesn't score (risk_signals): a year's
 # volatility, and how far below its 52-week high a stock is against its own
@@ -181,6 +183,7 @@ LEDGER_FACTOR_KEYS = {
     "score_value_cal": "vc", "score_analyst": "a", "score_insider": "i",
     "filter_score": "fs", "pct_above_ma200": "ma", "week52_position": "w52",
     "upside_pct": "up", "composite_score": "c", "quality_base": "qb",
+    "share_count_pct": "sc", "buyback_base": "bb",
     "volatility": "vol", "drop_severity": "ddp",
 }
 SECTOR_MOMENTUM_VALUE = {"Hot": 1, "Neutral": 0, "Cool": -1}
