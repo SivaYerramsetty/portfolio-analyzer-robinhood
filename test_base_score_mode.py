@@ -302,6 +302,32 @@ def test_buyback_base() -> None:
           "analyst 60, insider not scored (no signal)" in line, True,
           "a miss says why, in the recalibrated wording")
 
+    # Price vs the 200-day moves every base but Buyback (TREND_UNSCORED_BASES).
+    def under(trend, pct, mode):
+        p = _position(filters=[_rev_filter(1.0)], share_count_change=-0.02,
+                      score_analyst=70.0, score_insider=50.0, composite_score=88.0,
+                      composite_coverage=1.0, composite_score_cal=88.0,
+                      composite_coverage_cal=1.0, trend=trend, pct_above_ma200=pct)
+        ap.compute_buyback_base(p)
+        return ap.verdicts_v2_for(p, is_holding=False)[mode]
+    up, down = under("uptrend", 20.0, "buyback"), under("downtrend", -14.0, "buyback")
+    check(((up.label, up.score), (down.label, down.score)), (("BUY", 88.0), ("BUY", 88.0)),
+          "under Buyback an uptrend earns nothing and a downtrend costs nothing")
+    check(("Uptrend (+20% vs 200d) not scored under the Buyback base" in up.reason,
+           "Downtrend (-14% vs 200d) not scored under the Buyback base" in down.reason),
+          (True, True), "but the breakdown still shows it")
+    check((under("uptrend", 20.0, "composite").score,
+           under("downtrend", -14.0, "composite").score), (98.0, 78.0),
+          "the other bases score it as before (+10 / -10)")
+    sideways = under("sideways", 18.0, "buyback-cal")
+    check((sideways.score, "Price vs its 200-day (+18%) not scored under the "
+                           "Buyback base" in sideways.reason),
+          (under("sideways", 0.0, "buyback-cal").score, True),
+          "the recalibrated momentum credit, the same axis, stands down too")
+    check(under("sideways", 18.0, "composite-cal").score
+          - under("sideways", 0.0, "composite-cal").score, 4.0,
+          "while the other recalibrated bases keep it (+4 at 15%+ above)")
+
     for shares, want, label in (
             ([98.0, 100.0, 101.0], -0.02, "the newest year against the one before"),
             ([200.0, 100.0], None, "a doubling is an unadjusted split, not an issue"),

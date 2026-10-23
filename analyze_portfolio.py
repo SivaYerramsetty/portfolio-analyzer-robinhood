@@ -3085,6 +3085,13 @@ BUYBACK_SHARES_NONE = 0.01
 # A year-on-year share-count ratio outside these bounds is read as a data
 # error (a split Yahoo did not adjust), not as a buyback or an issue.
 BUYBACK_SHARE_RATIO_BOUNDS = (0.67, 1.5)
+# Bases under which price vs the 200-day line (the trend modifier, and the
+# recalibrated momentum credit on the same axis) is shown but not scored. In
+# the same 13-year test, rule passers trading below their 200-day beat the
+# average name by ~8.6% a year and those above it by ~1.4% — so +10 for an
+# uptrend and -10 for a downtrend leaned against the rule. Not inverted: one
+# split of ~33 names a year is too thin to score the other way.
+TREND_UNSCORED_BASES = ("buyback",)
 
 # ---- Calibration (switchable, orthogonal to the base) ----
 # A second axis on top of the base: which *calibration* of the sub-scores and
@@ -3785,12 +3792,18 @@ def compute_verdict_v2(
     # recalibrated momentum credit below reads it so the two never stack: they
     # measure the same axis, and the doctrine above is that it is scored once.
     trend_scored = False
+    vs_200d = (f" ({pct_above_ma200:+.0f}% vs 200d)"
+               if pct_above_ma200 is not None else "")
     if week52_extreme and trend in ("uptrend", "downtrend"):
         # Deferred, but keep it visible in the breakdown so the hover still
         # explains the full reasoning rather than silently dropping a factor.
         contributors.append(
             (f"{trend.capitalize()} not re-scored — already counted as "
              f"52-week position ({week52_position:.0f}% of range)", 0))
+    elif base_name in TREND_UNSCORED_BASES and trend in ("uptrend", "downtrend"):
+        contributors.append(
+            (f"{trend.capitalize()}{vs_200d} not scored under the "
+             f"{BASE_SCORE_BASE_LABELS[base_name]} base", 0))
     elif trend == "uptrend":
         bonus = 10
         if pct_above_ma200 is not None and pct_above_ma200 >= 25:
@@ -3906,7 +3919,13 @@ def compute_verdict_v2(
     # trend modifier already scored this axis, it stands down rather than
     # stacking a second reading of the same observation on top.
     if calibrated and pct_above_ma200 is not None and not week52_extreme:
-        if trend_scored:
+        if base_name in TREND_UNSCORED_BASES:
+            if trend not in ("uptrend", "downtrend"):   # else noted above
+                contributors.append(
+                    (f"Price vs its 200-day ({pct_above_ma200:+.0f}%) not "
+                     f"scored under the {BASE_SCORE_BASE_LABELS[base_name]} "
+                     f"base", 0))
+        elif trend_scored:
             contributors.append(
                 (f"Momentum not re-scored — trend already counted "
                  f"{pct_above_ma200:+.0f}% vs 200d", 0))
@@ -5635,8 +5654,9 @@ _BASE_SCORE_BLURBS = {
     "buyback": "one rule at 70%: revenue growth of 10%+ a year AND a shrinking "
                "share count (diluted shares down 1%+ on the year), plus the "
                "analyst (15%) and insider (15%) scores. A name that misses "
-               "either half sits at a neutral 50, not a sell. In a 13-year "
-               "test the rule beat the average stock by 3.8% a year",
+               "either half sits at a neutral 50, not a sell, and price vs "
+               "the 200-day is shown but not scored. In a 13-year test the "
+               "rule beat the average stock by 3.8% a year",
 }
 
 _CALIBRATION_BLURBS = {
