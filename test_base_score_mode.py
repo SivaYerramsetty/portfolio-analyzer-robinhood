@@ -319,6 +319,16 @@ def test_buyback_base() -> None:
     check((under("uptrend", 20.0, "composite").score,
            under("downtrend", -14.0, "composite").score), (98.0, 78.0),
           "the other bases score it as before (+10 / -10)")
+    low = _position(filters=[_rev_filter(1.0)], share_count_change=-0.02,
+                    score_analyst=70.0, score_insider=50.0, trend="downtrend",
+                    pct_above_ma200=-20.0, week52_position=3.0)
+    ap.compute_buyback_base(low)
+    low_v = ap.verdicts_v2_for(low, is_holding=True)
+    check(("Downtrend (-20% vs 200d) not scored under the Buyback base"
+           in low_v["buyback"].reason,
+           "already counted as 52-week position" in low_v["buyback"].reason),
+          (True, False),
+          "at a 52-week low Buyback still names its own reason for skipping trend")
     sideways = under("sideways", 18.0, "buyback-cal")
     check((sideways.score, "Price vs its 200-day (+18%) not scored under the "
                            "Buyback base" in sideways.reason),
@@ -1072,6 +1082,8 @@ def test_filter_bar_options() -> None:
         holdings = [
             # ADD under every base, Buyback included (it shrinks its share count)
             _scored("AAA", 80, all_pass, share_count_change=-0.02),
+            _scored("HHH", 65, all_pass, share_count_change=0.0),     # partly
+            _scored("JJJ", 65, all_pass, share_count_change=0.031),   # missed
             _scored("BBB", 45, all_pass),     # TRIM / ADD / HOLD / HOLD
             *(_scored(t, 65, all_pass) for t in ("DDD", "EEE", "FFF", "GGG")),
         ]
@@ -1091,6 +1103,12 @@ def test_filter_bar_options() -> None:
         page = _render_report(holdings + [thin, etf], watch)
 
     aaa, bbb, ccc = (_row_attrs(page, t) for t in ("AAA", "BBB", "CCC"))
+    hhh, jjj = _row_attrs(page, "HHH"), _row_attrs(page, "JJJ")
+    check([(r["buyback"], r["shares"]) for r in (aaa, hhh, jjj, bbb)],
+          [("met", "-2.0"), ("partly", "0.0"), ("missed", "3.1"), ("missed", "")],
+          "each row carries its Buyback rule outcome and share-count change")
+    check((_row_attrs(page, "ETF")["buyback"], _row_attrs(page, "ETF")["shares"]),
+          ("", ""), "an ETF has no Buyback rule to filter on")
     check((aaa["bases"], aaa["bases-quality"], aaa["bases-blend-cal"], bbb["bases"]),
           ("agree", "agree", "agree", "split"),
           "Across bases: agree when every base gives the same verdict, per mode")
@@ -1116,8 +1134,11 @@ def test_filter_bar_options() -> None:
     sections = script.split("var SECTIONS = [", 1)[1].split("var PRESETS", 1)[0]
     cards = re.findall(r"type:'(?:facet|range)', attr:'([\w-]+)'", sections)
     check([c for c in ("bases", "confidence", "drop-band", "off-high", "vol",
-                       "risk-share", "list") if c not in cards], [],
+                       "risk-share", "list", "buyback", "shares")
+           if c not in cards], [],
           "the panel has the new cards")
+    check("Composite, Quality, Blend and Buyback give the same verdict" in sections,
+          True, "the Across bases tip names every base")
     check([c for c in cards if f"data-{c}=" not in page], [],
           "every card reads an attribute the rows carry")
     check("attr:'has-tax', label:'Tax', skip:['0',''], flag:true" in sections, True,
@@ -1611,6 +1632,24 @@ def test_screen_channels() -> None:
     check(("CCC" in picks, skipped["CCC"]), (False, "already held"),
           "a held name is passed over in both channels")
     check(pick({}, 25)[0], [], "no channels, no picks")
+
+    def ruled(ticker: str, composite: float, rule) -> SimpleNamespace:
+        return SimpleNamespace(ticker=ticker, score_composite=composite,
+                               buyback_rule=rule)
+    chans = {"quality": [ruled("AAA", 90.0, 0.0), ruled("BBB", 85.0, 1.0),
+                         ruled("CCC", 80.0, 0.5), ruled("DDD", 75.0, 1.0)],
+             "fcf": [ruled("EEE", 70.0, None), ruled("FFF", 65.0, 1.0)]}
+    order = lambda mode: {ch: [r.ticker for r in rows] for ch, rows
+                          in ap.rank_screen_channels(chans, mode).items()}
+    check(order("composite"), {"quality": ["AAA", "BBB", "CCC", "DDD"],
+                               "fcf": ["EEE", "FFF"]},
+          "every base but Buyback adds in the scan's Composite order")
+    check(order("buyback-cal"), {"quality": ["BBB", "DDD", "CCC", "AAA"],
+                                 "fcf": ["FFF", "EEE"]},
+          "under Buyback, names meeting the rule go first, then near misses, "
+          "best Composite within each; no reading counts as a miss")
+    check(pick(ap.rank_screen_channels(chans, "buyback"), 3)[0],
+          ["BBB", "DDD", "FFF"], "so the add slots go to the rule's names")
 
 
 def test_holdings_ytd_weighting() -> None:
