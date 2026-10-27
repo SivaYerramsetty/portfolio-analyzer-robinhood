@@ -1150,6 +1150,43 @@ def test_filter_bar_options() -> None:
           (True, True, []), "the new quick screens, each on a real card")
     check(_tag_errors(page), [], "the page's tags balance")
 
+    # The filters on screen survive the page's own reload after each run, and
+    # the reload doesn't count as another use of the combo.
+    wire = script.split("// ---------- Wire up ----------", 1)[1]
+    check(("storeActive(sig);" in script.split("function refresh()", 1)[1],
+           wire.index("restoreActive();") < wire.index("\n  refresh();"),
+           "lastRecSig = signature(state);" in script),
+          (True, True, True),
+          "refresh stores the active filters; load restores them before the first pass")
+    # A range bound at the data's edge is stored open, so a saved "Upside
+    # ≥15%" still reaches the top of a later report's data. Runs the page's own
+    # signature functions.
+    node = shutil.which("node")
+    if node:
+        sig_js = script.split("// ---------- State signatures", 1)[1] \
+                       .split("\n", 1)[1].split("function resolveScreen", 1)[0]
+        probe = sig_js + """
+var domains = {upside: {min: -4, max: 35}, quality: {min: 0, max: 9}};
+var out = [
+  signature({facets: {verdict: new Set(['BUY', 'ADD'])},
+             ranges: {upside: {min: 15, max: 35}}}),
+  signature({facets: {}, ranges: {quality: {min: 0, max: 7}}}),
+  signature({facets: {}, ranges: {upside: {min: 5, max: 20}}}),
+];
+domains.upside = {min: -10, max: 50};   // the next report's data
+var st = parseSignature(out[0]), old = parseSignature('r:upside=15~35');
+out.push(st.ranges.upside.min + '~' + st.ranges.upside.max,
+         old.ranges.upside.min + '~' + old.ranges.upside.max);
+console.log(JSON.stringify(out));
+"""
+        proc = subprocess.run([node, "-e", probe], capture_output=True, text=True)
+        check(json.loads(proc.stdout or "null"),
+              ["f:verdict=ADD,BUY|r:upside=15~", "r:quality=~7", "r:upside=5~20",
+               "15~50", "15~35"],
+              "edge bounds are stored open and follow the next report's data; "
+              "inner and old closed bounds stay put"
+              + (f": {proc.stderr.strip()}" if proc.returncode else ""))
+
 
 def test_refresh_script_parses() -> None:
     section("report: the dispatch script (with Make default) is valid JS")

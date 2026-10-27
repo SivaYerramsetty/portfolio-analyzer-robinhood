@@ -12238,6 +12238,7 @@ Verdicts are framework outputs, not investment advice.
   var USAGE_KEY  = 'fltComboUsage';   // { signature: {c:count, t:lastUsedMs} }
   var SAVED_KEY  = 'fltSavedViews';   // [{ sig, name, t }] — combos you named; pinned first
   var HIDDEN_KEY = 'fltHiddenCombos'; // { signature: 1 } — combos you took off the bar
+  var ACTIVE_KEY = 'fltActive';       // { sig, q } — the filters and search on now
   var MAX_SHOWN  = 12;                // learned combos to render alongside saved ones
 
   // ---------- State ----------
@@ -12460,14 +12461,20 @@ Verdicts are framework outputs, not investment advice.
 
   // ---------- State signatures + (de)serialization ----------
   // A "combo" is a full facets+ranges state (search excluded). Ranges use '~'
-  // between the bounds so negative numbers survive the round-trip.
+  // between the bounds so negative numbers survive the round-trip. A bound at
+  // the data's edge is left blank ("15~"), so a saved "Upside ≥15%" or "Loss
+  // harvest" stays open-ended as later reports' data moves, instead of
+  // stopping at the day's top or bottom value.
+  function boundText(v, edge) { return Math.abs(v - edge) < 1e-9 ? '' : String(v); }
   function signature(st) {
     var parts = [];
     Object.keys(st.facets).sort().forEach(function(a) {
       if (st.facets[a] && st.facets[a].size) parts.push('f:' + a + '=' + Array.from(st.facets[a]).sort().join(','));
     });
     Object.keys(st.ranges).sort().forEach(function(a) {
-      parts.push('r:' + a + '=' + st.ranges[a].min + '~' + st.ranges[a].max);
+      var r = st.ranges[a], d = domains[a];
+      parts.push('r:' + a + '=' + (d ? boundText(r.min, d.min) : r.min) + '~' +
+                 (d ? boundText(r.max, d.max) : r.max));
     });
     return parts.join('|');
   }
@@ -12478,8 +12485,12 @@ Verdicts are framework outputs, not investment advice.
       var kind = part.charAt(0), body = part.slice(2), eq = body.indexOf('=');
       if (eq < 0) return;
       var attr = body.slice(0, eq), val = body.slice(eq + 1);
-      if (kind === 'f') st.facets[attr] = new Set(val.split(','));
-      else { var mm = val.split('~'); if (mm.length === 2) st.ranges[attr] = { min: parseFloat(mm[0]), max: parseFloat(mm[1]) }; }
+      if (kind === 'f') { st.facets[attr] = new Set(val.split(',')); return; }
+      var mm = val.split('~'), d = domains[attr];
+      if (mm.length !== 2) return;
+      var lo = mm[0] === '' ? (d ? d.min : -Infinity) : parseFloat(mm[0]);
+      var hi = mm[1] === '' ? (d ? d.max : Infinity) : parseFloat(mm[1]);
+      if (!isNaN(lo) && !isNaN(hi)) st.ranges[attr] = { min: lo, max: hi };
     });
     return st;
   }
@@ -12562,6 +12573,61 @@ Verdicts are framework outputs, not investment advice.
     var st = parseSignature(sig);
     for (var a in st.ranges) if (!domains[a]) return false;
     return true;
+  }
+
+  // Combos stored before open-ended bounds closed every range at that day's
+  // edge. Rewriting them against this report opens a bound that sits at
+  // today's edge, so the old and new forms of one combo don't show as two
+  // pills. A bound from another day's edge can't be told apart; it stays.
+  function normSig(sig) { return usableSig(sig) ? signature(parseSignature(sig)) : sig; }
+  function migrateSigs() {
+    var u = loadUsage(), nu = {}, changed = false;
+    Object.keys(u).forEach(function(k) {
+      var n = normSig(k), e = nu[n];
+      if (n !== k) changed = true;
+      nu[n] = e ? { c: e.c + u[k].c, t: Math.max(e.t, u[k].t) } : u[k];
+    });
+    if (changed) saveUsage(nu);
+    var list = loadSaved(), seen = {}, kept = [];
+    changed = false;
+    list.forEach(function(v) {
+      var n = normSig(v.sig);
+      if (n !== v.sig) changed = true;
+      if (seen[n]) { changed = true; return; }
+      seen[n] = 1; kept.push({ sig: n, name: v.name, t: v.t });
+    });
+    if (changed) storeSaved(kept);
+    var h = loadHidden(), nh = {};
+    changed = false;
+    Object.keys(h).forEach(function(k) { var n = normSig(k); if (n !== k) changed = true; nh[n] = 1; });
+    if (changed) storeHidden(nh);
+  }
+
+  // The filters on screen are kept in this browser too: the page reloads
+  // itself whenever a newer report is published (every run in market hours),
+  // and that used to clear them. A restored filter this report has no
+  // control for is dropped, since you couldn't see or undo it in the panel.
+  function storeActive(sig) {
+    try { localStorage.setItem(ACTIVE_KEY, JSON.stringify({ sig: sig, q: searchInput.value })); } catch (e) {}
+  }
+  function restoreActive() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(ACTIVE_KEY)); } catch (e) {}
+    if (!saved || typeof saved !== 'object') return;
+    var st = parseSignature(typeof saved.sig === 'string' ? saved.sig : '');
+    for (var f in st.facets) {
+      var entry = cardEls[f];
+      if (!entry || entry.kind !== 'facet') continue;
+      var shown = {};
+      entry.el.querySelectorAll('.flt-opt').forEach(function(b) { shown[b.getAttribute('data-val')] = 1; });
+      var vals = Array.from(st.facets[f]).filter(function(v) { return shown[v]; });
+      if (vals.length) state.facets[f] = new Set(vals);
+    }
+    for (var r in st.ranges) {
+      if (cardEls[r] && cardEls[r].kind === 'range') state.ranges[r] = st.ranges[r];
+    }
+    if (typeof saved.q === 'string') searchInput.value = saved.q;
+    lastRecSig = signature(state);   // a reload isn't a fresh use of the combo
   }
 
   // Name / rename / delete, all in one prompt: a blank name deletes the view.
@@ -12765,6 +12831,7 @@ Verdicts are framework outputs, not investment advice.
 
     // learn the combos you actually settle on
     if (sig !== lastRecSig) { lastRecSig = sig; scheduleRecord(); }
+    storeActive(sig);
   }
 
   function renderChips() {
@@ -12800,7 +12867,9 @@ Verdicts are framework outputs, not investment advice.
 
   // ---------- Wire up ----------
   buildPanel();
+  migrateSigs();
   buildSeeds();
+  restoreActive();
   renderUsed();
 
   searchInput.addEventListener('input', refresh);
