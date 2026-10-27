@@ -22,9 +22,9 @@ on:
         type: boolean
         default: false
       base_score_mode:
-        description: "Base score this run acts on for pruning, tax flags and history (the report shows all three either way). 'default' = the BASE_SCORE_MODE repository variable (composite when unset)"
+        description: "Base score this run acts on for pruning, tax flags and history (the report shows every base either way; -cal = Recalibrated scoring). 'default' = the BASE_SCORE_MODE repository variable (composite when unset)"
         type: choice
-        options: [default, composite, quality, blend]
+        options: [default, composite, quality, blend, buyback, composite-cal, quality-cal, blend-cal, buyback-cal]
         default: default
 
 permissions:
@@ -207,9 +207,10 @@ jobs:
           NEWS_BATCH_WAIT_SECONDS: ${{ vars.NEWS_BATCH_WAIT_SECONDS }}  # optional; defaults to 300s before falling back to lexicon
           SCORECARD_REQUEST_BUDGET: ${{ vars.SCORECARD_REQUEST_BUDGET }}  # optional; Yahoo requests per run for the scorecard's closes (default 500)
           # NEWS_BATCH: '0'                                       # set to disable the 50%-off Batches API pre-pass
-          # Default verdict base score: composite (default) | quality | blend.
+          # Default verdict base score: composite (when unset) | quality |
+          # blend | buyback, each optionally with -cal (Recalibrated scoring).
           # It drives watchlist pruning, tax flags and the history ledger; the
-          # report carries all three bases regardless. The report's "Make
+          # report carries every base regardless. The report's "Make
           # default" button writes this variable, so scheduled dispatches
           # (which send no inputs) follow it too.
           BASE_SCORE_MODE:    ${{ vars.BASE_SCORE_MODE }}
@@ -239,7 +240,8 @@ jobs:
           # no-input scheduled dispatch) leaves the saved variable in charge.
           BASE_FLAG=""
           case "${{ inputs.base_score_mode }}" in
-            composite|quality|blend) BASE_FLAG="--base-score ${{ inputs.base_score_mode }}" ;;
+            composite|quality|blend|buyback|composite-cal|quality-cal|blend-cal|buyback-cal)
+              BASE_FLAG="--base-score ${{ inputs.base_score_mode }}" ;;
           esac
           # --screen scans every profitable US-listed stock over $1B (ADRs
           # included) once per market day, spread over the first ~7 runs (the

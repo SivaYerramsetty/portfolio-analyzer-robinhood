@@ -129,14 +129,17 @@ COMMAND REFERENCE — every way to run this script
     --add-to-watchlist NAME  Append --tickers to a Robinhood watchlist (no report).
     --sync-dry-run         Preview --add-to-watchlist / --sync without writing.
     --debug-insider TICKER Diagnose insider data sources for one stock.
-    --base-score {composite,quality,blend}
+    --base-score {composite,quality,blend,buyback}[-cal]
                            The base score this run acts on (watchlist pruning,
-                           tax flags, history): the Composite Score (default),
-                           the nine quality filters + analyst + insider, or the
-                           average of the two. Overrides the BASE_SCORE_MODE env
-                           var (a repo variable in CI, set with the report's
-                           "Make default" button). The report always carries
-                           all three; its Base switch flips between them.
+                           tax flags, history): the Composite Score (when
+                           nothing is saved), the nine quality filters +
+                           analyst + insider, the average of the two, or the
+                           Buyback rule (revenue growth AND a shrinking share
+                           count) + analyst + insider; -cal for Recalibrated
+                           scoring. Overrides the BASE_SCORE_MODE env var (a
+                           repo variable in CI, set with the report's "Make
+                           default" button). The report always carries every
+                           base; its Base switch flips between them.
 
 --- HTML REPORT FEATURES (no flags needed; always on) ---------------------
 
@@ -3052,8 +3055,9 @@ TAX_FLAG_SCORE_THRESHOLD = 75
 
 # ---- Verdict base score (switchable) ----
 # compute_verdict_v2 starts every verdict from a 0-100 base, then applies the
-# context modifiers. The base comes from one of three modes:
-#   composite — the Composite Score. The original behavior and the default.
+# context modifiers. The base comes from one of four modes:
+#   composite — the Composite Score. The original behavior, and the fallback
+#               when BASE_SCORE_MODE is unset.
 #   quality   — the nine quality filters (soft-gated) at 70%, plus the same
 #               analyst and insider sub-scores the composite uses, at 15% each.
 #   blend     — the average of the composite and quality bases.
@@ -3493,6 +3497,20 @@ def buyback_share_credit(change: Optional[float]) -> Optional[float]:
                    / (BUYBACK_SHARES_NONE - BUYBACK_SHARES_FULL))
 
 
+def buyback_rule(filters: Optional[list],
+                 share_count_change: Optional[float]) -> float:
+    """The Buyback rule as a 0-1 product: the revenue gate's credit times the
+    share credit. A half without data counts as 0, a miss."""
+    rev = _revenue_filter(filters)
+    rev_credit = rev.credit if rev and rev.credit is not None else 0.0
+    return rev_credit * (buyback_share_credit(share_count_change) or 0.0)
+
+
+def buyback_rule_outcome(rule: float) -> str:
+    """'met', 'partly' or 'missed' for a buyback_rule product."""
+    return "met" if rule >= 1 else "partly" if rule > 0 else "missed"
+
+
 def compute_buyback_base(pa) -> None:
     """Populate the `buyback` base-score mode's inputs on `pa`.
 
@@ -3508,7 +3526,7 @@ def compute_buyback_base(pa) -> None:
     rev_credit = rev.credit if rev else None
     share_credit = buyback_share_credit(pa.share_count_change)
     halves = [c for c in (rev_credit, share_credit) if c is not None]
-    rule = (rev_credit or 0.0) * (share_credit or 0.0)
+    rule = buyback_rule(pa.filters, pa.share_count_change)
     pa.buyback_score = round(50 + 50 * rule, 1)
     rule_share = len(halves) / 2
     for cal, insider_score_v in (("std", pa.score_insider),
@@ -3794,16 +3812,18 @@ def compute_verdict_v2(
     trend_scored = False
     vs_200d = (f" ({pct_above_ma200:+.0f}% vs 200d)"
                if pct_above_ma200 is not None else "")
-    if week52_extreme and trend in ("uptrend", "downtrend"):
+    # A base that never scores trend says so first: at a 52-week extreme the
+    # deferral below would also hold, but it isn't why trend moved nothing.
+    if base_name in TREND_UNSCORED_BASES and trend in ("uptrend", "downtrend"):
+        contributors.append(
+            (f"{trend.capitalize()}{vs_200d} not scored under the "
+             f"{BASE_SCORE_BASE_LABELS[base_name]} base", 0))
+    elif week52_extreme and trend in ("uptrend", "downtrend"):
         # Deferred, but keep it visible in the breakdown so the hover still
         # explains the full reasoning rather than silently dropping a factor.
         contributors.append(
             (f"{trend.capitalize()} not re-scored — already counted as "
              f"52-week position ({week52_position:.0f}% of range)", 0))
-    elif base_name in TREND_UNSCORED_BASES and trend in ("uptrend", "downtrend"):
-        contributors.append(
-            (f"{trend.capitalize()}{vs_200d} not scored under the "
-             f"{BASE_SCORE_BASE_LABELS[base_name]} base", 0))
     elif trend == "uptrend":
         bonus = 10
         if pct_above_ma200 is not None and pct_above_ma200 >= 25:
@@ -4164,10 +4184,9 @@ def _buyback_base_detail(filters: Optional[list],
         rev_part = f"revenue {rev.actual:+.0f}%/yr" + (f" ({rev.note})" if rev.note else "")
     share_part = ("share count n/a" if share_count_change is None
                   else f"shares {share_count_change * 100:+.1f}% on the year")
-    rule = (rev.credit if rev and rev.credit is not None else 0.0) * (
-        buyback_share_credit(share_count_change) or 0.0)
-    outcome = ("rule met" if rule >= 1 else "rule partly met" if rule > 0
-               else "rule missed, so neutral")
+    outcome = {"met": "rule met", "partly": "rule partly met",
+               "missed": "rule missed, so neutral"}[
+        buyback_rule_outcome(buyback_rule(filters, share_count_change))]
     return ", ".join([f"{rev_part}, {share_part}: {outcome}"]
                      + _analyst_insider_parts(score_analyst, score_insider,
                                               calibrated))
@@ -5393,6 +5412,23 @@ SCREEN_READD_COOLDOWN_DAYS = 30
 MIN_SCREEN_UNIVERSE = 100
 
 
+def rank_screen_channels(channels: dict[str, list],
+                         mode: str) -> dict[str, list]:
+    """Each channel's candidates in the order `mode` should add them.
+
+    The scan's own order (best Composite first) for every base but Buyback.
+    Under Buyback a name that misses its rule sits at a neutral ~50-60, and
+    most of those fall under the prune bar the same run they are added, so
+    the add slots go to the best rule readings first (met, then near misses),
+    best Composite within each. A candidate scored before the rule was
+    recorded reads as a miss."""
+    if split_base_mode(mode)[0] != "buyback":
+        return channels
+    return {ch: sorted(rows, key=lambda r: -(getattr(r, "buyback_rule", None)
+                                             or 0.0))
+            for ch, rows in channels.items()}
+
+
 def select_screen_additions(
     channels: dict[str, list],
     held_tickers: set[str],
@@ -5403,11 +5439,11 @@ def select_screen_additions(
 ) -> tuple[list[str], dict[str, str], dict[str, list[str]]]:
     """Pick the scan's names worth adding to the Screening watchlist.
 
-    channels: {channel: candidates}, each best Composite first
-    (screener.channel_candidates). The channels split `limit` evenly, the
-    first taking any odd slot; a name both nominate counts once, against the
-    channel that reached it first, and a share a channel can't fill goes to
-    the best names left in either.
+    channels: {channel: candidates}, each best first (screener.
+    channel_candidates, ordered by rank_screen_channels). The channels split
+    `limit` evenly, the first taking any odd slot; a name both nominate
+    counts once, against the channel that reached it first, and a share a
+    channel can't fill goes to the best names left in either.
 
     Returns (tickers, skipped, tags): the picks, capped at `limit`; {ticker:
     why} for the ones passed over; and {ticker: [channels]} naming every
@@ -5581,7 +5617,7 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
         if r.error or r.ticker not in gathered:
             continue
         pa, info = gathered[r.ticker]
-        filters = apply_quality_filters(info)
+        filters = pa.filters = apply_quality_filters(info)
         r.passes = {_SCREEN_FILTER_KEYS.get(f.name, f.name): bool(f.passed)
                     for f in filters}
         r.num_passed = sum(1 for f in filters if f.passed)
@@ -5607,6 +5643,8 @@ def score_screen_shortlist(results: list, budget, max_workers: int = 6,
         r.score_insider = pa.score_insider
         r.insider_activity = pa.insider_activity
         r.score_composite = pa.composite_score
+        r.buyback_rule = buyback_rule(pa.filters,
+                                      _safe_get(info, "shareCountChange"))
     if verbose and shown:
         print(f"[screen] Insider reads for {len(shown)} name(s) in "
               f"{time.time() - start:.0f}s")
@@ -6485,12 +6523,21 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
     off_high = "" if r.drop_pct is None else round(abs(r.drop_pct), 1)
     vol = "" if r.volatility is None else round(r.volatility, 1)
     risk_share = "" if r.risk_share is None else round(r.risk_share, 1)
+    # The Buyback base's rule (met / partly / missed; blank for rows with no
+    # buyback base, e.g. ETFs) and its share-count half as a % on the year.
+    # Neither depends on the Scoring switch, so neither is per-mode.
+    buyback = ("" if getattr(r, "buyback_score", None) is None
+               else buyback_rule_outcome(buyback_rule(r.filters,
+                                                      r.share_count_change)))
+    shares = ("" if getattr(r, "share_count_change", None) is None
+              else round(r.share_count_change * 100, 1))
     # Combined search text — lowercased for case-insensitive contains() matching
     search_text = f"{r.ticker} {r.name} {r.sector or ''}".lower()
     return (
         f"<tr data-verdict='{verdict}' data-verdict-score='{verdict_score}' "
         f"data-earnings-days='{earnings_days}' "
         f"data-quality='{quality}' "
+        f"data-buyback='{buyback}' data-shares='{shares}' "
         f"data-gain='{gain}' data-gain-pct='{gain_pct}' "
         f"data-day-pct='{day_pct}' "
         f"data-upside='{upside}' "
@@ -9770,8 +9817,10 @@ def update_scorecard(
 
     scorecard.prune_log(log, now_et.date())
     scorecard.save_log(log, path)
-    sc = scorecard.build_scorecard(log, BASE_SCORE_MODES, base_score_mode(),
-                                   BASE_SCORE_LABELS)
+    sc = scorecard.build_scorecard(
+        log, BASE_SCORE_MODES, base_score_mode(), BASE_SCORE_LABELS,
+        unscored={m: ("ma",) for m in BASE_SCORE_MODES
+                  if split_base_mode(m)[0] in TREND_UNSCORED_BASES})
     meta = sc["meta"]
     print(f"[scorecard] Logged {logged} call(s) for {run_date}; "
           f"{meta['days_logged']} day(s) in the log"
@@ -12096,7 +12145,7 @@ Verdicts are framework outputs, not investment advice.
         tip:'Verdicts that are BUY or ADD now but were something else (HOLD, WATCH, TRIM…) at an earlier close. Today: it was something else at the last close. Earlier this week: it turned in the past seven days and has stayed buy-grade since.' },
       { type:'facet', attr:'bases', label:'Across bases', short:'Bases', skip:[''],
         order:['agree','split'], labels:{agree:'Same on every base',split:'Differs by base'},
-        tip:'Whether Composite, Quality and Blend give the same verdict under the current Scoring. Differs means the Base switch changes it.' },
+        tip:'Whether Composite, Quality, Blend and Buyback give the same verdict under the current Scoring. Differs means the Base switch changes it.' },
       { type:'facet', attr:'confidence', label:'Data confidence', short:'Confidence', skip:[''],
         order:['high','medium','low'], labels:{high:'High',medium:'Medium',low:'Low'},
         comboLabels:{high:'High confidence',medium:'Medium confidence',low:'Low confidence'},
@@ -12110,10 +12159,16 @@ Verdicts are framework outputs, not investment advice.
       { type:'facet', attr:'news', label:'News sentiment', short:'News', skip:[''],
         order:['bullish','neutral','bearish'],
         labels:{bullish:'📰 Bullish',neutral:'📰 Neutral',bearish:'📰 Bearish'} },
+      { type:'facet', attr:'buyback', label:'Buyback rule', short:'Buyback', skip:[''],
+        order:['met','partly','missed'], labels:{met:'✓ Met',partly:'Partly met',missed:'Missed'},
+        comboLabels:{met:'Buyback rule met',partly:'Buyback rule partly met',missed:'Buyback rule missed'},
+        tip:'The Buyback base’s rule: revenue growing 10%+ a year AND diluted shares down 1%+ on the year. Partly met is a near miss on either half; Missed includes a half with no data. The Buyback base scores a miss as neutral, not a sell.' },
       { type:'range', attr:'news-score', label:'News score (−1…+1)', short:'News score', step:0.1, signed:true },
       { type:'range', attr:'verdict-score', label:'Verdict score', short:'Verdict pts', integer:true },
       { type:'range', attr:'quality', label:'Quality gates', short:'Quality', integer:true },
       { type:'range', attr:'score', label:'Composite score', short:'Composite', integer:true },
+      { type:'range', attr:'shares', label:'Share count, 1 yr', short:'Shares', unit:'%', step:0.1, signed:true,
+        tip:'Change in diluted shares over the latest year; below zero means buybacks shrank the count. Half of the Buyback rule: full credit at −1% or lower, none at +1% or higher.' },
     ]},
     { id: 'price', title: 'Price & value', cards: [
       { type:'range', attr:'upside', label:'Upside to target', short:'Upside', unit:'%' },
@@ -13136,10 +13191,13 @@ def main():
                     help="The base score this run acts on for watchlist "
                          "pruning, tax flags and the history ledger: composite "
                          "(the Composite Score), quality (the nine quality "
-                         "filters 70%% + analyst 15%% + insider 15%%) or blend "
-                         "(the average of the two). Overrides the "
-                         "BASE_SCORE_MODE env var; default composite. The "
-                         "report carries all three either way.")
+                         "filters 70%% + analyst 15%% + insider 15%%), blend "
+                         "(the average of the two) or buyback (revenue growth "
+                         "AND a shrinking share count 70%% + analyst + "
+                         "insider), each with -cal for Recalibrated scoring. "
+                         "Overrides the BASE_SCORE_MODE env var; composite "
+                         "when neither is set. The report carries every base "
+                         "either way.")
     ap.add_argument("--lots-csv", default=None,
                     help="Optional purchase-history CSV (columns: ticker,date,"
                          "shares,price) for exact lot-level tax analysis in CSV "
@@ -13603,7 +13661,7 @@ def main():
             if syncing:
                 import robinhood_source as rhs
                 adds, skipped, tags = select_screen_additions(
-                    channels,
+                    rank_screen_channels(channels, base_score_mode()),
                     held_tickers={r["ticker"] for r in rows},
                     history=_prior_history,
                     limit=args.screen_add_limit,

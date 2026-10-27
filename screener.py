@@ -456,6 +456,9 @@ class ScreenResult:
     score_insider: Optional[float] = None
     insider_activity: Optional[dict] = None
     score_composite: Optional[float] = None
+    # The Buyback base's rule as a 0-1 product (stage 2; analyze_portfolio.
+    # buyback_rule). Orders the additions when Buyback is the run's base.
+    buyback_rule: Optional[float] = None
     # Errors
     error: Optional[str] = None
 

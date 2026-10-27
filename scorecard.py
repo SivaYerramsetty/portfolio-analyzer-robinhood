@@ -897,12 +897,16 @@ def _buy_share(log: dict, mode: str, last_days: int = 5) -> Optional[float]:
 
 def build_scorecard(log: dict, modes: tuple, default_mode: str,
                     labels: Optional[dict] = None,
-                    horizons=HORIZONS) -> dict:
+                    horizons=HORIZONS,
+                    unscored: Optional[dict] = None) -> dict:
     """Everything the report's scorecard section shows, from the log alone.
 
     `modes` are the base-score mode keys; `labels` their display names (for
-    the suggestions' wording). Returns {"meta", "modes", "compare",
-    "factors", "suggestions"}; "suggestions" is {mode: [(tone, text)]}."""
+    the suggestions' wording); `unscored` {mode: FACTORS keys} the inputs a
+    mode leaves out of its verdict (the Buyback base's trend), which its
+    suggestions then don't offer more or less weight. Returns {"meta",
+    "modes", "compare", "factors", "suggestions"}; "suggestions" is {mode:
+    [(tone, text)]}."""
     labels = labels or {m: m for m in modes}
     calls = evaluate_calls(log, horizons)
     days = log.get("days") or {}
@@ -952,7 +956,8 @@ def build_scorecard(log: dict, modes: tuple, default_mode: str,
     sc = {"meta": meta, "modes": per_mode, "compare": compare,
           "compare_n": compare_n, "factors": factors,
           "found": found_scorecard(log, horizons)}
-    sc["suggestions"] = {m: suggest(sc, m, modes, labels, horizons)
+    sc["suggestions"] = {m: suggest(sc, m, modes, labels, horizons,
+                                    (unscored or {}).get(m, ()))
                          for m in modes}
     return sc
 
@@ -982,11 +987,12 @@ def _pct(x: float) -> str:
 
 
 def suggest(sc: dict, mode: str, modes: tuple, labels: dict,
-            horizons=HORIZONS) -> list[tuple[str, str]]:
+            horizons=HORIZONS, unscored=()) -> list[tuple[str, str]]:
     """Plain-text findings for one mode, each (tone, text) with tone one of
     good / bad / neutral. Conservative on purpose: every rule needs enough
     calls and enough independent periods, and the wording is about the
-    scoring model, never about a stock."""
+    scoring model, never about a stock. `unscored`: FACTORS keys this mode
+    doesn't score, reported without a weight suggestion."""
     h = suggestion_horizon(sc, horizons)
     name = labels.get(mode, mode)
     if h is None:
@@ -1085,7 +1091,19 @@ def suggest(sc: dict, mode: str, modes: tuple, labels: dict,
         if not significant(f):
             continue
         agrees = (f["ic"] > 0) == (lean > 0)
-        if not agrees:
+        if key in unscored:
+            if agrees and abs(f["ic"]) < IC_STRONG:
+                continue
+            found = ("carried real signal" if agrees
+                     else "pointed the wrong way")
+            stance = ("leaves it unscored" if agrees
+                      else "already leaves it unscored")
+            factor_notes.append((abs(f["t"]), (
+                "neutral",
+                f"{label} has {found} over {span} (rank correlation "
+                f"{f['ic']:+.2f}). {name} {stance}; in the other bases it "
+                f"is {role}.")))
+        elif not agrees:
             how = ("names scoring higher on it did worse" if lean > 0 else
                    "names nearer their 52-week high did better, though the "
                    "verdict docks them")

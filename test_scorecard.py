@@ -548,6 +548,25 @@ def test_suggestions() -> None:
     check("rates 100% of names buy-grade" in q_joined, True,
           "a base rating every name a buy isn't offered as the default")
 
+    # An input a base leaves out of its verdict (the Buyback base's trend)
+    # gets no weight advice under that base.
+    card = sc.build_scorecard(synthetic_log(), ("composite", "quality"),
+                              "composite", labels,
+                              unscored={"quality": ("g", "v")})
+    q_joined = " ".join(t for _, t in card["suggestions"]["quality"])
+    c_joined = " ".join(t for _, t in card["suggestions"]["composite"])
+    check(("Growth has carried real signal over 1 month" in q_joined,
+           "Quality leaves it unscored; in the other bases it is 20% of the "
+           "Composite." in q_joined,
+           "Value has pointed the wrong way over 1 month" in q_joined,
+           "Quality already leaves it unscored" in q_joined,
+           "weight" in q_joined),
+          (True, True, True, True, False),
+          "an input the viewed base leaves out is reported, without weight advice")
+    check(("Growth has carried real signal" in c_joined,
+           "a candidate for more weight" in c_joined), (True, True),
+          "while a base that scores it still gets the advice")
+
 
 def test_digest() -> None:
     section("digest: the scorecard as text for the AI brief")
