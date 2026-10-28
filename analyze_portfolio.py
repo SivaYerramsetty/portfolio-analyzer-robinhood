@@ -6428,6 +6428,26 @@ def _base_agreement(r, mode: str) -> str:
     return "agree" if len({v.label for v in verdicts}) == 1 else "split"
 
 
+# The bases that must all rate a name buy-grade for the "Buy on all 3 bases"
+# filter. Blend is left out — it's a mix of Composite and Quality, so it adds
+# no independent read beyond those two.
+BUY_ACROSS_BASES = ("composite", "quality", "buyback")
+
+
+def _buy_across_bases(r, mode: str) -> str:
+    """The "Buy on all 3 bases" filter value under `mode`: 'yes' when the
+    Composite, Quality and Buyback bases all rate r buy-grade (BUY/ADD/BUY
+    MORE) at that mode's calibration, '' otherwise (including rows without
+    per-mode verdicts, e.g. ETF/thematic). Base-independent but calibration-
+    dependent, so like `_base_agreement` it's carried per mode."""
+    _, cal = split_base_mode(mode)
+    verdicts = [(getattr(r, "verdicts", None) or {}).get(join_base_mode(b, cal))
+                for b in BUY_ACROSS_BASES]
+    if any(v is None for v in verdicts):
+        return ""
+    return "yes" if all(v.label in BUY_GRADE_VERDICTS for v in verdicts) else ""
+
+
 def _tr_open(r, orders: Optional[dict[str, int]] = None,
              list_key: str = HOLDINGS_LIST_KEY) -> str:
     """Open a <tr> with data attributes used by the filter bar.
@@ -6504,6 +6524,7 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
                          f"data-has-tax-{m}='{m_tax}' "
                          f"data-confidence-{m}='{_confidence_attr(v)}' "
                          f"data-bases-{m}='{_base_agreement(r, m)}' "
+                         f"data-buy3-{m}='{_buy_across_bases(r, m)}' "
                          f"data-turned-buy-{m}='{_turned_buy_value(_turned_in(r, m))}' ")
     for m, index in (orders or {}).items():
         per_mode += f"data-order-{m}='{index}' "
@@ -6554,6 +6575,7 @@ def _tr_open(r, orders: Optional[dict[str, int]] = None,
         f"data-rank-move='{rank_move}' data-rank-delta='{rank_delta}' "
         f"data-confidence='{_confidence_attr(r.verdict)}' "
         f"data-bases='{_base_agreement(r, base_score_mode())}' "
+        f"data-buy3='{_buy_across_bases(r, base_score_mode())}' "
         f"data-turned-buy='{_turned_buy_value(_turned_in(r, base_score_mode()))}' "
         f"data-drop-band='{drop_band}' data-off-high='{off_high}' "
         f"data-vol='{vol}' data-risk-share='{risk_share}' "
@@ -11866,7 +11888,7 @@ Verdicts are framework outputs, not investment advice.
     return base + (cal === 'cal' ? CAL_SUFFIX : '');
   }
   var PER_MODE = ['verdict', 'verdict-score', 'rank-move', 'rank-delta', 'has-tax',
-                  'confidence', 'bases', 'turned-buy'];
+                  'confidence', 'bases', 'buy3', 'turned-buy'];
   var root = document.documentElement;
   var sw = document.getElementById('baseScoreSwitch');
 
@@ -12146,6 +12168,10 @@ Verdicts are framework outputs, not investment advice.
       { type:'facet', attr:'bases', label:'Across bases', short:'Bases', skip:[''],
         order:['agree','split'], labels:{agree:'Same on every base',split:'Differs by base'},
         tip:'Whether Composite, Quality, Blend and Buyback give the same verdict under the current Scoring. Differs means the Base switch changes it.' },
+      { type:'facet', attr:'buy3', label:'Buy on all 3 bases', short:'3-base buy', skip:[''], flag:true,
+        order:['yes'], labels:{yes:'✓ Composite, Quality & Buyback'},
+        comboLabels:{yes:'Buy on all 3 bases'},
+        tip:'Names rated buy-grade (BUY or ADD) under Composite, Quality and Buyback all at once, at the current Scoring — the high-conviction overlap. Blend is left out: it is a mix of Composite and Quality.' },
       { type:'facet', attr:'confidence', label:'Data confidence', short:'Confidence', skip:[''],
         order:['high','medium','low'], labels:{high:'High',medium:'Medium',low:'Low'},
         comboLabels:{high:'High confidence',medium:'Medium confidence',low:'Low confidence'},

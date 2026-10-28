@@ -1112,6 +1112,10 @@ def test_filter_bar_options() -> None:
     check((aaa["bases"], aaa["bases-quality"], aaa["bases-blend-cal"], bbb["bases"]),
           ("agree", "agree", "agree", "split"),
           "Across bases: agree when every base gives the same verdict, per mode")
+    check((aaa["buy3"], aaa["buy3-composite"], aaa["buy3-quality-cal"],
+           bbb["buy3"], _row_attrs(page, "ETF")["buy3"]),
+          ("yes", "yes", "yes", "", ""),
+          "Buy on all 3 bases: yes only when Composite, Quality and Buyback all buy-grade")
     check((ccc["confidence"], ccc["confidence-composite"], ccc["confidence-quality"],
            ccc["confidence-blend"], aaa["confidence"]),
           ("low", "low", "high", "medium", "high"),
@@ -1129,11 +1133,12 @@ def test_filter_bar_options() -> None:
 
     script = re.search(r"/\* ---------- Filter bar:.*?\n\}\)\(\);", page, re.S).group(0)
     per_mode = re.search(r"var PER_MODE = \[([^\]]*)\]", page).group(1)
-    check(("'confidence'" in per_mode, "'bases'" in per_mode), (True, True),
-          "the base switch copies confidence and agreement with the verdict")
+    check(("'confidence'" in per_mode, "'bases'" in per_mode, "'buy3'" in per_mode),
+          (True, True, True),
+          "the base switch copies confidence, agreement and 3-base buy with the verdict")
     sections = script.split("var SECTIONS = [", 1)[1].split("var PRESETS", 1)[0]
     cards = re.findall(r"type:'(?:facet|range)', attr:'([\w-]+)'", sections)
-    check([c for c in ("bases", "confidence", "drop-band", "off-high", "vol",
+    check([c for c in ("bases", "buy3", "confidence", "drop-band", "off-high", "vol",
                        "risk-share", "list", "buyback", "shares")
            if c not in cards], [],
           "the panel has the new cards")
