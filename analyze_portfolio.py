@@ -2435,13 +2435,18 @@ def _compute_multi_year_growth(tkr, info: dict) -> None:
         opinc = usable_series(opinc_row)
 
         # ---- Revenue CAGR ----
+        # Both endpoints must be positive, as for earnings below: a negative
+        # newest year (an insurer's investment losses, say) raised to 1/2 or
+        # 1/3 gives a complex number, which no comparison can read and which
+        # stopped the fundamentals cache from saving, failing the screen every
+        # run on 2026-11-05/06. Without a CAGR the 1-year figure stands in.
         if rev:
             latest, earliest, n_years = None, None, 0
-            if len(rev) >= 4 and rev[3] > 0:
+            if len(rev) >= 4 and rev[0] > 0 and rev[3] > 0:
                 latest, earliest, n_years = rev[0], rev[3], 3
-            elif len(rev) >= 3 and rev[2] > 0:
+            elif len(rev) >= 3 and rev[0] > 0 and rev[2] > 0:
                 latest, earliest, n_years = rev[0], rev[2], 2
-            elif len(rev) >= 2 and rev[1] > 0:
+            elif len(rev) >= 2 and rev[0] > 0 and rev[1] > 0:
                 latest, earliest, n_years = rev[0], rev[1], 1
 
             if latest is not None and earliest is not None and earliest > 0:

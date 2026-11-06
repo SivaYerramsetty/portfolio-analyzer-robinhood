@@ -238,11 +238,12 @@ class _Statements:
     """Just enough of a yfinance Ticker for _compute_multi_year_growth: an
     income statement whose newest year comes first."""
 
-    def __init__(self, shares: list):
+    def __init__(self, shares: list, revenue: list | None = None):
         import pandas as pd
         cols = pd.to_datetime([f"{2025 - i}-12-31" for i in range(len(shares))])
+        revenue = revenue or [100.0] * len(shares)
         self.income_stmt = pd.DataFrame(
-            {c: [100.0, 10.0, s] for c, s in zip(cols, shares)},
+            {c: [r, 10.0, s] for c, r, s in zip(cols, revenue, shares)},
             index=["Total Revenue", "Net Income", "Diluted Average Shares"])
         self.balance_sheet = pd.DataFrame()
         self.cashflow = pd.DataFrame()
@@ -349,6 +350,20 @@ def test_buyback_base() -> None:
         check(None if got is None else round(got, 4), want, f"share count change: {label}")
     check("shareCountChange" in ap._GROWTH_METRIC_KEYS, True,
           "the share-count change rides the fundamentals cache")
+
+    # A negative newest revenue once made a complex CAGR, which json.dumps
+    # refuses: the fundamentals cache stopped saving and the screen failed
+    # every run (2026-11-05/06).
+    for revenue, want, label in (
+            ([133.1, 121.0, 110.0, 100.0], 0.1, "a 3-year CAGR from positive endpoints"),
+            ([-50.0, 120.0, 110.0, 100.0], None, "a negative newest year gives no CAGR"),
+            ([0.0, 120.0, 110.0], None, "nor does a zero one")):
+        info = {"symbol": "TEST"}
+        ap._compute_multi_year_growth(_Statements([100.0] * len(revenue), revenue), info)
+        got = info.get("revenueCAGR3y")
+        check(None if got is None else round(got, 4), want, f"revenue CAGR: {label}")
+        check(json.loads(json.dumps(info)) is not None, True,
+              f"and the metrics still serialize ({label})")
 
     with _mode_env():
         html = ap._base_switch_html(interactive=False)
