@@ -1,4 +1,7 @@
 name: Portfolio Analyzer
+# Tax runs get their own title: the report's Tax button looks for it to follow
+# the run it started. Every other run keeps the workflow's name.
+run-name: ${{ inputs.include_tax && 'Portfolio Analyzer (tax file)' || 'Portfolio Analyzer' }}
 on:
     # schedule:                          # ← comment these out
   #   - cron: '30 13 * * 1-5'
@@ -10,7 +13,7 @@ on:
         type: boolean
         default: false
       include_tax:
-        description: "Include the Tax-Aware Trim Guidance section (fetches full order history; off by default)"
+        description: "Write the tax file, the Tax-Aware Trim Guidance as its own page beside the report (fetches full order history; off by default). The report's Tax button sets this"
         type: boolean
         default: false
       analyze_misses:
@@ -232,8 +235,12 @@ jobs:
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
         run: |
           # --tax / --analyze-misses only when their dispatch checkboxes are set.
+          # The tax file goes into .cache/, which rides the Actions cache, so
+          # the next runs can keep publishing it (see Build site).
           TAX_FLAG=""
-          if [ "${{ inputs.include_tax }}" = "true" ]; then TAX_FLAG="--tax"; fi
+          if [ "${{ inputs.include_tax }}" = "true" ]; then
+            TAX_FLAG="--tax --tax-out .cache/tax_report.html"
+          fi
           MISS_FLAG=""
           if [ "${{ inputs.analyze_misses }}" = "true" ]; then MISS_FLAG="--analyze-misses"; fi
           # A one-off base score overrides BASE_SCORE_MODE; 'default' (and the
@@ -267,12 +274,36 @@ jobs:
             --out report.html
 
       - name: Build site
+        env:
+          # How long the tax file stays on the site after its run made it. The
+          # Tax button fetches it within minutes; the window is for a run
+          # queued behind the tax run, which would otherwise publish a site
+          # without it first. Past that it comes off the site and out of the
+          # cache, so real tax figures don't linger on the public Pages URL.
+          TAX_FILE_KEEP_MINUTES: 120
         run: |
           mkdir -p _site
           cp report.html _site/index.html
+          TAX=.cache/tax_report.html
+          if [ -f "$TAX" ]; then
+            made=$(grep -o '<meta name="tax-report-generated-ms" content="[0-9]*">' "$TAX" \
+                   | grep -o '[0-9][0-9]*' | head -n 1 || true)
+            now=$(( $(date +%s) * 1000 ))
+            if [ -n "$made" ] && [ $(( now - made )) -lt $(( TAX_FILE_KEEP_MINUTES * 60000 )) ]; then
+              cp "$TAX" _site/tax_report.html
+              echo "Publishing the tax file made $(( (now - made) / 60000 )) min ago"
+            else
+              rm -f "$TAX"
+              echo "Tax file is past ${TAX_FILE_KEEP_MINUTES} min; removed"
+            fi
+          fi
 
       - name: Add password protection        # ← MOVED before upload
-        run: python add_password_protection.py _site/index.html --in-place
+        run: |
+          python add_password_protection.py _site/index.html --in-place
+          if [ -f _site/tax_report.html ]; then
+            python add_password_protection.py _site/tax_report.html --in-place
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

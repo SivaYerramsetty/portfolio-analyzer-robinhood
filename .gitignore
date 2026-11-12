@@ -39,3 +39,5 @@ equity_history.json
 # the page as plaintext, so committing it published them.)
 report.html
 report_protected.html
+# The --tax output file: realized gains, cost basis and estimated tax owed.
+tax_report.html

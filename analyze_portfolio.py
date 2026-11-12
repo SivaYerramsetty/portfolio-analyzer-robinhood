@@ -5800,14 +5800,15 @@ def _build_refresh_widget() -> tuple[str, str]:
         return _base_switch_html(interactive=False), ""
     # Base-score switch first; the script below saves its "Make default"
     # choice as the BASE_SCORE_MODE repository variable.
-    # Tax toggle sits before the refresh button. Its state lives in
-    # localStorage; when on, the dispatch below sends include_tax=true so the
-    # regenerated report contains the Tax-Aware Trim Guidance section.
+    # The Tax button sits before the refresh button. It dispatches a run with
+    # include_tax=true, which writes the Tax-Aware Trim Guidance to its own
+    # file beside the report (not into it); the script below downloads that
+    # file once Pages serves it.
     button = _base_switch_html(interactive=True)
-    button += ('<button id="taxSectionToggle" class="refresh-btn tax-toggle" '
-              'aria-pressed="false" '
-              'title="Include the Tax-Aware Trim Guidance section in the '
-              'next data refresh">'
+    button += ('<button id="taxFileBtn" class="refresh-btn" '
+              'title="Make the tax file: runs the workflow with your full '
+              'order history, then downloads the Tax-Aware Trim Guidance as '
+              'tax-report-&lt;date&gt;.html (takes a few minutes)">'
               '&#129534; Tax</button>'
               '<button id="missAnalysisToggle" class="refresh-btn miss-toggle" '
               'aria-pressed="false" '
@@ -5827,44 +5828,197 @@ def _build_refresh_widget() -> tuple[str, str]:
   var WORKFLOW = "portfolio.yml";   // file name under .github/workflows/
   var REF = "main";
   var TOKEN_KEY = "gh-dispatch-token";
-  var TAX_KEY = "tax-section-enabled";
+  // The tax file a --tax run publishes beside this report, and the <meta>
+  // that stamps when it was made. The workflow keeps publishing the newest
+  // one for a while after its run, so a run queued behind it can't take it
+  // down before this page fetches it.
+  var TAX_FILE = "__TAX_FILE__";
+  var TAX_PENDING_KEY = "tax-file-pending";   // when this browser asked for one
+  var TAX_WAIT_MS = 60 * 60000;               // the job itself times out at 45 min
+  var taxTimer = null, taxBusy = false;
   var MISS_KEY = "miss-analysis-enabled";
   var BASE_VAR = "BASE_SCORE_MODE";   // repository variable the workflow reads
   var BASE_LABELS = __BASE_LABELS__;
   var DEFAULT_NOTE = __DEFAULT_NOTE__;
   var pollTimer = null, startedAt = null;
 
-  function taxEnabled() {
-    try { return localStorage.getItem(TAX_KEY) === "1"; }
-    catch (e) { return false; }
-  }
   function missEnabled() {
     try { return localStorage.getItem(MISS_KEY) === "1"; }
     catch (e) { return false; }
   }
-  // Tax section toggle: persisted per-browser; honored by every dispatch
-  // the Refresh data button makes (ghTriggerRefresh reads it at send time).
-  (function() {
-    var tb = document.getElementById("taxSectionToggle");
-    if (!tb) return;
-    function paint() {
-      var on = taxEnabled();
-      tb.classList.toggle("active", on);
-      tb.setAttribute("aria-pressed", on ? "true" : "false");
-      tb.title = on
-        ? "Tax section ON \\u2014 the next data refresh will include the " +
-          "Tax-Aware Trim Guidance section. Click to turn off."
-        : "Include the Tax-Aware Trim Guidance section in the next data " +
-          "refresh (fetches full order history, so the run takes longer).";
+  // Tax button: dispatches a run with include_tax, which writes the tax file,
+  // then downloads that file once Pages serves it. The request is kept in
+  // localStorage, so the wait carries on after the auto-reload that the run's
+  // own deploy triggers (or on the next visit, within TAX_WAIT_MS).
+  function taxPending() {
+    try { return parseInt(localStorage.getItem(TAX_PENDING_KEY), 10) || 0; }
+    catch (e) { return 0; }
+  }
+  function setTaxPending(ms) {
+    try {
+      if (ms) localStorage.setItem(TAX_PENDING_KEY, String(ms));
+      else localStorage.removeItem(TAX_PENDING_KEY);
+    } catch (e) {}
+  }
+  function taxDone(msg, isError) {
+    clearInterval(taxTimer);
+    taxTimer = null;
+    setTaxPending(0);
+    var tb = document.getElementById("taxFileBtn");
+    if (tb) tb.disabled = false;
+    if (msg) setStatus(msg, isError);
+  }
+  async function fetchTaxFile() {
+    try {
+      var r = await fetch(TAX_FILE + "?v=" + Date.now(), {cache: "no-store"});
+      if (!r.ok) return null;
+      var html = await r.text();
+      var m = /<meta name="__TAX_STAMP__" content="([0-9]+)">/.exec(html);
+      return m ? {html: html, generated: parseInt(m[1], 10)} : null;
+    } catch (e) { return null; }
+  }
+  // The run this request started. The workflow titles tax runs "... (tax
+  // file)", so a scheduled run dispatched alongside can't pass for it; the
+  // oldest such run since the click is this one.
+  async function findTaxRun(since) {
+    var tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok) return null;
+    try {
+      var r = await fetch(API + "/actions/workflows/" + WORKFLOW +
+                          "/runs?event=workflow_dispatch&per_page=30",
+                          {headers: headers(tok)});
+      if (!r.ok) return null;
+      var runs = ((await r.json()).workflow_runs || []).filter(function(run) {
+        return (run.display_title || "").indexOf("(tax file)") !== -1 &&
+               new Date(run.created_at).getTime() >= since - 120000;
+      });
+      return runs.length ? runs[runs.length - 1] : null;
+    } catch (e) { return null; }
+  }
+  // Whether the run skipped its analysis: the workflow's gate skips it when
+  // the market is closed (weekends, NYSE holidays), so no file is coming.
+  async function analysisSkipped(run) {
+    var tok = localStorage.getItem(TOKEN_KEY);
+    if (!tok) return false;
+    try {
+      var r = await fetch(run.jobs_url, {headers: headers(tok)});
+      if (!r.ok) return false;
+      return ((await r.json()).jobs || []).some(function(j) {
+        return j.name === "analyze" && j.conclusion === "skipped";
+      });
+    } catch (e) { return false; }
+  }
+  function saveTaxFile(file) {
+    // Pages serves the file behind the report's password gate. This tab is
+    // already unlocked, so the saved copy leaves the gate out (the marker
+    // names are split so the gate script never mistakes this for its own).
+    var gate = new RegExp("<!-- PASSWORD_GATE_" + "START -->.*?" +
+                          "<!-- PASSWORD_GATE_" + "END -->", "s");
+    var html = file.html.replace(gate, "");
+    // Open on the base score this tab is viewing.
+    var mode = document.documentElement.getAttribute("data-base-view");
+    if (BASE_LABELS[mode]) {
+      html = html.replace(/<html data-base-view="[^"]*"/,
+                          '<html data-base-view="' + mode + '"');
     }
-    tb.addEventListener("click", function() {
-      try { localStorage.setItem(TAX_KEY, taxEnabled() ? "0" : "1"); }
-      catch (e) {}
-      paint();
+    var d = new Date(file.generated);
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    var name = "tax-report-" + d.getFullYear() + "-" + two(d.getMonth() + 1) +
+               "-" + two(d.getDate()) + ".html";
+    var url = URL.createObjectURL(new Blob([html], {type: "text/html"}));
+    function link(text) {
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.textContent = text;
+      return a;
+    }
+    var auto = link("");
+    document.body.appendChild(auto);
+    auto.click();
+    auto.remove();
+    taxDone();
+    // A download no click started (this one may follow a reload) can be held
+    // back by the browser, so the status line keeps a link to save it by hand.
+    var el = document.getElementById("ghRefreshStatus");
+    el.textContent = "\\u2713 Tax file ready \\u2014 ";
+    el.style.color = "var(--fg-muted)";
+    el.appendChild(link("save " + name));
+  }
+  async function taxTick() {
+    if (taxBusy || !taxTimer) return;
+    taxBusy = true;
+    try {
+      var since = taxPending();
+      if (!since) { taxDone(); return; }   // another tab already got it
+      var file = await fetchTaxFile();
+      if (!taxTimer) return;
+      if (file && file.generated >= since - 120000) { saveTaxFile(file); return; }
+      var waited = Date.now() - since;
+      if (waited > TAX_WAIT_MS) {
+        taxDone("No tax file turned up within an hour \\u2014 see the repo's " +
+                "Actions tab for the run's log.", true);
+        return;
+      }
+      var run = await findTaxRun(since);
+      if (!taxTimer) return;
+      if (run && run.status === "completed") {
+        if (run.conclusion !== "success") {
+          taxDone("The tax file run ended: " + run.conclusion + " \\u2014 click " +
+                  "Tax to try again, or see the repo's Actions tab for logs.", true);
+          return;
+        }
+        if (await analysisSkipped(run)) {
+          taxDone("The market is closed today, so the workflow skipped the " +
+                  "analysis and made no tax file. Try again on a market day.", true);
+          return;
+        }
+      }
+      var s = Math.floor(waited / 1000);
+      setStatus((run && run.status === "completed"
+                 ? "Tax file made \\u2014 waiting for Pages to publish it\\u2026 "
+                 : "Making the tax file" +
+                   (run ? " (run " + run.status.replace("_", " ") + ")" : "") +
+                   "\\u2026 ") + Math.floor(s / 60) + "m " + (s % 60) + "s");
+    } finally {
+      taxBusy = false;
+    }
+  }
+  function watchTaxFile() {
+    var since = taxPending();
+    if (taxTimer || !since) return;
+    if (Date.now() - since > TAX_WAIT_MS) { setTaxPending(0); return; }
+    var tb = document.getElementById("taxFileBtn");
+    if (tb) tb.disabled = true;
+    taxTimer = setInterval(taxTick, 15000);
+    taxTick();
+  }
+  (function() {
+    var tb = document.getElementById("taxFileBtn");
+    if (!tb) return;
+    tb.addEventListener("click", async function() {
+      if (taxPending()) return;
+      var tok = getToken(false);
+      if (!tok) return;
+      tb.disabled = true;
+      setStatus("Starting the tax file run\\u2026");
+      try {
+        var r = await dispatchRun(tok, {include_tax: "true"});
+        if (r.status === 204) {
+          setTaxPending(Date.now());
+          watchTaxFile();
+        } else {
+          await dispatchFailed(r, "Tax");
+          tb.disabled = false;
+        }
+      } catch (e) {
+        setStatus("Network error: " + e, true);
+        tb.disabled = false;
+      }
     });
-    paint();
+    watchTaxFile();   // a request made before a reload, or on an earlier visit
   })();
-  // Analyze-with-AI toggle: same pattern as Tax. When on, the dispatch sends
+  // Analyze-with-AI toggle, kept in localStorage. When on, every dispatch sends
   // analyze_misses=true and the regenerated report embeds a Claude post-mortem
   // of the Missed Opportunities.
   (function() {
@@ -6007,6 +6161,29 @@ def _build_refresh_widget() -> tuple[str, str]:
     return Math.floor(s / 60) + "m " + (s % 60) + "s";
   }
 
+  // Starts a workflow run. Every run started here honors the Analyze-with-AI
+  // toggle; workflow_dispatch inputs must be strings, even boolean-typed ones.
+  function dispatchRun(tok, inputs) {
+    if (missEnabled()) inputs.analyze_misses = "true";
+    var payload = {ref: REF};
+    if (Object.keys(inputs).length) payload.inputs = inputs;
+    return fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
+      method: "POST", headers: headers(tok), body: JSON.stringify(payload)
+    });
+  }
+  // A dispatch that didn't return 204. A rejected token is forgotten, so the
+  // next click of `button` asks for it again.
+  async function dispatchFailed(r, button) {
+    if (r.status === 401 || r.status === 403) {
+      localStorage.removeItem(TOKEN_KEY);
+      setStatus("Token rejected (HTTP " + r.status + ") \\u2014 click " + button +
+                " again to re-enter it.", true);
+    } else {
+      var body = await r.text();
+      setStatus("Dispatch failed: HTTP " + r.status + " " + body.slice(0, 120), true);
+    }
+  }
+
   window.ghTriggerRefresh = async function() {
     var tok = getToken(false);
     if (!tok) return;
@@ -6014,30 +6191,15 @@ def _build_refresh_widget() -> tuple[str, str]:
     btn.disabled = true;
     setStatus("Triggering workflow\\u2026");
     try {
-      var payload = {ref: REF};
-      // workflow_dispatch inputs must be strings, even for boolean-typed ones.
-      var inputs = {};
-      if (taxEnabled()) inputs.include_tax = "true";
-      if (missEnabled()) inputs.analyze_misses = "true";
-      if (Object.keys(inputs).length) payload.inputs = inputs;
-      var r = await fetch(API + "/actions/workflows/" + WORKFLOW + "/dispatches", {
-        method: "POST", headers: headers(tok),
-        body: JSON.stringify(payload)
-      });
+      var r = await dispatchRun(tok, {});
       if (r.status === 204) {
         startedAt = Date.now();
         setStatus("Workflow queued" +
-                  (taxEnabled() ? " with tax section" : "") +
                   (missEnabled() ? " with AI analysis" : "") +
                   " \\u2014 a fresh report usually takes a few minutes\\u2026");
         pollTimer = setInterval(pollRun, 12000);
-      } else if (r.status === 401 || r.status === 403) {
-        localStorage.removeItem(TOKEN_KEY);
-        setStatus("Token rejected (HTTP " + r.status + ") \\u2014 click Refresh again to re-enter it.", true);
-        btn.disabled = false;
       } else {
-        var body = await r.text();
-        setStatus("Dispatch failed: HTTP " + r.status + " " + body.slice(0, 120), true);
+        await dispatchFailed(r, "Refresh");
         btn.disabled = false;
       }
     } catch (e) {
@@ -6083,7 +6245,9 @@ def _build_refresh_widget() -> tuple[str, str]:
 """
     widget = (widget.replace("__REPO__", repo)
               .replace("__BASE_LABELS__", json.dumps(BASE_SCORE_LABELS))
-              .replace("__DEFAULT_NOTE__", json.dumps(_BASE_DEFAULT_NOTE)))
+              .replace("__DEFAULT_NOTE__", json.dumps(_BASE_DEFAULT_NOTE))
+              .replace("__TAX_FILE__", TAX_REPORT_FILENAME)
+              .replace("__TAX_STAMP__", TAX_REPORT_STAMP))
     return button, widget
 
 
@@ -7588,13 +7752,13 @@ def _render_tax_section(flagged: list,
             card += (
                 f"<table style='margin:0;font-size:12px;width:auto;"
                 f"border-collapse:collapse;'>"
-                f"<tr><th style='background:#fff;color:#7f8c8d;text-align:left;"
+                f"<tr><th style='background:transparent;color:var(--fg-muted);text-align:left;"
                 f"padding:2px 12px 2px 0;border:none;'></th>"
-                f"<th style='background:#fff;color:#7f8c8d;text-align:right;"
+                f"<th style='background:transparent;color:var(--fg-muted);text-align:right;"
                 f"padding:2px 12px;border:none;'>Shares</th>"
-                f"<th style='background:#fff;color:#7f8c8d;text-align:right;"
+                f"<th style='background:transparent;color:var(--fg-muted);text-align:right;"
                 f"padding:2px 12px;border:none;'>Unrealized</th>"
-                f"<th style='background:#fff;color:#7f8c8d;text-align:right;"
+                f"<th style='background:transparent;color:var(--fg-muted);text-align:right;"
                 f"padding:2px 12px;border:none;'>Est. tax if sold</th></tr>"
             )
             card += (
@@ -7699,7 +7863,7 @@ def _render_tax_section(flagged: list,
 
         # Timing note
         if ta.timing_note:
-            card += (f"<div style='font-size:12px;color:#34495e;background:#f8f9fa;"
+            card += (f"<div style='font-size:12px;color:var(--fg-body);background:var(--bg-page);"
                      f"padding:8px 10px;border-radius:4px;margin-bottom:8px;'>"
                      f"⏱ {ta.timing_note}</div>\n")
 
@@ -7725,6 +7889,133 @@ def _render_tax_section(flagged: list,
         html += _mode_variants(render_card, tag="div")
 
     return html
+
+
+# The --tax output file. The report no longer carries the tax section; a --tax
+# run writes it here instead (next to --out unless --tax-out says otherwise),
+# and CI publishes it beside the report for the header's Tax button to download.
+TAX_REPORT_FILENAME = "tax_report.html"
+# <meta name=…> carrying the file's generation time in epoch ms. The Tax button
+# and the workflow's build step both read it, so keep the markup exact.
+TAX_REPORT_STAMP = "tax-report-generated-ms"
+
+
+def generate_tax_report_file(results: list,
+                             realized_ytd: Optional[dict] = None,
+                             generated_ms: Optional[int] = None) -> str:
+    """The Tax-Aware Trim Guidance as a standalone HTML document.
+
+    Holds what the report's tax section used to: YTD realized gains with the
+    tax estimate, the tax-minimization recommendations and a card per flagged
+    position. Cards exist for every base-score mode (like the report's), and
+    the file's own Base menu picks which mode's flags show — it opens on the
+    run's mode. Always returns a document, so a --tax run always leaves a file
+    behind, even when there is nothing to flag."""
+    flagged = [r for r in results if getattr(r, "tax", None) is not None]
+    gen_ms = int(time.time() * 1000) if generated_ms is None else int(generated_ms)
+    # Eastern time, like the report's own "Last updated" (CI runs in UTC).
+    gen_et = datetime.fromtimestamp(gen_ms / 1000, ZoneInfo("America/New_York"))
+    body = _render_tax_section(flagged, results, realized_ytd)
+    if not flagged and not realized_ytd:
+        body += ("<p style='color:var(--fg-muted);'>Nothing to show: no position "
+                 "is flagged SELL or TRIM or scores below "
+                 f"{TAX_FLAG_SCORE_THRESHOLD}, and there is no realized-gains "
+                 "data for this year.</p>\n")
+
+    base_menu = ""
+    if flagged:
+        run_mode = base_score_mode()
+        options = "".join(
+            f"<option value='{m}'{' selected' if m == run_mode else ''}>"
+            f"{BASE_SCORE_LABELS[m]}</option>" for m in BASE_SCORE_MODES)
+        base_menu = (
+            " · <label>Base score <select id='taxBase' title=\"Which base "
+            "score's SELL/TRIM and low-score flags pick the per-position "
+            f"cards\">{options}</select></label>")
+    # The section opens with its heading; the file's date line goes under it.
+    heading = "<h2 style='margin-top:48px;'>Tax-Aware Trim Guidance</h2>\n"
+    meta = (f"<p class='tax-meta'>Generated "
+            f"{gen_et:%B %d, %Y at %I:%M %p %Z}{base_menu}</p>\n")
+    body = body.replace(heading, "<h2>Tax-Aware Trim Guidance</h2>\n" + meta, 1)
+
+    return f"""<!DOCTYPE html>
+<html data-base-view="{base_score_mode()}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="{TAX_REPORT_STAMP}" content="{gen_ms}">
+<title>Tax-Aware Trim Guidance — {gen_et:%Y-%m-%d}</title>
+<script>
+  // Follow the system's light/dark setting (the report's own theme choice
+  // lives in its browser storage, which a saved file can't read).
+  try {{
+    if (window.matchMedia('(prefers-color-scheme: dark)').matches) {{
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }}
+  }} catch (e) {{}}
+</script>
+<style>
+{_THEME_TOKENS_CSS}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+          color: var(--fg-body); background: var(--bg-page);
+          max-width: 1100px; margin: 0 auto; padding: 24px 24px 48px;
+          line-height: 1.5; font-size: 14px; }}
+  h2 {{ font-size: 19px; margin: 0 0 12px; font-weight: 600;
+        color: var(--fg-strong); padding: 0 4px 10px;
+        border-bottom: 2px solid var(--border-medium); }}
+  h3 {{ font-size: 15px; margin: 24px 0 10px; font-weight: 600;
+        color: var(--fg-table-header); }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  thead th {{ background: var(--bg-table-header); color: var(--fg-table-header);
+              padding: 8px; text-align: left; font-weight: 600; font-size: 11px;
+              border-bottom: 2px solid var(--border-medium);
+              text-transform: uppercase; letter-spacing: 0.3px; }}
+  td {{ padding: 9px 8px; border-bottom: 1px solid var(--border-soft);
+        vertical-align: middle; color: var(--fg-body); }}
+  tbody tr:last-child td {{ border-bottom: none; }}
+  .verdict {{ padding: 4px 10px; border-radius: 12px; color: white;
+              font-weight: 600; font-size: 11px; letter-spacing: 0.4px;
+              display: inline-block; }}
+  .ticker {{ font-weight: 700; font-family: "SF Mono", SFMono-Regular,
+             Consolas, "Liberation Mono", monospace;
+             color: var(--fg-strong); letter-spacing: -0.2px; }}
+  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .tax-meta {{ color: var(--fg-muted); font-size: 12px; margin: 0 0 18px; }}
+  .tax-meta select {{ font: inherit; color: var(--fg-body);
+                      background: var(--bg-input);
+                      border: 1px solid var(--border-medium);
+                      border-radius: 6px; padding: 1px 4px; }}
+  @media print {{ .tax-meta label {{ display: none; }} }}
+{_base_view_css()}</style>
+</head>
+<body>
+{body}
+<script>
+  // Base menu: show the chosen base score's flagged positions.
+  (function() {{
+    var sel = document.getElementById('taxBase');
+    if (!sel) return;
+    var root = document.documentElement;
+    sel.value = root.getAttribute('data-base-view');
+    sel.addEventListener('change', function() {{
+      root.setAttribute('data-base-view', sel.value);
+    }});
+  }})();
+</script>
+</body>
+</html>
+"""
+
+
+def write_tax_report_file(path, results: list,
+                          realized_ytd: Optional[dict] = None) -> Path:
+    """Write generate_tax_report_file's document to `path`; returns the path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(generate_tax_report_file(results, realized_ytd))
+    return path
 
 
 def portfolio_risk(results: list[PositionAnalysis], *,
@@ -10328,10 +10619,109 @@ def _portfolio_insights(results: list[PositionAnalysis],
     return out
 
 
+# The report's colour tokens, light by default with [data-theme="dark"]
+# overrides. Shared with the standalone tax file so it matches the report.
+_THEME_TOKENS_CSS = """\
+  /* ---------- Theme tokens (light by default) ---------- */
+  :root {
+    --bg-page: #fafbfc;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f0f3f7;
+    --bg-table-header: #f3f5f7;
+    --bg-table-header-hover: #e8ebef;
+    --bg-row-even: #fafbfc;
+    --bg-row-hover: #eef2f7;
+    --bg-pill: #ffffff;
+    --bg-pill-hover: #f0f3f7;
+    --bg-pill-active: #2c3e50;
+    --bg-input: #ffffff;
+    --bg-summary: #ffffff;
+    --bg-alert: #fffbeb;
+    --bg-alert-border: #fde68a;
+    --bg-chip-neutral: #ecf0f1;
+    --bg-chip-green: #d4edda;
+    --bg-chip-red: #f8d7da;
+    --bg-chip-amber: #fff3cd;
+    --bg-chip-blue: #e7f1ff;
+    --bg-chip-yellow: #fff8e1;
+
+    --fg-strong: #1a2533;
+    --fg-body: #2c3e50;
+    --fg-muted: #7f8c8d;
+    --fg-faint: #95a5a6;
+    --fg-table-header: #34495e;
+    --fg-pill: #34495e;
+    --fg-pill-active: #ffffff;
+    --fg-alert: #7d5d00;
+    --fg-chip-green: #1e7e34;
+    --fg-chip-red: #a02622;
+    --fg-chip-amber: #7d6608;
+    --fg-chip-blue: #1c4d8c;
+    --fg-chip-neutral: #7f8c8d;
+
+    --border-soft: #f1f3f5;
+    --border-medium: #e1e4e8;
+    --border-strong: #d0d7de;
+
+    --pos-up: #1e7e34;
+    --pos-down: #a02622;
+    --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.04);
+    --shadow-sticky: 0 2px 6px rgba(15, 23, 42, 0.06);
+  }
+
+  /* ---------- Dark theme overrides ---------- */
+  [data-theme="dark"] {
+    --bg-page: #0f1419;
+    --bg-card: #1a2028;
+    --bg-card-hover: #232a35;
+    --bg-table-header: #232a35;
+    --bg-table-header-hover: #2d3540;
+    --bg-row-even: #161c24;
+    --bg-row-hover: #232a35;
+    --bg-pill: #1a2028;
+    --bg-pill-hover: #2d3540;
+    --bg-pill-active: #4a90e2;
+    --bg-input: #1a2028;
+    --bg-summary: #1a2028;
+    --bg-alert: #2d2517;
+    --bg-alert-border: #6b5a20;
+    /* Chips in dark mode — muted backgrounds, brighter text */
+    --bg-chip-neutral: #2d3540;
+    --bg-chip-green: #143324;
+    --bg-chip-red: #3d1a1a;
+    --bg-chip-amber: #3a2d10;
+    --bg-chip-blue: #1a2c44;
+    --bg-chip-yellow: #3d3010;
+
+    --fg-strong: #e8eaed;
+    --fg-body: #cbd5e0;
+    --fg-muted: #8b95a3;
+    --fg-faint: #6b7280;
+    --fg-table-header: #cbd5e0;
+    --fg-pill: #cbd5e0;
+    --fg-pill-active: #ffffff;
+    --fg-alert: #f0c97a;
+    --fg-chip-green: #4ade80;
+    --fg-chip-red: #f87171;
+    --fg-chip-amber: #fbbf24;
+    --fg-chip-blue: #60a5fa;
+    --fg-chip-neutral: #9ca3af;
+
+    --border-soft: #232a35;
+    --border-medium: #2d3540;
+    --border-strong: #3a4250;
+
+    --pos-up: #4ade80;
+    --pos-down: #f87171;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.5);
+  }
+"""
+
+
 def generate_html_report(
     results: list[PositionAnalysis],
     watchlists: Optional[dict[str, list[PositionAnalysis]]] = None,
-    realized_ytd: Optional[dict] = None,
     missed_opportunities: Optional[list[dict]] = None,
     recs_tracked_count: int = 0,
     avoided_losses: Optional[list[dict]] = None,
@@ -10710,101 +11100,7 @@ def generate_html_report(
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <style>
-  /* ---------- Theme tokens (light by default) ---------- */
-  :root {{
-    --bg-page: #fafbfc;
-    --bg-card: #ffffff;
-    --bg-card-hover: #f0f3f7;
-    --bg-table-header: #f3f5f7;
-    --bg-table-header-hover: #e8ebef;
-    --bg-row-even: #fafbfc;
-    --bg-row-hover: #eef2f7;
-    --bg-pill: #ffffff;
-    --bg-pill-hover: #f0f3f7;
-    --bg-pill-active: #2c3e50;
-    --bg-input: #ffffff;
-    --bg-summary: #ffffff;
-    --bg-alert: #fffbeb;
-    --bg-alert-border: #fde68a;
-    --bg-chip-neutral: #ecf0f1;
-    --bg-chip-green: #d4edda;
-    --bg-chip-red: #f8d7da;
-    --bg-chip-amber: #fff3cd;
-    --bg-chip-blue: #e7f1ff;
-    --bg-chip-yellow: #fff8e1;
-
-    --fg-strong: #1a2533;
-    --fg-body: #2c3e50;
-    --fg-muted: #7f8c8d;
-    --fg-faint: #95a5a6;
-    --fg-table-header: #34495e;
-    --fg-pill: #34495e;
-    --fg-pill-active: #ffffff;
-    --fg-alert: #7d5d00;
-    --fg-chip-green: #1e7e34;
-    --fg-chip-red: #a02622;
-    --fg-chip-amber: #7d6608;
-    --fg-chip-blue: #1c4d8c;
-    --fg-chip-neutral: #7f8c8d;
-
-    --border-soft: #f1f3f5;
-    --border-medium: #e1e4e8;
-    --border-strong: #d0d7de;
-
-    --pos-up: #1e7e34;
-    --pos-down: #a02622;
-    --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.04);
-    --shadow-sticky: 0 2px 6px rgba(15, 23, 42, 0.06);
-  }}
-
-  /* ---------- Dark theme overrides ---------- */
-  [data-theme="dark"] {{
-    --bg-page: #0f1419;
-    --bg-card: #1a2028;
-    --bg-card-hover: #232a35;
-    --bg-table-header: #232a35;
-    --bg-table-header-hover: #2d3540;
-    --bg-row-even: #161c24;
-    --bg-row-hover: #232a35;
-    --bg-pill: #1a2028;
-    --bg-pill-hover: #2d3540;
-    --bg-pill-active: #4a90e2;
-    --bg-input: #1a2028;
-    --bg-summary: #1a2028;
-    --bg-alert: #2d2517;
-    --bg-alert-border: #6b5a20;
-    /* Chips in dark mode — muted backgrounds, brighter text */
-    --bg-chip-neutral: #2d3540;
-    --bg-chip-green: #143324;
-    --bg-chip-red: #3d1a1a;
-    --bg-chip-amber: #3a2d10;
-    --bg-chip-blue: #1a2c44;
-    --bg-chip-yellow: #3d3010;
-
-    --fg-strong: #e8eaed;
-    --fg-body: #cbd5e0;
-    --fg-muted: #8b95a3;
-    --fg-faint: #6b7280;
-    --fg-table-header: #cbd5e0;
-    --fg-pill: #cbd5e0;
-    --fg-pill-active: #ffffff;
-    --fg-alert: #f0c97a;
-    --fg-chip-green: #4ade80;
-    --fg-chip-red: #f87171;
-    --fg-chip-amber: #fbbf24;
-    --fg-chip-blue: #60a5fa;
-    --fg-chip-neutral: #9ca3af;
-
-    --border-soft: #232a35;
-    --border-medium: #2d3540;
-    --border-strong: #3a4250;
-
-    --pos-up: #4ade80;
-    --pos-down: #f87171;
-    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
-    --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.5);
-  }}
-
+{_THEME_TOKENS_CSS}
   /* ---------- Foundation ---------- */
   * {{ box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -10849,7 +11145,6 @@ def generate_html_report(
                   transition: transform 0.15s, background 0.2s; }}
   .refresh-btn:hover {{ transform: scale(1.04); background: var(--bg-card-hover); }}
   .refresh-btn:disabled {{ opacity: 0.5; cursor: default; transform: none; }}
-  .tax-toggle.active,
   .miss-toggle.active {{ background: var(--bg-chip-green);
                         color: var(--fg-chip-green);
                         border-color: var(--pos-up); }}
@@ -11850,13 +12145,9 @@ def generate_html_report(
             html += _verdict_td(r)
             html += "</tr>\n"
         html += "</tbody></table></div>\n"
-    # ---------- Tax analysis section (moved to bottom by request) ----------
-    flagged_with_tax = [r for r in results
-                        if getattr(r, "tax", None) is not None]
-    # Render the tax section if there are flagged positions OR YTD data
-    # (YTD section is valuable even when no positions are flagged for trim).
-    if flagged_with_tax or realized_ytd:
-        html += _render_tax_section(flagged_with_tax, results, realized_ytd)
+    # The Tax-Aware Trim Guidance is not part of the report: a --tax run writes
+    # it to its own file (generate_tax_report_file), which the header's Tax
+    # button downloads.
 
     html += """
 <p style="color:#95a5a6;font-size:11px;margin-top:30px;">
@@ -12243,7 +12534,7 @@ Verdicts are framework outputs, not investment advice.
         labels:{up:'▲ Moved up',down:'▼ Moved down','new':'★ New today'} },
       { type:'range', attr:'rank-delta', label:'Rank Δ (places)', short:'Rank Δ', integer:true },
       { type:'facet', attr:'has-tax', label:'Tax', skip:['0',''], flag:true,
-        labels:{'1':'Has tax detail'} },
+        labels:{'1':'In tax file'} },
     ]},
   ];
 
@@ -13276,9 +13567,14 @@ def main():
                     help="When --source robinhood, also analyze Robinhood watchlists "
                          "and add a 'should I buy?' section to the report")
     ap.add_argument("--tax", action="store_true",
-                    help="Opt in to the Tax-Aware Trim Guidance section. Off by "
-                         "default — it's the only step that fetches your full "
-                         "order history, so skipping it keeps runs fast.")
+                    help="Opt in to the Tax-Aware Trim Guidance, written to its "
+                         "own file (tax_report.html next to --out; see "
+                         "--tax-out), not the report. Off by default — it's the "
+                         "only step that fetches your full order history, so "
+                         "skipping it keeps runs fast.")
+    ap.add_argument("--tax-out", default=None,
+                    help="Where --tax writes the tax file (default: "
+                         "tax_report.html in --out's folder).")
     ap.add_argument("--analyze-misses", action="store_true",
                     help="On-demand AI post-mortem of the Missed Opportunities: "
                          "sends the computed miss data (alpha, horizons, factors, "
@@ -13602,7 +13898,7 @@ def main():
         if args.tax:
             print("[robinhood] Reconstructing tax lots from order history...")
             tax_lots_lookup = rhs.fetch_tax_lots(verbose=True)
-            # Same order history computes YTD realized gains for the tax section
+            # Same order history computes YTD realized gains for the tax file
             realized_ytd = rhs.fetch_realized_ytd(verbose=True)
         if args.save_positions:
             # Mirror CSV format from parse_statement.py
@@ -13958,7 +14254,7 @@ def main():
                                   reconcile_lots_with_position)
         tax_cfg = TaxConfig.from_env()
         # Tax analysis is opt-in (--tax). When off, leave `flagged` empty so no
-        # r.tax is populated and the tax section is omitted from the report.
+        # r.tax is populated and no tax file is written.
         # Flag SELL/TRIM verdicts plus any position whose verdict score is
         # below 75 — weak-scoring holds are trim candidates too. A position
         # any base-score mode flags gets tax detail, so the report's base
@@ -14035,7 +14331,6 @@ def main():
 
     html = generate_html_report(
         results, watchlists=watchlists_analyzed or None,
-        realized_ytd=realized_ytd,   # None unless --tax populated it
         missed_opportunities=missed_opportunities,
         recs_tracked_count=recs_tracked_count,
         avoided_losses=avoided_losses,
@@ -14053,6 +14348,17 @@ def main():
         total_wl = sum(len(v) for v in watchlists_analyzed.values())
         print(f"Watchlist tickers analyzed: {total_wl}")
     print(f"Report written to {out.resolve()}")
+
+    # The tax guidance goes to its own file, not the report. Written on every
+    # --tax run, even with nothing flagged, so the run always leaves one.
+    if args.tax:
+        tax_out = (Path(args.tax_out) if args.tax_out
+                   else out.with_name(TAX_REPORT_FILENAME))
+        try:
+            written = write_tax_report_file(tax_out, results, realized_ytd)
+            print(f"Tax file written to {written.resolve()}")
+        except Exception as e:
+            print(f"[tax] Could not write the tax file: {e}")
 
     if args.email:
         send_email(html, f"Portfolio Analysis — {datetime.now():%Y-%m-%d}")
