@@ -958,6 +958,7 @@ def test_full_report() -> None:
                                   upside_pct=5.0)]}
         html = _render_report(results, watch)
         qr_html = _render_report(results, watch, env={"QUICK_RECS": "1"})
+        tax_doc = ap.generate_tax_report_file(results, generated_ms=1_780_000_000_000)
 
     labels = {p.ticker: {m: v.label for m, v in p.verdicts.items()}
               for p in holdings[:3] + watch["Tech"]}
@@ -992,18 +993,34 @@ def test_full_report() -> None:
            "data-has-tax-composite='1'" in bbb), (True, True, True),
           "BBB: ADD with no tax flag under quality, flagged under composite")
 
+    # The tax guidance lives in its own file, not the report.
+    check(("Trim Guidance</h2>" in html, "Per-Position Trim Detail" in html),
+          (False, False), "the report carries no tax section")
+    check(("Trim Guidance</h2>" in tax_doc, "Per-Position Trim Detail" in tax_doc),
+          (True, True), "the tax file does")
     cards = re.findall(r"<div class='bmode ([\w -]+)'[^>]*><div style='border:1px solid "
                        r"var\(--border-medium\);border-radius:8px;background:var\(--bg-card\);"
                        r"padding:14px 16px;margin-bottom:14px;'><div[^>]*>"
-                       r"<span class='ticker'[^>]*>(\w+)</span>", html)
+                       r"<span class='ticker'[^>]*>(\w+)</span>", tax_doc)
     check(sorted((t, c) for c, t in cards),
           [("BBB", _both_cals("blend")), ("BBB", _both_cals("buyback")),
            ("BBB", _both_cals("composite")),
            ("CCC", _both_cals("blend")), ("CCC", _both_cals("buyback")),
            ("CCC", _both_cals("composite")), ("CCC", _both_cals("quality"))],
           "tax cards show only in the modes that flag them, one per verdict pill")
-    check("No positions are flagged under" in html, False,
+    check("No positions are flagged under" in tax_doc, False,
           "every mode flags something here, so no empty-section note")
+    check(('<html data-base-view="composite">' in tax_doc,
+           f'<meta name="{ap.TAX_REPORT_STAMP}" content="1780000000000">' in tax_doc,
+           "html[data-base-view='quality'] .bmode.bmode-quality" in tax_doc,
+           "<option value='quality'>" in tax_doc,
+           "<option value='composite' selected>" in tax_doc),
+          (True, True, True, True, True),
+          "the file opens on the run's mode, carries its stamp, and its Base "
+          "menu switches the cards")
+    check(re.findall(r"<h2[^>]*>", tax_doc), ["<h2>"],
+          "one heading, without the report's top margin")
+    check(_tag_errors(tax_doc), [], "the tax file's tags balance, per-lot detail included")
 
     sell_trim = re.search(r"<strong>(.*?)</strong>Sell / Trim flags", html).group(1)
     check(re.findall(r"class='bmode ([\w -]+)'[^>]*>(\d+)<", sell_trim),
@@ -1221,8 +1238,8 @@ def test_refresh_script_parses() -> None:
             os.environ["GITHUB_REPOSITORY"] = old
     check('id="baseScoreSwitch"' in buttons and 'id="baseDefaultBtn"' in buttons, True,
           "the switch and Make default sit with the header buttons")
-    check(buttons.index("baseScoreSwitch") < buttons.index("taxSectionToggle"), True,
-          "ahead of the Tax toggle")
+    check(buttons.index("baseScoreSwitch") < buttons.index("taxFileBtn"), True,
+          "ahead of the Tax button")
     script = widget.split("<script>", 1)[1].rsplit("</script>", 1)[0]
     check(('"/actions/variables/" + BASE_VAR' in script, "base_score_mode" in script),
           (True, False),
@@ -1239,6 +1256,60 @@ def test_refresh_script_parses() -> None:
         proc = subprocess.run([node, "--check", str(path)],
                               capture_output=True, text=True)
     check(proc.returncode, 0, "node --check accepts the script"
+          + (f": {proc.stderr.strip()}" if proc.returncode else ""))
+
+
+def test_tax_file() -> None:
+    section("tax file: written on its own, dispatched and saved by the Tax button")
+    import add_password_protection as gate
+
+    with _mode_env():
+        empty = ap.generate_tax_report_file([], generated_ms=1_780_000_000_000)
+    check(("Nothing to show" in empty, "id='taxBase'" in empty, _tag_errors(empty)),
+          (True, False, []),
+          "with nothing flagged the file still comes out, saying so, with no Base menu")
+    with tempfile.TemporaryDirectory() as tmp, _mode_env():
+        out = ap.write_tax_report_file(Path(tmp) / "sub" / ap.TAX_REPORT_FILENAME, [])
+        check((out.name, "Tax-Aware Trim Guidance" in out.read_text()),
+              ("tax_report.html", True), "write_tax_report_file makes its folder")
+
+    old = os.environ.get("GITHUB_REPOSITORY")
+    os.environ["GITHUB_REPOSITORY"] = "owner/repo"
+    try:
+        buttons, widget = ap._build_refresh_widget()
+    finally:
+        if old is None:
+            os.environ.pop("GITHUB_REPOSITORY", None)
+        else:
+            os.environ["GITHUB_REPOSITORY"] = old
+    script = widget.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+    tax_btn = buttons.split('id="taxFileBtn"', 1)[1].split(">", 1)[0]
+    check(("aria-pressed" in tax_btn, "tax-toggle" in buttons), (False, False),
+          "the Tax button is a plain button now, not a toggle")
+    check(('dispatchRun(tok, {include_tax: "true"})' in script,
+           "include_tax" in script.split("window.ghTriggerRefresh", 1)[1]),
+          (True, False), "Tax dispatches an include_tax run; Refresh data never does")
+    check(("__TAX_" in script, f'var TAX_FILE = "{ap.TAX_REPORT_FILENAME}";' in script),
+          (False, True), "the tax placeholders are filled in")
+    check((gate.is_patched(widget), gate.remove_gate(widget) == widget), (False, True),
+          "the script never spells out the gate markers, so gating the report "
+          "leaves it whole")
+
+    node = shutil.which("node")
+    if not node:
+        print("  (node not found — skipping the download check)")
+        return
+    gated = gate.patch_html(empty, gate.PASSWORD_HASH)
+    gate_expr = re.search(r"var gate = (new RegExp\(.*?\"s\"\));", script, re.S).group(1)
+    stamp_re = re.search(r"var m = (/<meta name=.*?/)\.exec\(html\);", script).group(1)
+    probe = (f"var gate = {gate_expr}; var html = {json.dumps(gated)};\n"
+             f"var m = {stamp_re}.exec(html);\n"
+             "console.log(JSON.stringify([m && m[1], html.replace(gate, '')]));")
+    proc = subprocess.run([node, "-e", probe], capture_output=True, text=True)
+    stamp, saved = json.loads(proc.stdout or '[null, ""]')
+    check((stamp, "pw-gate" in gated, "pw-gate" in saved, saved == gate.remove_gate(gated)),
+          ("1780000000000", True, False, True),
+          "the page reads the Pages copy's stamp and saves it without the gate"
           + (f": {proc.stderr.strip()}" if proc.returncode else ""))
 
 
@@ -2106,7 +2177,7 @@ def main() -> int:
               test_compare_base_modes, test_mode_variants, test_report_markup,
               test_missed_opps_per_mode, test_missed_opps_markup,
               test_full_report, test_filter_bar_options,
-              test_refresh_script_parses,
+              test_refresh_script_parses, test_tax_file,
               test_calibration_insider, test_calibration_value,
               test_calibration_modifiers, test_calibration_hysteresis,
               test_recently_held_universe, test_screen_additions,
