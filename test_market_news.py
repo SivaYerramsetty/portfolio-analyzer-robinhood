@@ -365,6 +365,7 @@ def test_report() -> None:
     stubs = {
         "fetch_market_fear_greed": lambda: None,
         "fetch_benchmark_returns": lambda: None,
+        "fetch_entry_signal": lambda: None,
         "fetch_market_events": lambda: [{
             "name": "CPI inflation", "timed": True, "detail": "est 0.3%",
             "when": datetime.now(NY) + timedelta(days=1)}],

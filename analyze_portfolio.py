@@ -190,6 +190,7 @@ from typing import Optional
 
 import yfinance as yf
 
+import entry_signal
 import risk_signals
 import scorecard
 import yahoo_limits
@@ -548,6 +549,213 @@ def fetch_benchmark_returns() -> Optional[dict]:
         return data
     except Exception:
         return cached
+
+
+# --- Entry window (when to put new money in; see entry_signal.py) ----------
+# S&P 500 daily closes since 1928 and the VIX since 1990, fetched whole once
+# per ET day (2 Yahoo requests) and topped up with the last few sessions at
+# most every 30 minutes (2 more), plus multpl.com's monthly Shiller CAPE table
+# once a day. All of it is cached in .cache/ (carried across CI runs), and a
+# failed or refused fetch keeps the cached copy. ENTRY_SIGNAL=0 (or
+# MARKET_METER=0) turns the gauge off.
+_ENTRY_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "entry_history.json"
+_ENTRY_TAIL_TTL_SEC = 30 * 60
+_ENTRY_CAPE_URL = "https://www.multpl.com/shiller-pe/table/by-month"
+_entry_signal_memo: Optional[dict] = None
+_entry_signal_done = False
+
+
+def _entry_signal_enabled() -> bool:
+    return (os.environ.get("MARKET_METER", "").strip() != "0"
+            and os.environ.get("ENTRY_SIGNAL", "").strip() != "0")
+
+
+def _yf_daily_closes(symbol: str, period: str) -> Optional[tuple[list, list]]:
+    """(ISO dates, closes) of one index's daily history, or None when the
+    fetch failed, came back empty, or Yahoo refused anything meanwhile (a
+    refused fetch can come back partial, so it is never merged)."""
+    before = yahoo_limits.refusals()
+    try:
+        hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+    except Exception:
+        return None
+    if yahoo_limits.refusals() != before or hist is None or hist.empty:
+        return None
+    closes = hist["Close"].dropna()
+    # The exchange's own calendar date (the index is tz-aware local time).
+    dates = [ts.strftime("%Y-%m-%d") for ts in closes.index]
+    return dates, [round(float(x), 4) for x in closes.values]
+
+
+def _merge_closes(old: Optional[dict], tail: Optional[tuple[list, list]]) -> Optional[dict]:
+    """The cached series with `tail` laid over it from its first date on (a
+    tail's last close is today's live price during the session)."""
+    if not tail or not tail[0]:
+        return old
+    if not old or not old.get("d"):
+        return {"d": list(tail[0]), "c": list(tail[1])}
+    first = tail[0][0]
+    keep = [i for i, d in enumerate(old["d"]) if d < first]
+    return {"d": [old["d"][i] for i in keep] + list(tail[0]),
+            "c": [old["c"][i] for i in keep] + list(tail[1])}
+
+
+def _fetch_cape_table() -> Optional[dict]:
+    """multpl.com's monthly Shiller CAPE since 1871, or None. Rejected unless
+    it parses into a long, plausible series (a changed page must not replace
+    a good cached copy with a stub)."""
+    if not requests:
+        return None
+    try:
+        r = requests.get(_ENTRY_CAPE_URL, timeout=10, headers={
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0 Safari/537.36")})
+        if r.status_code != 200:
+            return None
+        dates, values = entry_signal.parse_multpl_table(r.text)
+    except Exception:
+        return None
+    if len(dates) < 1000 or not all(2 < v < 100 for v in values[-24:]):
+        return None
+    return {"d": dates, "c": values}
+
+
+def _load_entry_cache() -> dict:
+    try:
+        if _ENTRY_CACHE_PATH.exists():
+            data = json.loads(_ENTRY_CACHE_PATH.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_entry_cache(cache: dict) -> None:
+    try:
+        _ENTRY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ENTRY_CACHE_PATH.write_text(json.dumps(cache, separators=(",", ":")))
+    except OSError:
+        pass
+
+
+def refresh_entry_history(cache: dict, now: Optional[float] = None) -> bool:
+    """Bring the cached S&P, VIX and CAPE up to date in place: whole series
+    on the first run of an ET day, the last five sessions every 30 minutes
+    after that. Returns whether anything changed. Nothing is fetched once
+    Yahoo has refused this run."""
+    now = time.time() if now is None else now
+    today = _et_date_iso(now)
+    changed = False
+    full = cache.get("day") != today
+    if full or now - cache.get("tail_at", 0) >= _ENTRY_TAIL_TTL_SEC:
+        got_all = True
+        for key, symbol in (("sp", "^GSPC"), ("vix", "^VIX")):
+            if yahoo_limits.refusals():
+                got_all = False
+                break
+            if full:
+                fresh = _yf_daily_closes(symbol, "max")
+                if fresh and len(fresh[0]) > 1000:
+                    cache[key] = {"d": fresh[0], "c": fresh[1]}
+                    changed = True
+                    continue
+            tail = _yf_daily_closes(symbol, "5d")
+            if tail and cache.get(key):
+                cache[key] = _merge_closes(cache.get(key), tail)
+                changed = True
+            else:
+                got_all = False
+        if got_all:
+            cache["tail_at"] = now
+            if full:
+                cache["day"] = today
+    if cache.get("cape_day") != today:
+        cape = _fetch_cape_table()
+        if cape:
+            cache["cape"] = cape
+            changed = True
+        # One try a day: a site that refuses keeps the last good copy.
+        cache["cape_day"] = today
+        changed = True
+    return changed
+
+
+def fetch_entry_signal() -> Optional[dict]:
+    """The Entry window reading (entry_signal.assess) from the cached,
+    refreshed history; None when it's turned off or there is no S&P history
+    at all. Computed once per process."""
+    global _entry_signal_memo, _entry_signal_done
+    if not _entry_signal_enabled():
+        return None
+    if _entry_signal_done:
+        return _entry_signal_memo
+    cache = _load_entry_cache()
+    try:
+        if refresh_entry_history(cache):
+            _save_entry_cache(cache)
+    except Exception as e:  # never let the gauge break a run
+        print(f"[entry] refresh failed: {e}")
+    sig = None
+    sp, vix, cape = cache.get("sp") or {}, cache.get("vix") or {}, cache.get("cape") or {}
+    if sp.get("d"):
+        try:
+            sig = entry_signal.assess(sp["d"], sp["c"], vix.get("d", ()), vix.get("c", ()),
+                                      cape.get("d", ()), cape.get("c", ()))
+        except Exception as e:
+            print(f"[entry] assess failed: {e}")
+    if sig:
+        sig["alerted"] = cache.get("alerted")
+        print(f"[entry] {sig['rating']} ({sig['score']:.0f}/100): S&P "
+              f"{sig['reading']['drawdown']:+.1f}% from its high, VIX "
+              f"{sig['reading']['vix']:.1f} (peak {sig['reading']['vix_peak']:.1f} "
+              f"in {entry_signal.RECENT_SESSIONS} sessions)")
+    _entry_signal_memo, _entry_signal_done = sig, True
+    return sig
+
+
+def _smtp_configured() -> bool:
+    return all(os.environ.get(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASS", "EMAIL_TO"))
+
+
+def notify_entry_window(sig: Optional[dict]) -> bool:
+    """Email once when an entry window opens, the same way --email sends the
+    report (the SMTP_* settings). One email per window: the window's start
+    date is remembered in the entry cache once the email has gone. Returns
+    whether one was sent."""
+    if not sig or sig.get("state") != "open" or not sig.get("since"):
+        return False
+    since = sig["since"]
+    cache = _load_entry_cache()
+    if cache.get("alerted") == since:
+        return False
+    if not _smtp_configured():
+        print(f"[entry] Window open since {since}; no email (SMTP_HOST, SMTP_USER, "
+              "SMTP_PASS and EMAIL_TO aren't all set)")
+        return False
+    slug = _gh_repo_slug()
+    link = ""
+    if "/" in slug:
+        owner, repo = slug.split("/", 1)
+        link = (f'<p><a href="https://{owner.lower()}.github.io/{repo}/">Open the '
+                "report</a> and click the Entry window gauge for the full history.</p>")
+    r = sig["reading"]
+    body = (f"<p>{_entry_lead(sig)}</p>"
+            f"<p>S&amp;P 500 {r['level']:,.0f} ({_entry_num(r['drawdown'])} from its "
+            f"record); VIX {r['vix']:.1f}, peak {r['vix_peak']:.1f} on "
+            f"{_fmt_short_date(r['vix_peak_date'])}.</p>{link}"
+            "<p style='color:#7f8c8d;font-size:12px'>The historical record, not a "
+            "forecast or personal advice. One email per window.</p>")
+    try:
+        send_email(body, f"Entry window open — S&P {_entry_num(r['drawdown'], digits=0)}, "
+                         f"VIX peak {r['vix_peak']:.0f}".replace("&minus;", "-"))
+    except Exception as e:
+        print(f"[entry] Window alert email failed: {e}")
+        return False
+    cache["alerted"] = since
+    _save_entry_cache(cache)
+    return True
 
 
 def _compute_holdings_ytd_return(results) -> Optional[float]:
@@ -1313,16 +1521,34 @@ def _zone_color(score: float) -> str:
     )
 
 
+_GAUGE_STOPS = ((0, "#e5484d"), (30, "#f76b15"), (50, "#f5b301"),
+                (72, "#7fbf3f"), (100, "#2fa84f"))
+
+
+def _gauge_offset(score: float) -> float:
+    """Where `score` sits along the arc's horizontal gradient (0-100%): the
+    arc is a semicircle, so equal scores aren't equal widths."""
+    return (1 + _math.cos(_math.pi * (1 - score / 100.0))) / 2 * 100
+
+
 def _render_gauge_card(dom_id: str, score: float, rating: str, label: str,
                        sub_html: str = "", source: str = "",
-                       tooltip: str = "") -> str:
+                       tooltip: str = "", *, stops=None, color: str = "",
+                       attrs: str = "", css_class: str = "",
+                       badge_html: str = "") -> str:
     """
     One semicircular SVG dial (0–100) rendered as a `.market-meter` card.
     Every top-of-report meter is built through here so they stay identical
     in shape/behavior; only the number, rating and captions differ.
     """
     score = max(0, min(100, int(round(score))))
-    color = _zone_color(score)
+    color = color or _zone_color(score)
+    # The default stops are spaced by eye (the other meters'); custom ones
+    # are placed by score, so a color change lands where the needle does.
+    stop_html = "\n        ".join(
+        f'<stop offset="{off}%" stop-color="{c}"/>' for off, c in _GAUGE_STOPS
+    ) if stops is None else "\n        ".join(
+        f'<stop offset="{_gauge_offset(s):.1f}%" stop-color="{c}"/>' for s, c in stops)
 
     # Needle geometry: score 0 → 180° (left), 100 → 0° (right), 50 → straight up.
     angle = _math.radians(180.0 - (score / 100.0) * 180.0)
@@ -1334,16 +1560,12 @@ def _render_gauge_card(dom_id: str, score: float, rating: str, label: str,
     source_html = f'<div class="fg-source">{source}</div>' if source else ""
 
     return f"""
-<div class="market-meter" id="{dom_id}"{title_attr}>
+<div class="market-meter{' ' + css_class if css_class else ''}" id="{dom_id}"{title_attr}{' ' + attrs if attrs else ''}>{badge_html}
   <svg class="fg-gauge" viewBox="0 0 200 118" role="img"
        aria-label="{label}: {score}, {rating}">
     <defs>
       <linearGradient id="{grad}" x1="0%" y1="0%" x2="100%" y2="0%">
-        <stop offset="0%" stop-color="#e5484d"/>
-        <stop offset="30%" stop-color="#f76b15"/>
-        <stop offset="50%" stop-color="#f5b301"/>
-        <stop offset="72%" stop-color="#7fbf3f"/>
-        <stop offset="100%" stop-color="#2fa84f"/>
+        {stop_html}
       </linearGradient>
     </defs>
     <path d="M20,100 A80,80 0 0 1 180,100" fill="none"
@@ -1472,6 +1694,262 @@ def _render_diversification_gauge(results: list) -> str:
         source="Effective holdings (Herfindahl)",
         tooltip="How spread out your portfolio is. Based on effective number of holdings; low = concentrated single-name risk.",
     )
+
+
+_ENTRY_COLORS = {"calm": "#8a94a6", "normal": "#8a94a6",
+                 "stress": "#e0a100", "open": "#2fa84f"}
+_ENTRY_STOPS = ((0, "#b4bcc8"), (entry_signal.STRESS_SCORE - 4, "#b4bcc8"),
+                (entry_signal.STRESS_SCORE, "#f5b301"),
+                (entry_signal.WINDOW_SCORE - 3, "#f5b301"),
+                (entry_signal.WINDOW_SCORE, "#2fa84f"), (100, "#2fa84f"))
+
+
+def _entry_num(x: Optional[float], signed: bool = True, digits: int = 1) -> str:
+    """A % figure with a real minus sign; an en dash when missing."""
+    if x is None:
+        return "&ndash;"
+    if round(x, digits) == 0:
+        return f"{0:.{digits}f}%"        # no "+0.0%" or "−0.0%"
+    txt = f"{x:+.{digits}f}%" if signed else f"{x:.{digits}f}%"
+    return txt.replace("-", "&minus;")
+
+
+def _entry_color(x: Optional[float]) -> str:
+    if x is None:
+        return "var(--fg-muted)"
+    return "var(--pos-up)" if x > 0 else "var(--pos-down)" if x < 0 else "var(--fg-body)"
+
+
+def _render_entry_gauge(sig: Optional[dict]) -> str:
+    """The Entry window dial: how close the market is to the one buying
+    window that has held up historically (VIX >= 40 within a month, or the
+    S&P 30%+ below its record). Click opens the evidence panel. Empty
+    without a reading."""
+    if not sig:
+        return ""
+    r = sig["reading"]
+    bars = sig["bars"]
+    state = sig["state"]
+    key = "calm" if sig["rating"] == entry_signal.STATE_LABELS["calm"] else state
+    vix_word = "Vol" if r["vix_is_proxy"] else "VIX"
+    sub_html = (
+        '<div class="fg-prev">'
+        f'<span class="fg-prev-item">{vix_word} <strong>{r["vix"]:.0f}</strong></span>'
+        f'<span class="fg-prev-item">Month peak <strong>{r["vix_peak"]:.0f}</strong></span>'
+        f'<span class="fg-prev-item">Off high <strong>{_entry_num(r["drawdown"], digits=0)}</strong></span>'
+        '</div>')
+    if state == "open":
+        source = f"Open since {_fmt_short_date(sig['since'])} &#9662;"
+    else:
+        source = (f"Opens at VIX {bars['window_vix']:.0f} / S&amp;P "
+                  f"&minus;{bars['window_drop']:.0f}% &#9662;")
+    tip = ("How close the market is to the rare panic window that has been a "
+           "reliably good time to invest (VIX 40+ within a month, or the S&P "
+           "30%+ below its record). Click for the history behind it.")
+    badge = ('<span class="entry-new-chip" aria-hidden="true">NEW</span>'
+             if state == "open" else "")
+    attrs = (f'role="button" tabindex="0" aria-controls="entryPanel" '
+             f'aria-expanded="false" data-entry-state="{state}" '
+             f'data-entry-since="{sig.get("since") or ""}"')
+    return _render_gauge_card(
+        dom_id="entryMeter", score=sig["score"], rating=sig["rating"],
+        label="Entry window", sub_html=sub_html, source=source, tooltip=tip,
+        stops=_ENTRY_STOPS, color=_ENTRY_COLORS[key], attrs=attrs,
+        css_class=f"entry-meter entry-{state}", badge_html=badge)
+
+
+def _entry_lead(sig: dict) -> str:
+    """The panel's opening sentence for today's state."""
+    r, st, bars = sig["reading"], sig["stats"], sig["bars"]
+    op, nm = st.get("open") or {}, st.get("normal") or {}
+    span_from = sig["span"]["from"][:4]
+    if sig["state"] == "open":
+        why = (f"the VIX closed at {r['vix_peak']:.1f} on "
+               f"{_fmt_short_date(r['vix_peak_date'])}"
+               if r["vix_peak"] >= bars["window_vix"] else
+               f"the S&amp;P is {abs(r['drawdown']):.1f}% below its record close")
+        return (f"<strong>A rare entry window is open</strong> (since "
+                f"{_fmt_short_date(sig['since'])}: {why}). Since {span_from} the S&amp;P "
+                f"has been here in {op.get('episodes', 0)} episodes; the next 12 "
+                f"months averaged {_entry_num(op.get('avg12'))} and were positive "
+                f"{op.get('pos12', 0)}% of the time, against "
+                f"{_entry_num(nm.get('avg12'))} on ordinary days.")
+    st_s = st.get("stress") or {}
+    if sig["state"] == "stress":
+        return (f"<strong>Stressed, but not a window.</strong> The VIX peaked at "
+                f"{r['vix_peak']:.1f} on {_fmt_short_date(r['vix_peak_date'])} and the "
+                f"S&amp;P is {abs(r['drawdown']):.1f}% below its record. Moments like "
+                f"this have not been a reliable edge: the next 12 months averaged "
+                f"{_entry_num(st_s.get('pre12'))} before 1990 but "
+                f"{_entry_num(st_s.get('post12'))} since, when several were the start "
+                f"of a bear market. The window opens at a VIX close of "
+                f"{bars['window_vix']:.0f} ({r['to_window_vix']:.1f} points away) or "
+                f"the S&amp;P &minus;{bars['window_drop']:.0f}% "
+                f"({r['to_window_drop']:.1f} points away).")
+    return ("<strong>No timing edge today.</strong> Outside the rare panic window, "
+            "history has favored investing new money when it arrives: putting a lump "
+            "sum in at once beat spreading it out or waiting for a dip on average "
+            "(table below). The window opens at a VIX close of "
+            f"{bars['window_vix']:.0f} (now {r['vix']:.1f}) or the S&amp;P "
+            f"&minus;{bars['window_drop']:.0f}% (now {_entry_num(r['drawdown'])}).")
+
+
+def _render_entry_panel(sig: Optional[dict]) -> str:
+    """The evidence behind the Entry window gauge, hidden until the gauge is
+    clicked: today's readings, what the S&P did next in each state, what
+    waiting has cost, valuation, every past window, and what didn't work."""
+    if not sig:
+        return ""
+    r, st, bars = sig["reading"], sig["stats"], sig["bars"]
+    span_from, span_to = sig["span"]["from"][:4], sig["span"]["to"]
+    muted = "class='entry-note'"
+
+    def cell(x, signed=True):
+        # data-sort lets the report's click-to-sort headers order the rows.
+        sort = "" if x is None else f" data-sort='{x}'"
+        return (f"<td class='num'{sort} style='color:{_entry_color(x) if signed else 'inherit'};'>"
+                f"{_entry_num(x, signed)}</td>")
+
+    # Today's readings.
+    chg = r.get("change_1d")
+    cape = sig.get("cape") or {}
+    facts = [
+        ("S&amp;P 500", f"{r['level']:,.0f}"
+         + (f" <span style='color:{_entry_color(chg)}'>{_entry_num(chg)}</span>" if chg is not None else "")),
+        ("From record", f"{_entry_num(r['drawdown'])} <span {muted}>(high {r['high']:,.0f} on {_fmt_short_date(r['high_date'])}; month low {_entry_num(r['low_21'])})</span>"),
+        ("VIX" if not r["vix_is_proxy"] else "Volatility", f"{r['vix']:.1f} <span {muted}>(peak {r['vix_peak']:.1f} on {_fmt_short_date(r['vix_peak_date'])})</span>"),
+        ("vs 200-day average", _entry_num(r.get("trend_200"))),
+    ]
+    if cape.get("cape"):
+        facts.append(("Shiller CAPE", f"{cape['cape']:.1f} <span {muted}>(above {cape['pct']}% of months since {cape['since']})</span>"))
+    facts_html = "".join(f"<div class='entry-fact'><span>{k}</span><strong>{v}</strong></div>" for k, v in facts)
+
+    # What followed each state.
+    rules = {
+        "open": f"VIX closed &ge; {bars['window_vix']:.0f} in the last {bars['recent']} sessions, or S&amp;P &ge; {bars['window_drop']:.0f}% below its record",
+        "stress": f"VIX &ge; {bars['stress_vix']:.0f} or S&amp;P &ge; {bars['stress_drop']:.0f}% below, short of the window",
+        "normal": "everything else",
+    }
+    names = {"open": "Window open", "stress": "Stressed", "normal": "Normal / calm"}
+    rows = ""
+    for k in entry_signal.STATES:
+        x = st.get(k) or {}
+        today = k == sig["state"]
+        rows += (f"<tr class='{'entry-today' if today else ''}'>"
+                 f"<td><strong>{names[k]}</strong>{' <span class=entry-today-tag>today</span>' if today else ''}"
+                 f"<div {muted}>{rules[k]}</div></td>"
+                 f"<td class='num'>{x.get('episodes', 0)}</td>"
+                 + cell(x.get("avg3")) + cell(x.get("avg12"))
+                 + f"<td class='num'>{x.get('pos12', '&ndash;')}{'%' if x.get('pos12') is not None else ''}</td>"
+                 + cell(x.get("worst12")) + cell(x.get("pre12")) + cell(x.get("post12"))
+                 + "</tr>")
+    a = sig.get("all") or {}
+    rows += ("<tr class='entry-all'><td>All days</td><td class='num'>&ndash;</td>"
+             + cell(a.get("avg3")) + cell(a.get("avg12"))
+             + f"<td class='num'>{a.get('pos12', '&ndash;')}%</td>"
+             + cell(a.get("worst12")) + cell(a.get("pre12")) + cell(a.get("post12")) + "</tr>")
+    states_table = (
+        "<div class='entry-table-wrap'><table class='entry-table'><thead><tr>"
+        "<th>State</th><th class='num'>Episodes</th><th class='num'>Next 3 mo</th>"
+        "<th class='num'>Next 12 mo</th><th class='num'>12 mo &gt; 0</th>"
+        "<th class='num'>Worst 12 mo</th><th class='num'>12 mo, before 1990</th>"
+        "<th class='num'>12 mo, since 1990</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>")
+
+    # Waiting.
+    w = sig.get("wait") or {}
+    ww = entry_signal.DEPLOY_STUDY["wait_for_window"]
+    wait_html = ""
+    if w:
+        wait_html = (
+            f"<p>The window is worth acting on but not worth waiting for. From a "
+            f"day outside it, the next one opened after a median "
+            f"<strong>{w['median_years']:.1f} years</strong>, and the S&amp;P was "
+            f"cheaper by then only <strong>{w['cheaper_pct']}%</strong> of the time. "
+            f"Holding cash in T-bills until it opened and then buying lagged buying "
+            f"at once by {_entry_num(ww['avg_vs_now'])} on average (it came out ahead "
+            f"{ww['won']:.0f}% of the time).</p>")
+    ds = entry_signal.DEPLOY_STUDY
+    drow = ""
+    for name, rel, beat, worst, med in ds["rows"]:
+        drow += (f"<tr><td>{name}</td>" + (cell(None) if beat is None else cell(rel))
+                 + f"<td class='num'>{'&ndash;' if beat is None else f'{beat:.0f}%'}</td>"
+                 + cell(worst) + cell(med) + "</tr>")
+    deploy_table = (
+        "<div class='entry-table-wrap'><table class='entry-table'><thead><tr>"
+        "<th>Putting a lump sum in</th><th class='num'>vs all at once</th>"
+        "<th class='num'>Beat all at once</th><th class='num'>Worst 5%</th>"
+        f"<th class='num'>Median</th></tr></thead><tbody>{drow}</tbody></table></div>"
+        f"<p {muted}>{ds['starts']} monthly start dates, {ds['span']}; value "
+        f"{ds['horizon_months']} months later with dividends reinvested and cash "
+        "earning 3-month T-bill rates. Spreading it out or waiting gave up some "
+        "return on average but trimmed the worst outcomes.</p>")
+
+    # Valuation.
+    cape_html = ""
+    if cape.get("f10_top") is not None:
+        cape_html = (
+            f"<p>Valuation is high: a CAPE of {cape['cape']:.1f} is above "
+            f"{cape['pct']}% of months since {cape['since']}"
+            + (" and in the dearest tenth since 1950" if cape.get("in_top") else "")
+            + f". It hasn't timed the next year: from the dearest tenth (CAPE "
+            f"&ge; {cape['top_decile']:.1f}) the S&amp;P's next 12 months averaged "
+            f"{_entry_num(cape['f12_top'])} against {_entry_num(cape['f12_all'])} for "
+            f"all months. It has shaped the next ten: "
+            f"{_entry_num(cape['f10_top'])} a year from there against "
+            f"{_entry_num(cape['f10_all'])} for all months (price only).</p>"
+            if cape.get("in_top") else
+            f"<p>Valuation: a CAPE of {cape['cape']:.1f} (above {cape['pct']}% of months "
+            f"since {cape['since']}). From the dearest tenth since 1950 (CAPE &ge; "
+            f"{cape['top_decile']:.1f}) the next 12 months were about average "
+            f"({_entry_num(cape['f12_top'])} vs {_entry_num(cape['f12_all'])}), the "
+            f"next ten years weaker ({_entry_num(cape['f10_top'])} a year vs "
+            f"{_entry_num(cape['f10_all'])}).</p>")
+
+    # Past windows, newest first.
+    wrows = ""
+    for x in reversed(sig.get("windows") or []):
+        trig = (f"{'Vol' if x['is_proxy'] else 'VIX'} {x['vix_peak']:.0f}"
+                if x["trigger"] == "vix" else f"S&amp;P {_entry_num(x['drawdown'], digits=0)}")
+        wrows += (f"<tr><td data-sort='{x['date']}'>{_fmt_short_date(x['date'])}</td><td>{trig}</td>"
+                  + cell(x["drawdown"]) + cell(x["f3"]) + cell(x["f12"]) + cell(x["low12"]) + "</tr>")
+    windows_table = (
+        "<div class='entry-table-wrap'><table class='entry-table'><thead><tr>"
+        "<th>Window opened</th><th>Trigger</th><th class='num'>S&amp;P from record</th>"
+        "<th class='num'>Next 3 mo</th><th class='num'>Next 12 mo</th>"
+        "<th class='num' title='Lowest close over the next 12 months vs the day it opened'>"
+        "Worst dip after</th></tr></thead>"
+        f"<tbody>{wrows}</tbody></table></div>") if wrows else ""
+
+    no_edge = "".join(f"<li><strong>{k}</strong>: {v}</li>" for k, v in entry_signal.NO_EDGE)
+    vix_from = sig["span"].get("vix_from")
+    return f"""
+<div class="entry-panel" id="entryPanel" hidden>
+  <div class="entry-head">
+    <h3>Entry window: when to put new money in</h3>
+    <button class="entry-x" id="entryClose" aria-label="Close">&#10005;</button>
+  </div>
+  <p class="entry-lead">{_entry_lead(sig)}</p>
+  <div class="entry-facts">{facts_html}</div>
+  <h4>What the S&amp;P did next, by state <span {muted}>({span_from} to {_fmt_short_date(span_to)}, price only)</span></h4>
+  {states_table}
+  <h4>Waiting vs investing now</h4>
+  {wait_html}
+  {deploy_table}
+  {('<h4>Valuation</h4>' + cape_html) if cape_html else ''}
+  {('<h4>Every window since ' + span_from + '</h4>' + windows_table) if windows_table else ''}
+  <h4>Tested and not reliable</h4>
+  <ul class="entry-noedge">{no_edge}</ul>
+  <p {muted}>Method: S&amp;P 500 daily closes from {span_from}{f" and the VIX from {vix_from[:4]}" if vix_from else ""};
+  before that the VIX is estimated from the S&amp;P's own one-month volatility
+  (&times;{entry_signal.VOL_PROXY_RATIO}). The bars are round numbers set before
+  the test, not fitted, and each result held before and after 1990. A day counts
+  toward its state's averages, so long episodes weigh more; episodes are runs of
+  days less than {entry_signal.EPISODE_GAP} sessions apart. CAPE from multpl.com.
+  The lump-sum table and "Tested and not reliable" come from a one-off study on
+  Nov 23, 2026; everything else is recomputed every run. This is the historical
+  record, not a forecast or personal advice.</p>
+</div>"""
 
 
 # ============================================================
@@ -10887,8 +11365,12 @@ def generate_html_report(
     # Top-of-report meter row: market sentiment · book quality · concentration.
     # Each renderer returns "" when its data is unavailable, so the row simply
     # shows whichever gauges apply (and collapses entirely with no holdings).
+    # The Entry window sits beside Fear & Greed (both market-wide); clicking
+    # it opens its evidence panel under the row.
+    entry_sig = fetch_entry_signal()
     _meter_cards = [
         _render_fear_greed_gauge(fetch_market_fear_greed()),
+        _render_entry_gauge(entry_sig),
         _mode_variants(lambda m: _render_portfolio_health_gauge(results, m),
                        tag="div"),
         _render_diversification_gauge(results),
@@ -10896,6 +11378,7 @@ def generate_html_report(
     _meter_cards = [c for c in _meter_cards if c]
     market_meter_html = (
         f'<div class="market-meters-row">{"".join(_meter_cards)}</div>'
+        + _render_entry_panel(entry_sig)
         if _meter_cards else ""
     )
 
@@ -11223,6 +11706,54 @@ def generate_html_report(
     .fg-gauge {{ width: 84px; }}
     .fg-score {{ font-size: 19px; }}
   }}
+  /* Entry window: a clickable meter that opens its evidence panel. */
+  .entry-meter {{ cursor: pointer; position: relative; }}
+  .entry-meter:hover, .entry-meter:focus-visible {{ border-color: var(--border-strong);
+                                                   outline: none; }}
+  .entry-meter[aria-expanded="true"] {{ border-color: var(--fg-muted); }}
+  .entry-meter.entry-open {{ border-color: #2fa84f; box-shadow: 0 0 0 2px rgba(47,168,79,0.25); }}
+  .entry-new-chip {{ display: none; position: absolute; top: 6px; right: 8px;
+                     font-size: 9px; font-weight: 800; letter-spacing: 0.5px;
+                     color: #fff; background: #2fa84f; border-radius: 8px; padding: 1px 6px; }}
+  .entry-meter.entry-new .entry-new-chip {{ display: inline-block; }}
+  .entry-meter.entry-new {{ animation: entryPulse 1.6s ease-in-out infinite; }}
+  @keyframes entryPulse {{ 0%, 100% {{ box-shadow: 0 0 0 2px rgba(47,168,79,0.25); }}
+                          50% {{ box-shadow: 0 0 0 6px rgba(47,168,79,0.10); }} }}
+  .entry-panel {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
+                  border-radius: 10px; padding: 12px 18px 14px; margin: -4px 0 16px;
+                  box-shadow: var(--shadow-card); font-size: 13px; line-height: 1.5; }}
+  .entry-panel[hidden] {{ display: none; }}
+  .entry-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
+  .entry-head h3 {{ margin: 2px 0 4px; }}
+  .entry-x {{ background: none; border: 0; color: var(--fg-muted); font-size: 16px;
+              cursor: pointer; padding: 2px 6px; }}
+  .entry-panel h4 {{ font-size: 13px; margin: 16px 0 6px; color: var(--fg-table-header); }}
+  .entry-panel p {{ margin: 6px 0; max-width: 980px; }}
+  .entry-lead {{ font-size: 14px; }}
+  .entry-note {{ color: var(--fg-muted); font-size: 11.5px; font-weight: 400; }}
+  .entry-facts {{ display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 8px 0 2px; }}
+  .entry-fact {{ display: flex; flex-direction: column; }}
+  .entry-fact > span {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+                      color: var(--fg-muted); }}
+  .entry-fact strong {{ font-size: 13.5px; color: var(--fg-strong); font-weight: 600; }}
+  .entry-table-wrap {{ overflow-x: auto; max-width: 100%; }}
+  .entry-table {{ border-collapse: collapse; font-size: 12.5px; margin: 4px 0; min-width: 520px; }}
+  .entry-table th, .entry-table td {{ padding: 5px 10px; border-bottom: 1px solid var(--border-soft);
+                                      text-align: left; vertical-align: top; }}
+  .entry-table th {{ text-transform: uppercase; letter-spacing: 0.3px;
+                     font-weight: 600; white-space: nowrap; }}
+  .entry-table .num {{ text-align: right; white-space: nowrap; }}
+  .entry-table td:first-child {{ min-width: 190px; }}
+  /* The report's tables pin their headers while scrolling; these short
+     ones sit inside a panel, so theirs stay put. */
+  .entry-table thead th {{ position: static; box-shadow: none; padding: 6px 10px;
+                           font-size: 10.5px; color: var(--fg-muted); }}
+  .entry-table tr.entry-today td {{ background: var(--bg-chip-amber); }}
+  .entry-table tr.entry-all td {{ color: var(--fg-muted); }}
+  .entry-today-tag {{ font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+                      color: var(--fg-chip-amber); margin-left: 4px; }}
+  .entry-noedge {{ margin: 4px 0 8px; padding-left: 18px; max-width: 980px; }}
+  .entry-noedge li {{ margin: 2px 0; }}
   .summary-card {{ background: var(--bg-summary); border: 1px solid var(--border-medium);
                    border-radius: 10px; padding: 12px 16px;
                    margin-bottom: 16px;
@@ -12320,6 +12851,38 @@ Verdicts are framework outputs, not investment advice.
     (window.reloadFreshReport || location.reload.bind(location))();
   });
 })();
+// Entry window: the gauge opens its evidence panel, and the panel stays open
+// or closed through the auto-reload. A window this browser hasn't been shown
+// yet pulses with a NEW chip until its panel is opened.
+(function() {
+  var card = document.getElementById('entryMeter');
+  var panel = document.getElementById('entryPanel');
+  if (!card || !panel) return;
+  var KEY = 'entry-panel-open', SEEN = 'entry-window-seen';
+  var since = card.getAttribute('data-entry-since') || '';
+  function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function show(open) {
+    panel.hidden = !open;
+    card.setAttribute('aria-expanded', open ? 'true' : 'false');
+    store(KEY, open ? '1' : '0');
+    if (open && since) { store(SEEN, since); card.classList.remove('entry-new'); }
+  }
+  if (since && read(SEEN) !== since) card.classList.add('entry-new');
+  if (read(KEY) === '1') show(true);
+  // On a phone the panel lands under the other meters, so bring it to view.
+  function toggle() {
+    var open = panel.hidden;
+    show(open);
+    if (open && panel.scrollIntoView) panel.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  }
+  card.addEventListener('click', toggle);
+  card.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  });
+  var x = document.getElementById('entryClose');
+  if (x) x.addEventListener('click', function() { show(false); });
+})();
 // Auto-reload. Once a minute, while the tab is visible, fetch the published
 // report (cache-busted, like reloadFreshReport) and compare its generation
 // stamp with this page's. Reload only when a newer report is up, so an open
@@ -13349,8 +13912,9 @@ window.scrollToSection = function(id) {
   }
 
   // Elements with their own tap action (or that aren't real tooltips).
+  // .entry-meter: a tap opens its own panel, which says more than its title.
   var SKIP = 'th,button,a,summary,label,input,select,' +
-             '.refresh-btn,.theme-toggle,.icon-btn';
+             '.refresh-btn,.theme-toggle,.icon-btn,.entry-meter';
 
   // Best-effort: the column header text for a tapped data cell, as a label.
   function columnLabel(cell) {
@@ -14362,6 +14926,9 @@ def main():
 
     if args.email:
         send_email(html, f"Portfolio Analysis — {datetime.now():%Y-%m-%d}")
+
+    # A rare entry window opening is worth an email of its own, once.
+    notify_entry_window(fetch_entry_signal())
 
 
 if __name__ == "__main__":
